@@ -1,0 +1,19 @@
+{
+  "name": "gym-booker",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test.js",
+    "book": "node book.js",
+    "dry": "node book.js --dry-run --now"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "playwright": "^1.59.1"
+  }
+}
