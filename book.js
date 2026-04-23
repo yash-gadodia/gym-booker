@@ -41,10 +41,28 @@ async function tg(text) {
 }
 
 async function isLoggedOut(page) {
+  // Mindbody renders two copies of the Login button (hidden mobile + visible desktop).
+  // Presence of data-name="NavigationBar.Login.Button" anywhere = logged out.
+  // Checking .first().isVisible() is unreliable because the mobile copy has a 0x0 rect.
+  const byDataName = await page.locator('button[data-name="NavigationBar.Login.Button"]').count();
+  if (byDataName > 0) return true;
   const sel = 'button:has-text("Sign in"), a:has-text("Sign in"), button:has-text("Log in"), a:has-text("Log in")';
-  const el = page.locator(sel).first();
-  if (await el.count() === 0) return false;
-  return await el.isVisible({ timeout: 2000 }).catch(() => false);
+  const els = await page.locator(sel).all();
+  for (const el of els) {
+    const r = await el.evaluate(n => n.getBoundingClientRect()).catch(() => null);
+    if (r && r.width > 0 && r.height > 0) return true;
+  }
+  return false;
+}
+
+async function clickVisible(page, selector) {
+  const els = await page.locator(selector).all();
+  for (const el of els) {
+    const r = await el.evaluate(n => n.getBoundingClientRect()).catch(() => null);
+    if (!r || r.width === 0 || r.height === 0) continue;
+    try { await el.click({ timeout: 5000 }); return { ok: true, rect: r }; } catch {}
+  }
+  return { ok: false };
 }
 
 async function loginAndSave(page, ctx, authPath) {
@@ -52,18 +70,18 @@ async function loginAndSave(page, ctx, authPath) {
   if (!process.env.MINDBODY_EMAIL || !process.env.MINDBODY_PASSWORD) {
     throw new Error('auth expired but MINDBODY_EMAIL/MINDBODY_PASSWORD not set in .env');
   }
-  const loginSelectors = [
-    'button:has-text("Sign in")', 'a:has-text("Sign in")',
-    'button:has-text("Log in")', 'a:has-text("Log in")',
-  ];
-  let clicked = false;
-  for (const sel of loginSelectors) {
-    const el = page.locator(sel).first();
-    if (await el.count() > 0 && await el.isVisible().catch(() => false)) {
-      try { await el.click({ timeout: 5000 }); clicked = true; log(`AUTH: clicked ${sel}`); break; } catch {}
+  let clicked = await clickVisible(page, 'button[data-name="NavigationBar.Login.Button"]');
+  if (clicked.ok) log(`AUTH: clicked Login button (${clicked.rect.width}x${clicked.rect.height}) via data-name`);
+  if (!clicked.ok) {
+    for (const sel of [
+      'button:has-text("Sign in")', 'a:has-text("Sign in")',
+      'button:has-text("Log in")', 'a:has-text("Log in")',
+    ]) {
+      clicked = await clickVisible(page, sel);
+      if (clicked.ok) { log(`AUTH: clicked ${sel} (text fallback)`); break; }
     }
   }
-  if (!clicked) throw new Error('auth expired and no Sign in button visible');
+  if (!clicked.ok) throw new Error('auth expired and no visible Login button found');
   await page.waitForTimeout(2500);
   const emailInput = page.locator('input:visible').first();
   await emailInput.waitFor({ state: 'visible', timeout: 15000 });
