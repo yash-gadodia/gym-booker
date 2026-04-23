@@ -174,12 +174,23 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
   log(`mode: dry=${dryRun} nowait=${noWait}`);
   log(`9am SGT target: ${t9.toISOString()} (ms-from-now: ${t9.getTime() - Date.now()})`);
 
+  const planLineForMsg = `${plan.kind} @ ${plan.primaryTime}${plan.fallback ? ` (fallback ${plan.fallback})` : ''}`;
+  await tg(
+    `🚀 *ragtag booking* — *started*\n` +
+    `target: ${DAY_SHORT[target.getDay()]} ${ymd(target)} — ${planLineForMsg}\n` +
+    `run: \`${RUN_ID}\``
+  );
+
   const authPath = path.join(__dirname, 'auth.json');
+  const msToNine = t9.getTime() - Date.now();
+  const forceLogin = !noWait && msToNine > 90000;
+  log(`auth: ${forceLogin ? `FORCE fresh login (${msToNine}ms to 9am, >90s safety margin)` : 'using cached auth.json if available'}`);
+
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     viewport: { width: 1440, height: 900 }, locale: 'en-SG', timezoneId: SGT_TZ,
-    storageState: fs.existsSync(authPath) ? authPath : undefined,
+    storageState: (!forceLogin && fs.existsSync(authPath)) ? authPath : undefined,
   });
   const page = await ctx.newPage();
   let status = { ok: false, reason: 'unknown', detail: '', time: null };
@@ -193,7 +204,7 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
     await snap(page, 'landed');
 
     if (await isLoggedOut(page)) {
-      log('AUTH: detected logged-out state — self-healing');
+      log(`AUTH: detected logged-out state — ${forceLogin ? 'proactive' : 'reactive'} login`);
       didRelogin = true;
       await snap(page, 'logged-out');
       await loginAndSave(page, ctx, authPath);
@@ -203,6 +214,7 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
       await dismissCookieBanner(page);
       await snap(page, 'post-relogin');
       if (await isLoggedOut(page)) throw new Error('still logged out after re-login attempt');
+      await tg(`🔐 *ragtag booking* — *logged in*\nfresh session saved (${forceLogin ? 'proactive' : 'reactive'})`);
     }
 
     await clickClassesTab(page);
@@ -238,11 +250,17 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
     if (chosen.status === 'FULL') throw new Error(`${plan.kind} FULL (primary${plan.fallback ? ' and fallback' : ''})`);
 
     // Wait to 09:00:00.000 SGT unless --now or already past
-    const msToNine = t9.getTime() - Date.now();
-    if (!noWait && msToNine > 0) {
-      log(`waiting ${msToNine}ms to 09:00:00.000 SGT`);
-      if (msToNine > 15000) {
-        await new Promise(r => setTimeout(r, msToNine - 10000));
+    const msLeft = t9.getTime() - Date.now();
+    if (!noWait && msLeft > 0) {
+      const secs = Math.round(msLeft / 1000);
+      await tg(
+        `⏸️ *ragtag booking* — *on standby*\n` +
+        `${plan.kind} @ ${chosen.time} — row staged (${chosen.status})\n` +
+        `waiting ${secs}s to 09:00:00.000 SGT`
+      );
+      log(`waiting ${msLeft}ms to 09:00:00.000 SGT`);
+      if (msLeft > 15000) {
+        await new Promise(r => setTimeout(r, msLeft - 10000));
         log('T-10s refresh: clicking day tab again');
         await clickDayTab(page, target);
         chosen = await pickRow('T-10s refresh');
@@ -252,8 +270,8 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
       }
       await busyWaitUntil(t9.getTime());
       log(`drift from 09:00:00.000: ${Date.now() - t9.getTime()}ms`);
-    } else if (msToNine < 0) {
-      log(`already past 9am today (by ${-msToNine}ms) — clicking immediately`);
+    } else if (msLeft < 0) {
+      log(`already past 9am today (by ${-msLeft}ms) — clicking immediately`);
     } else {
       log('--now: clicking immediately');
     }
