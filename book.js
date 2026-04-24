@@ -30,7 +30,11 @@ async function snap(page, name) {
   return p;
 }
 
+// Interactive test modes (--dry-run / --now) skip telegram — otherwise every
+// smoke-test spams the user's DMs. The real launchd run uses neither flag.
+const suppressTg = dryRun || noWait;
 async function tg(text) {
+  if (suppressTg) { log(`tg: suppressed (dry/now mode): ${text.split('\n')[0]}`); return; }
   if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) { log('tg: missing creds'); return; }
   const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   try {
