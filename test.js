@@ -1,6 +1,9 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus } = require('./lib');
+const {
+  DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
+  decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
+} = require('./lib');
 
 test('DAY_SHORT is Sun..Sat indexed by getDay()', () => {
   assert.equal(DAY_SHORT[new Date('2026-04-26').getDay()], 'Sun');
@@ -34,13 +37,13 @@ test('ymd: zero-pads month and day', () => {
 
 test('classPlan: all seven days', () => {
   const cases = [
-    ['2026-04-26', { kind: 'Gymnastics', primaryTime: '1:00pm',  fallback: null }],   // Sun
-    ['2026-04-27', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }], // Mon
-    ['2026-04-28', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }], // Tue
-    ['2026-04-29', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }], // Wed
-    ['2026-04-30', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }], // Thu
-    ['2026-05-01', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }], // Fri
-    ['2026-04-25', { kind: 'Gymnastics', primaryTime: '12:30pm', fallback: null }],   // Sat
+    ['2026-04-26', { kind: 'Gymnastics', primaryTime: '1:00pm',  fallback: null }],
+    ['2026-04-27', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }],
+    ['2026-04-28', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }],
+    ['2026-04-29', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }],
+    ['2026-04-30', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }],
+    ['2026-05-01', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }],
+    ['2026-04-25', { kind: 'Gymnastics', primaryTime: '12:30pm', fallback: null }],
   ];
   for (const [date, expected] of cases) {
     const got = classPlan(new Date(date));
@@ -127,4 +130,106 @@ test('day tab regex against live format "FRI\\n24"', () => {
   assert.equal(re.test('FRI24'), true);
   assert.equal(re.test('FRI 241'), false, 'must not cross-match 2-digit prefix');
   assert.equal(re.test('FRI 2'), false);
+});
+
+// ---------- new: post-9am booking-race logic ----------
+
+test('decideNextAction: BOOK_NOW → click', () => {
+  assert.deepEqual(decideNextAction('BOOK_NOW'), { action: 'click' });
+});
+
+test('decideNextAction: BOOKED → done (idempotent rerun)', () => {
+  assert.deepEqual(decideNextAction('BOOKED'), { action: 'done', detail: 'already BOOKED' });
+});
+
+test('decideNextAction: DETAILS → poll (pre-flip DOM state)', () => {
+  assert.deepEqual(decideNextAction('DETAILS'), { action: 'poll' });
+});
+
+test('decideNextAction: UNKNOWN → poll (transient render)', () => {
+  assert.deepEqual(decideNextAction('UNKNOWN'), { action: 'poll' });
+});
+
+test('decideNextAction: FULL → fail (lost the race)', () => {
+  const d = decideNextAction('FULL');
+  assert.equal(d.action, 'fail');
+  assert.match(d.reason, /FULL/);
+});
+
+test('decideNextAction: NOT_FOUND → fail', () => {
+  const d = decideNextAction('NOT_FOUND');
+  assert.equal(d.action, 'fail');
+  assert.match(d.reason, /disappeared/);
+});
+
+test('decideNextAction: unexpected status → fail with diagnostic', () => {
+  const d = decideNextAction('WAITLIST');
+  assert.equal(d.action, 'fail');
+  assert.match(d.reason, /WAITLIST/);
+});
+
+test('isBookingWindowErrorText: exact modal copy from 2026-04-24 failure', () => {
+  assert.equal(isBookingWindowErrorText('You missed the booking window for this class.'), true);
+});
+
+test('isBookingWindowErrorText: case-insensitive + trailing punctuation', () => {
+  assert.equal(isBookingWindowErrorText('YOU MISSED THE BOOKING WINDOW FOR THIS CLASS'), true);
+  assert.equal(isBookingWindowErrorText('you missed the booking window'), true);
+});
+
+test('isBookingWindowErrorText: "booking window not open" variant', () => {
+  assert.equal(isBookingWindowErrorText('The booking window is not open yet'), true);
+  assert.equal(isBookingWindowErrorText("booking window isn't open"), true);
+});
+
+test('isBookingWindowErrorText: "booking not available" variant', () => {
+  assert.equal(isBookingWindowErrorText('Sorry, booking is not available for this class'), true);
+});
+
+test('isBookingWindowErrorText: unrelated modals pass through', () => {
+  assert.equal(isBookingWindowErrorText('Welcome back!'), false);
+  assert.equal(isBookingWindowErrorText('Are you sure you want to cancel?'), false);
+  assert.equal(isBookingWindowErrorText(''), false);
+  assert.equal(isBookingWindowErrorText(null), false);
+  assert.equal(isBookingWindowErrorText(undefined), false);
+});
+
+test('isLoginRedirectUrl: detects /login, /signin, /authorize', () => {
+  assert.equal(isLoginRedirectUrl('https://www.mindbodyonline.com/login'), true);
+  assert.equal(isLoginRedirectUrl('https://www.mindbodyonline.com/signin?next=/book'), true);
+  assert.equal(isLoginRedirectUrl('https://prod-mkt-gateway.mindbody.io/v1/auth/authorize?code_challenge=abc'), true);
+});
+
+test('isLoginRedirectUrl: detects screen=login query', () => {
+  assert.equal(isLoginRedirectUrl('https://example.com/explore?screen=login&foo=bar'), true);
+});
+
+test('isLoginRedirectUrl: does NOT match booking/schedule URLs', () => {
+  assert.equal(isLoginRedirectUrl('https://www.mindbodyonline.com/explore/locations/ragtag'), false);
+  assert.equal(isLoginRedirectUrl('https://www.mindbodyonline.com/explore/checkout'), false);
+  assert.equal(isLoginRedirectUrl(''), false);
+  assert.equal(isLoginRedirectUrl(null), false);
+});
+
+test('isLoginRedirectUrl: "signinghelp" should not false-positive /signin', () => {
+  // word-boundary check: /signin\b means /signin not /signinghelp
+  assert.equal(isLoginRedirectUrl('https://example.com/signinghelp'), false);
+});
+
+// ---------- regression: today's exact failure ----------
+
+test('regression 2026-04-24: DETAILS row at T+0 → poll (not click)', () => {
+  // At Fri 09:00:00.015 SGT, the Sun 1pm Gymnastics row read:
+  //   "CROSSFIT® Gymnastics Tris Kong 1:00pm (90 min) DETAILS"
+  // The old code clicked DETAILS and hit "You missed the booking window".
+  // New code must recognise DETAILS as "not yet flipped" and keep polling.
+  const text = 'CROSSFIT® Gymnastics Tris Kong 1:00pm (90 min) DETAILS';
+  const status = rowStatus(text);
+  assert.equal(status, 'DETAILS');
+  assert.equal(decideNextAction(status).action, 'poll');
+});
+
+test('regression 2026-04-24: the exact modal copy is recognised', () => {
+  // Screenshot from runs/2026-04-24T00-57-04/92400183-post-click.png
+  assert.equal(isBookingWindowErrorText('You missed the booking window for this class.'), true);
 });

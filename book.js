@@ -2,7 +2,10 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
-const { DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus } = require('./lib');
+const {
+  DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
+  decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
+} = require('./lib');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
 const SGT_TZ = 'Asia/Singapore';
@@ -41,9 +44,6 @@ async function tg(text) {
 }
 
 async function isLoggedOut(page) {
-  // Mindbody renders two copies of the Login button (hidden mobile + visible desktop).
-  // Presence of data-name="NavigationBar.Login.Button" anywhere = logged out.
-  // Checking .first().isVisible() is unreliable because the mobile copy has a 0x0 rect.
   const byDataName = await page.locator('button[data-name="NavigationBar.Login.Button"]').count();
   if (byDataName > 0) return true;
   const sel = 'button:has-text("Sign in"), a:has-text("Sign in"), button:has-text("Log in"), a:has-text("Log in")';
@@ -154,17 +154,19 @@ async function findRow(page, plan, time) {
   return null;
 }
 
-async function resolveButton(rowLoc) {
-  let b = rowLoc.locator('button, a').filter({ hasText: /BOOK NOW/i }).first();
+// Resolve the click target on a row. Only BOOK NOW is a real booking trigger —
+// DETAILS opens a class-info modal ("You missed the booking window") and never
+// leads to checkout. Returning null here is intentional: callers must decide
+// whether to poll (pre-9am) or fail (post-9am).
+async function resolveBookButton(rowLoc) {
+  const b = rowLoc.locator('button, a').filter({ hasText: /BOOK NOW/i }).first();
   if (await b.count() > 0) return { btn: b, label: 'BOOK NOW' };
-  b = rowLoc.locator('button, a').filter({ hasText: /DETAILS/i }).first();
-  if (await b.count() > 0) return { btn: b, label: 'DETAILS' };
   return null;
 }
 
 async function attemptRow(page, plan, time) {
   const hit = await findRow(page, plan, time);
-  if (!hit) return { notFound: true, time };
+  if (!hit) return { notFound: true, time, status: 'NOT_FOUND' };
   const status = rowStatus(hit.text);
   return { ...hit, status, time };
 }
@@ -175,6 +177,72 @@ async function busyWaitUntil(targetMs) {
   log(`sleeping ${delta}ms to target`);
   if (delta > 500) await new Promise(r => setTimeout(r, delta - 400));
   while (Date.now() < targetMs) {}
+}
+
+// Light refresh: re-click the day tab. Cheap (~1.5s). Used at T-10s to sanity-
+// check the row before the 9am click. May not force a server refetch, so the
+// DOM may stay stale — but that's fine at T-10s because the window isn't open.
+async function softRefreshSchedule(page, target) {
+  await clickDayTab(page, target);
+}
+
+// Hard refresh: full page.reload() + re-navigate to schedule view. Guarantees
+// MindBody re-hits the schedule API (cookies/session survive). Costs ~4-8s.
+// Used exactly once at T+0 to pick up the DETAILS→BOOK_NOW transition that the
+// React app won't auto-refresh on its own.
+async function hardRefreshSchedule(page, target) {
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(1500);
+  await dismissCookieBanner(page);
+  await clickClassesTab(page);
+  await waitForScheduleView(page, 15000);
+  await clickDayTab(page, target);
+}
+
+// Poll for the target row until it's BOOK_NOW (then caller clicks) or a terminal
+// state. Returns { action, row?, text?, reason? } where action ∈ click/done/fail.
+async function pollUntilBookable(page, plan, time, { timeoutMs = 20000, intervalMs = 250 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = 'UNKNOWN';
+  let polls = 0;
+  while (Date.now() < deadline) {
+    polls++;
+    const a = await attemptRow(page, plan, time);
+    if (a.status !== lastStatus) {
+      log(`poll #${polls}: ${a.status}${a.text ? ` — ${a.text.slice(0,100)}` : ''}`);
+      lastStatus = a.status;
+    }
+    const d = decideNextAction(a.status);
+    if (d.action === 'click') return { action: 'click', row: a.row, text: a.text };
+    if (d.action === 'done')  return { action: 'done', text: a.text, detail: d.detail };
+    if (d.action === 'fail')  return { action: 'fail', reason: d.reason, text: a.text };
+    // action === 'poll' — keep waiting
+    await page.waitForTimeout(intervalMs);
+  }
+  return { action: 'fail', reason: `BOOK NOW never appeared within ${timeoutMs}ms (last status: ${lastStatus})` };
+}
+
+// After clicking BOOK NOW, MindBody routes to a checkout page with a BUY button.
+// Detect error states early: booking-window modal or login redirect.
+async function waitForCheckout(page, { timeoutMs = 45000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // Login-redirect = session died. Fail fast.
+    if (isLoginRedirectUrl(page.url())) {
+      return { ok: false, reason: 'redirected to login', url: page.url() };
+    }
+    // "You missed the booking window" modal. Fail fast.
+    const modalText = await page.locator('[role="dialog"], [class*="Modal"], [class*="modal"]').first()
+      .innerText({ timeout: 500 }).catch(() => '');
+    if (isBookingWindowErrorText(modalText)) {
+      return { ok: false, reason: `booking window modal: ${modalText.slice(0,160)}` };
+    }
+    // BUY button present = checkout loaded.
+    const buy = await page.locator('button:has-text("BUY"), button:has-text("Buy")').count();
+    if (buy > 0) return { ok: true };
+    await page.waitForTimeout(300);
+  }
+  return { ok: false, reason: `no BUY button within ${timeoutMs}ms` };
 }
 
 function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
@@ -240,10 +308,11 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
     await clickDayTab(page, target);
     await snap(page, 'day-selected');
 
-    // Pre-stage: try primary, then fallback if primary missing/FULL/BOOKED-elsewhere
+    // Pre-stage: verify the row exists and prefer fallback if primary is FULL/BOOKED-elsewhere.
+    // Status here may be DETAILS (window not yet open) — that's fine; we refresh at 9am.
     async function pickRow(reason) {
       log(`pickRow (${reason}): primary=${plan.primaryTime}${plan.fallback ? ` fallback=${plan.fallback}`:''}`);
-      let a = await attemptRow(page, plan, plan.primaryTime);
+      const a = await attemptRow(page, plan, plan.primaryTime);
       log(`  primary: ${a.notFound ? 'NOT FOUND' : `${a.status} — ${a.text.slice(0,140)}`}`);
       if (!a.notFound && a.status === 'BOOKED') return a;
       if (!a.notFound && (a.status === 'BOOK_NOW' || a.status === 'DETAILS')) return a;
@@ -251,7 +320,6 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
         const b = await attemptRow(page, plan, plan.fallback);
         log(`  fallback: ${b.notFound ? 'NOT FOUND' : `${b.status} — ${b.text.slice(0,140)}`}`);
         if (!b.notFound && (b.status === 'BOOKED' || b.status === 'BOOK_NOW' || b.status === 'DETAILS')) return b;
-        // Both unusable — prefer to surface primary's failure reason
         return a.notFound ? b : a;
       }
       return a;
@@ -267,7 +335,7 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
     }
     if (chosen.status === 'FULL') throw new Error(`${plan.kind} FULL (primary${plan.fallback ? ' and fallback' : ''})`);
 
-    // Wait to 09:00:00.000 SGT unless --now or already past
+    // Wait to 09:00:00.000 SGT unless --now or already past.
     const msLeft = t9.getTime() - Date.now();
     if (!noWait && msLeft > 0) {
       const secs = Math.round(msLeft / 1000);
@@ -279,12 +347,16 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
       log(`waiting ${msLeft}ms to 09:00:00.000 SGT`);
       if (msLeft > 15000) {
         await new Promise(r => setTimeout(r, msLeft - 10000));
-        log('T-10s refresh: clicking day tab again');
-        await clickDayTab(page, target);
-        chosen = await pickRow('T-10s refresh');
-        if (chosen.notFound) throw new Error('row disappeared after refresh');
-        if (chosen.status === 'BOOKED') { status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${chosen.time} — booked during refresh`, time: chosen.time }; return; }
-        if (chosen.status === 'FULL') throw new Error(`${plan.kind} went FULL before 9am (all fallbacks too)`);
+        log('T-10s soft refresh: clicking day tab again');
+        await softRefreshSchedule(page, target);
+        const snapshot = await pickRow('T-10s refresh');
+        if (snapshot.notFound) throw new Error('row disappeared after refresh');
+        if (snapshot.status === 'BOOKED') {
+          status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${snapshot.time} — booked during refresh`, time: snapshot.time };
+          return;
+        }
+        if (snapshot.status === 'FULL') throw new Error(`${plan.kind} went FULL before 9am (all fallbacks too)`);
+        chosen = snapshot;
       }
       await busyWaitUntil(t9.getTime());
       log(`drift from 09:00:00.000: ${Date.now() - t9.getTime()}ms`);
@@ -294,11 +366,45 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
       log('--now: clicking immediately');
     }
 
-    // Resolve the click target on the chosen row
-    let resolved = await resolveButton(chosen.row);
-    if (!resolved) throw new Error(`no Book Now / Details button on chosen row (status=${chosen.status})`);
+    // Core fix: at T+0, MindBody's DOM is stale — the server has flipped the
+    // row to BOOK_NOW but the cached DOM still shows DETAILS (or a stale
+    // BOOK_NOW bound to a pre-9am token). Force a fresh fetch and poll.
+    if (!noWait) {
+      log('T+0 hard refresh: page.reload() to force fresh BOOK NOW state');
+      const t0 = Date.now();
+      await hardRefreshSchedule(page, target);
+      log(`T+0 hard refresh complete (${Date.now() - t0}ms)`);
+    }
+
+    const poll = await pollUntilBookable(page, plan, chosen.time, { timeoutMs: 20000, intervalMs: 250 });
+    if (poll.action === 'done') {
+      status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${chosen.time} — ${poll.detail}`, time: chosen.time };
+      return;
+    }
+    if (poll.action === 'fail') {
+      // Try fallback once if primary is FULL/NOT_FOUND (fast race: someone else booked it)
+      if (plan.fallback && chosen.time === plan.primaryTime) {
+        log(`primary ${poll.reason} — trying fallback ${plan.fallback}`);
+        const pollFb = await pollUntilBookable(page, plan, plan.fallback, { timeoutMs: 10000, intervalMs: 250 });
+        if (pollFb.action === 'click') {
+          chosen = { row: pollFb.row, text: pollFb.text, time: plan.fallback, status: 'BOOK_NOW' };
+        } else if (pollFb.action === 'done') {
+          status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${plan.fallback} — ${pollFb.detail}`, time: plan.fallback };
+          return;
+        } else {
+          throw new Error(`primary+fallback both failed: primary=${poll.reason}, fallback=${pollFb.reason}`);
+        }
+      } else {
+        throw new Error(`poll failed: ${poll.reason}`);
+      }
+    } else {
+      chosen = { row: poll.row, text: poll.text, time: chosen.time, status: 'BOOK_NOW' };
+    }
+
+    // Resolve BOOK NOW button on the fresh row
+    const resolved = await resolveBookButton(chosen.row);
+    if (!resolved) throw new Error('BOOK NOW button not resolvable on chosen row despite BOOK_NOW status');
     log(`button label: ${resolved.label}`);
-    const btn = resolved.btn;
 
     if (dryRun) {
       log('DRY RUN — skipping click + buy');
@@ -308,28 +414,25 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
     }
 
     log('CLICK book-now');
-    await btn.click({ timeout: 10000 });
+    await resolved.btn.click({ timeout: 10000 });
     await snap(page, 'post-click');
 
-    // Wait for checkout BUY button
-    log('waiting for BUY button on checkout');
-    try {
-      await page.waitForSelector('button:has-text("BUY"), button:has-text("Buy")', { timeout: 30000 });
-    } catch {
+    log('waiting for checkout BUY button (up to 45s)');
+    const checkout = await waitForCheckout(page, { timeoutMs: 45000 });
+    if (!checkout.ok) {
       await snap(page, 'no-buy');
-      throw new Error('checkout did not load (no BUY button within 30s)');
+      throw new Error(`checkout failed: ${checkout.reason}`);
     }
     await page.waitForTimeout(1000);
     await snap(page, 'checkout');
 
     const buy = page.locator('button').filter({ hasText: /^BUY$/i }).first();
-    if (await buy.count() === 0) throw new Error('BUY button missing on checkout');
+    if (await buy.count() === 0) throw new Error('BUY button missing on checkout after wait');
     log('CLICK BUY');
     await buy.click();
     await page.waitForTimeout(5000);
     await snap(page, 'post-buy');
 
-    // Verify on schedule
     log('verifying booked status on schedule');
     await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2500);
