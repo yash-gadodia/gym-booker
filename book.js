@@ -223,7 +223,32 @@ async function pollUntilBookable(page, plan, time, { timeoutMs = 20000, interval
     // action === 'poll' — keep waiting
     await page.waitForTimeout(intervalMs);
   }
-  return { action: 'fail', reason: `BOOK NOW never appeared within ${timeoutMs}ms (last status: ${lastStatus})` };
+  return { action: 'fail', reason: `BOOK NOW never appeared within ${timeoutMs}ms (last status: ${lastStatus})`, timedOut: true };
+}
+
+// Progressive refresh at T+0: try the cheapest thing first, escalate only if
+// the DOM genuinely hasn't flipped to BOOK_NOW. Replaces the previous
+// mandatory 6.5s page.reload() — happy path now clicks at ~T+2s instead of T+6.5s.
+async function progressivePollForBookNow(page, plan, time, target) {
+  // Stage A: soft refresh (re-click day tab, ~1.5s) + poll 2.5s
+  const tA = Date.now();
+  try {
+    await softRefreshSchedule(page, target);
+    log(`T+0 stage A (soft refresh) done in ${Date.now() - tA}ms — polling`);
+    const rA = await pollUntilBookable(page, plan, time, { timeoutMs: 2500, intervalMs: 150 });
+    if (!rA.timedOut) return rA;
+    log('T+0 stage A did not surface BOOK NOW — escalating to hard refresh');
+  } catch (e) {
+    log(`T+0 stage A errored (${e.message.slice(0,100)}) — escalating to hard refresh`);
+  }
+
+  // Stage B: hard refresh (page.reload, ~6.5s) + poll 10s. Reserved for the
+  // case where React really won't repaint without a full navigation — the
+  // original fix path, kept as a safety net.
+  const tB = Date.now();
+  await hardRefreshSchedule(page, target);
+  log(`T+0 stage B (hard refresh) done in ${Date.now() - tB}ms — polling`);
+  return await pollUntilBookable(page, plan, time, { timeoutMs: 10000, intervalMs: 250 });
 }
 
 // After clicking BOOK NOW, MindBody routes to a checkout page with a BUY button.
@@ -249,7 +274,112 @@ async function waitForCheckout(page, { timeoutMs = 45000 } = {}) {
   return { ok: false, reason: `no BUY button within ${timeoutMs}ms` };
 }
 
+// After clicking BUY we need to know within ~10s whether it worked. Old code
+// just slept 5s and took a screenshot — that's what let "Sorry! Something went
+// wrong... try a different payment method" slip through unlogged. Now we
+// actively scrape the page every 250ms for either a success signal (URL change
+// to a confirmation, BUY disappeared) or the error modal's full text — so the
+// run log tells us exactly what Mindbody said.
+async function waitForBuyOutcome(page, { timeoutMs = 12000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  const errorSelectors = '[role="dialog"], [role="alertdialog"], [class*="Modal"], [class*="modal"], [class*="Error"], [class*="error"], [class*="Toast"]';
+  const errorPatterns = /(something went wrong|checkout failed|unable to complete|different payment method|try again|declined|insufficient|expired|invalid)/i;
+  const successPatterns = /(booking confirmed|thank you|your booking|order complete|confirmation)/i;
+  while (Date.now() < deadline) {
+    // Success via URL
+    if (/thank|confirm|success|receipt/i.test(page.url())) {
+      return { ok: true, reason: 'url', detail: page.url() };
+    }
+    // Success via body copy
+    const bodyText = await page.locator('body').innerText({ timeout: 500 }).catch(() => '');
+    if (successPatterns.test(bodyText)) {
+      return { ok: true, reason: 'confirmation text', detail: (bodyText.match(successPatterns) || [''])[0] };
+    }
+    // Error modal / toast
+    const modals = await page.locator(errorSelectors).all().catch(() => []);
+    for (const m of modals) {
+      const t = await m.innerText({ timeout: 300 }).catch(() => '');
+      if (t && errorPatterns.test(t)) {
+        return { ok: false, reason: 'error modal', detail: t.replace(/\s+/g,' ').trim().slice(0, 400) };
+      }
+    }
+    // Success via BUY vanishing (checkout closed → booking accepted)
+    const buyCount = await page.locator('button').filter({ hasText: /^BUY$/i }).count().catch(() => 1);
+    if (buyCount === 0 && Date.now() > deadline - (timeoutMs - 2000)) {
+      return { ok: true, reason: 'BUY dismissed', detail: 'no BUY button present after click' };
+    }
+    await page.waitForTimeout(250);
+  }
+  return { ok: false, reason: 'timeout', detail: `no success/error signal within ${timeoutMs}ms` };
+}
+
 function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
+
+// Last-resort fallback: primary class failed post-BUY. Try the fallback time
+// from the schedule page we're already on. Keeps the logic here (not in the
+// main flow) to avoid nesting — primary attempt is the bulk of book.js.
+async function attemptFallbackBooking(page, plan, target) {
+  try {
+    // Page may have been torn down by checkout navigation — re-land on schedule.
+    if (!/locations\/ragtag/i.test(page.url())) {
+      await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(2000);
+      await dismissCookieBanner(page);
+      await clickClassesTab(page);
+      await waitForScheduleView(page, 15000);
+      await clickDayTab(page, target);
+    }
+    const hit = await findRow(page, plan, plan.fallback);
+    if (!hit) return { ok: false, reason: `fallback row ${plan.fallback} not found` };
+    const s = rowStatus(hit.text);
+    log(`fallback ${plan.fallback}: ${s} — ${hit.text.slice(0,120)}`);
+    if (s === 'BOOKED') return { ok: true, reason: 'fallback already BOOKED' };
+    if (s !== 'BOOK_NOW' && s !== 'DETAILS') return { ok: false, reason: `fallback status ${s}` };
+
+    // If DETAILS (rare at this point), poll briefly
+    let rowLoc = hit.row;
+    if (s === 'DETAILS') {
+      const r = await pollUntilBookable(page, plan, plan.fallback, { timeoutMs: 4000, intervalMs: 200 });
+      if (r.action === 'done') return { ok: true, reason: 'fallback BOOKED mid-poll' };
+      if (r.action !== 'click') return { ok: false, reason: `fallback poll: ${r.reason || r.action}` };
+      rowLoc = r.row;
+    }
+
+    const btn = rowLoc.locator('button, a').filter({ hasText: /BOOK NOW/i }).first();
+    if (await btn.count() === 0) return { ok: false, reason: 'fallback BOOK NOW button missing' };
+    log(`CLICK fallback BOOK NOW @ ${plan.fallback}`);
+    await btn.click({ timeout: 10000 });
+    await snap(page, 'fallback-post-click');
+
+    const co = await waitForCheckout(page, { timeoutMs: 30000 });
+    if (!co.ok) return { ok: false, reason: `fallback checkout: ${co.reason}` };
+    await page.waitForTimeout(1000);
+    await snap(page, 'fallback-checkout');
+    const buy2 = page.locator('button').filter({ hasText: /^BUY$/i }).first();
+    if (await buy2.count() === 0) return { ok: false, reason: 'fallback BUY button missing' };
+    log('CLICK fallback BUY');
+    await buy2.click();
+    const o2 = await waitForBuyOutcome(page, { timeoutMs: 12000 });
+    await snap(page, 'fallback-post-buy');
+    log(`fallback BUY outcome: ok=${o2.ok} reason=${o2.reason} — ${(o2.detail||'').slice(0,300)}`);
+
+    // Re-verify on schedule
+    await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2000);
+    await dismissCookieBanner(page);
+    await clickClassesTab(page);
+    await waitForScheduleView(page, 15000);
+    await clickDayTab(page, target);
+    const v = await findRow(page, plan, plan.fallback);
+    const vS = v ? rowStatus(v.text) : 'NOT_FOUND';
+    log(`fallback verify: ${vS}`);
+    await snap(page, 'fallback-verify');
+    if (vS === 'BOOKED') return { ok: true, reason: 'fallback booked' };
+    return { ok: false, reason: `fallback unverified (row ${vS}; BUY ${o2.ok ? 'ok' : o2.reason + ': ' + (o2.detail||'').slice(0,120)})` };
+  } catch (e) {
+    return { ok: false, reason: `fallback exception: ${e.message}` };
+  }
+}
 
 (async () => {
   const today = new Date();
@@ -370,17 +500,14 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
       log('--now: clicking immediately');
     }
 
-    // Core fix: at T+0, MindBody's DOM is stale — the server has flipped the
-    // row to BOOK_NOW but the cached DOM still shows DETAILS (or a stale
-    // BOOK_NOW bound to a pre-9am token). Force a fresh fetch and poll.
-    if (!noWait) {
-      log('T+0 hard refresh: page.reload() to force fresh BOOK NOW state');
-      const t0 = Date.now();
-      await hardRefreshSchedule(page, target);
-      log(`T+0 hard refresh complete (${Date.now() - t0}ms)`);
-    }
-
-    const poll = await pollUntilBookable(page, plan, chosen.time, { timeoutMs: 20000, intervalMs: 250 });
+    // At T+0, MindBody's DOM is stale — the server has flipped the row to
+    // BOOK_NOW but the cached DOM still shows DETAILS. Progressive refresh
+    // tries a cheap soft re-click first (1.5s) before falling back to the
+    // expensive page.reload() (6.5s). Cuts happy-path BUY time by ~5 seconds,
+    // which is exactly the window in which popular slots get snatched.
+    const poll = !noWait
+      ? await progressivePollForBookNow(page, plan, chosen.time, target)
+      : await pollUntilBookable(page, plan, chosen.time, { timeoutMs: 20000, intervalMs: 250 });
     if (poll.action === 'done') {
       status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${chosen.time} — ${poll.detail}`, time: chosen.time };
       return;
@@ -434,8 +561,10 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
     if (await buy.count() === 0) throw new Error('BUY button missing on checkout after wait');
     log('CLICK BUY');
     await buy.click();
-    await page.waitForTimeout(5000);
+
+    const buyOutcome = await waitForBuyOutcome(page, { timeoutMs: 12000 });
     await snap(page, 'post-buy');
+    log(`BUY outcome: ok=${buyOutcome.ok} reason=${buyOutcome.reason} — ${(buyOutcome.detail||'').slice(0,300)}`);
 
     log('verifying booked status on schedule');
     await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -451,8 +580,20 @@ function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
 
     if (vStatus === 'BOOKED') {
       status = { ok: true, reason: 'booked', detail: `${plan.kind} @ ${chosen.time} on ${DAY_SHORT[target.getDay()]} ${ymd(target)}`, time: chosen.time };
+    } else if (plan.fallback && chosen.time === plan.primaryTime) {
+      // Primary did not book (checkout error, race lost, etc). Try the 7:30am fallback
+      // before giving up — may still be available if primary-race losers also fell back.
+      const fbReason = buyOutcome.ok ? `row shows ${vStatus}` : `BUY ${buyOutcome.reason}: ${(buyOutcome.detail||'').slice(0,120)}`;
+      log(`primary unverified (${fbReason}) — attempting fallback ${plan.fallback}`);
+      const fb = await attemptFallbackBooking(page, plan, target);
+      if (fb.ok) {
+        status = { ok: true, reason: 'booked (fallback)', detail: `${plan.kind} @ ${plan.fallback} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} (primary ${plan.primaryTime} failed: ${fbReason})`, time: plan.fallback };
+      } else {
+        status = { ok: false, reason: 'unverified', detail: `primary: ${fbReason}; fallback: ${fb.reason}`, time: chosen.time };
+      }
     } else {
-      status = { ok: false, reason: 'unverified', detail: `clicked BUY but row shows ${vStatus}`, time: chosen.time };
+      const fbReason = buyOutcome.ok ? `row shows ${vStatus}` : `BUY ${buyOutcome.reason}: ${(buyOutcome.detail||'').slice(0,200)}`;
+      status = { ok: false, reason: 'unverified', detail: fbReason, time: chosen.time };
     }
   } catch (e) {
     log('ERROR', e.message);
