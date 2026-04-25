@@ -26,8 +26,9 @@ function rowMatches(text, { kind, time }) {
 
 function rowStatus(text) {
   if (/\bBOOKED\b/i.test(text)) return 'BOOKED';
-  if (/\bFULL\b/i.test(text)) return 'FULL';
   if (/BOOK NOW/i.test(text)) return 'BOOK_NOW';
+  if (/JOIN\s*WAITLIST|WAITLIST/i.test(text)) return 'WAITLIST';
+  if (/\bFULL\b/i.test(text)) return 'FULL';
   if (/\bDETAILS\b/i.test(text)) return 'DETAILS';
   return 'UNKNOWN';
 }
@@ -47,6 +48,7 @@ function decideNextAction(status) {
     case 'DETAILS':  return { action: 'poll' };
     case 'UNKNOWN':  return { action: 'poll' };
     case 'FULL':     return { action: 'fail', reason: 'class is FULL' };
+    case 'WAITLIST': return { action: 'fail', reason: 'class is on WAITLIST — manual join required' };
     case 'NOT_FOUND':return { action: 'fail', reason: 'row disappeared from schedule' };
     default:         return { action: 'fail', reason: `unexpected status: ${status}` };
   }

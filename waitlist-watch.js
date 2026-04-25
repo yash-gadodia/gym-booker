@@ -1,0 +1,206 @@
+// One-shot waitlist/cancellation watcher.
+//
+// Usage: node waitlist-watch.js <YYYY-MM-DD> <time> [--reset]
+//   e.g. node waitlist-watch.js 2026-04-27 6:30am
+//
+// Polls the target row once. If the row's status has transitioned away from
+// FULL (to BOOK_NOW or WAITLIST), sends a Telegram alert and writes the state
+// file marking the watch as fired. Subsequent runs are no-ops once fired.
+//
+// Designed to be invoked every few minutes by a LaunchAgent.
+
+require('dotenv').config();
+const { chromium } = require('playwright');
+const path = require('path');
+const fs = require('fs');
+const {
+  DAY_SHORT, ymd, classPlan, normalize, rowMatches, rowStatus,
+} = require('./lib');
+
+const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
+
+function parseTimeToMinutes(t) {
+  // "6:30am" → 6*60+30; "1:00pm" → 13*60
+  const m = /^(\d{1,2}):(\d{2})\s*(am|pm)$/i.exec(t);
+  if (!m) throw new Error(`bad time: ${t}`);
+  let h = parseInt(m[1], 10); const mins = parseInt(m[2], 10); const ap = m[3].toLowerCase();
+  if (ap === 'pm' && h !== 12) h += 12;
+  if (ap === 'am' && h === 12) h = 0;
+  return h * 60 + mins;
+}
+
+function targetClassStartMs(dateYmd, timeStr) {
+  const d = new Date(`${dateYmd}T00:00:00+08:00`);
+  const minutes = parseTimeToMinutes(timeStr);
+  d.setHours(0, minutes, 0, 0);
+  return d.getTime();
+}
+
+async function tg(text) {
+  if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) return false;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: process.env.TELEGRAM_CHAT_ID, text,
+        parse_mode: 'Markdown', disable_web_page_preview: true,
+      }),
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+(async () => {
+  const args = process.argv.slice(2);
+  const dateArg = args.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a));
+  const timeArg = args.find(a => /^\d{1,2}:\d{2}(am|pm)$/i.test(a));
+  const reset = args.includes('--reset');
+  if (!dateArg || !timeArg) {
+    console.error('usage: waitlist-watch.js <YYYY-MM-DD> <time> [--reset]');
+    process.exit(2);
+  }
+
+  const target = new Date(`${dateArg}T00:00:00`);
+  const plan = classPlan(target);
+  const watchId = `${dateArg}_${timeArg.replace(':', '')}`;
+  const stateFile = path.join(__dirname, 'runs', `waitlist-state-${watchId}.json`);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+
+  if (reset && fs.existsSync(stateFile)) {
+    fs.unlinkSync(stateFile);
+    console.log(`[reset] removed ${stateFile}`);
+  }
+
+  let state = { lastStatus: null, alerted: false, firstSeen: null, lastChecked: null, polls: 0 };
+  if (fs.existsSync(stateFile)) {
+    try { state = { ...state, ...JSON.parse(fs.readFileSync(stateFile, 'utf8')) }; } catch {}
+  }
+
+  // Auto-disarm: if class has already started, don't bother
+  const classStartMs = targetClassStartMs(dateArg, timeArg);
+  if (Date.now() >= classStartMs) {
+    console.log(`class already started (${new Date(classStartMs).toISOString()}) — exiting`);
+    process.exit(0);
+  }
+  // Already fired — idempotent silent exit
+  if (state.alerted) {
+    console.log(`already alerted on ${state.firedAt} — exiting`);
+    process.exit(0);
+  }
+
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] poll #${state.polls + 1}: ${plan.kind} @ ${timeArg} on ${DAY_SHORT[target.getDay()]} ${dateArg}`);
+
+  const authPath = path.join(__dirname, 'auth.json');
+  const browser = await chromium.launch({ headless: true });
+  const ctx = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    viewport: { width: 1440, height: 900 }, locale: 'en-SG', timezoneId: 'Asia/Singapore',
+    storageState: fs.existsSync(authPath) ? authPath : undefined,
+  });
+  const page = await ctx.newPage();
+
+  let observed = 'ERROR';
+  let observedText = '';
+  let didLogin = false;
+  try {
+    await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2500);
+    for (const sel of ['button:has-text("AGREE AND PROCEED")', '#onetrust-accept-btn-handler']) {
+      const el = await page.$(sel); if (el) try { await el.click({ timeout: 2000 }); } catch {}
+    }
+
+    // Reactive login — only if logged out. We don't need a fresh session for read-only polling.
+    const loggedOut = await page.locator('button[data-name="NavigationBar.Login.Button"]').count() > 0;
+    if (loggedOut && process.env.MINDBODY_EMAIL && process.env.MINDBODY_PASSWORD) {
+      console.log('logged out — re-login');
+      didLogin = true;
+      await page.click('button[data-name="NavigationBar.Login.Button"]');
+      await page.waitForTimeout(2000);
+      const emailInput = page.locator('input:visible').first();
+      await emailInput.waitFor({ state: 'visible', timeout: 15000 });
+      await emailInput.fill(process.env.MINDBODY_EMAIL);
+      await page.click('button:has-text("Continue"), button:has-text("Next"), button[type="submit"]');
+      await page.waitForSelector('input[type="password"]', { timeout: 20000 });
+      await page.waitForTimeout(800);
+      await page.fill('input[type="password"]', process.env.MINDBODY_PASSWORD);
+      await Promise.all([
+        page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {}),
+        page.click('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")'),
+      ]);
+      await page.waitForTimeout(3000);
+      await ctx.storageState({ path: authPath });
+      await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(2500);
+    }
+
+    // Click Schedule tab and target day
+    const tab = page.locator('button, a, [role="tab"]').filter({ hasText: /^(Classes|Schedule)$/i }).first();
+    await tab.click({ timeout: 8000 });
+    await page.waitForTimeout(2500);
+
+    const dayShort = DAY_SHORT[target.getDay()].toUpperCase();
+    const dom = String(target.getDate());
+    const dayTab = page.locator('[class*="Day_item"]').filter({ hasText: new RegExp(`^${dayShort}\\s*${dom}$`, 'i') }).first();
+    await dayTab.waitFor({ state: 'visible', timeout: 10000 });
+    await dayTab.click();
+    await page.waitForTimeout(2000);
+
+    const rows = await page.locator('[class*="ClassTimeScheduleItemDesktop"]').all();
+    let matched = null;
+    for (const r of rows) {
+      const text = normalize(await r.innerText().catch(() => ''));
+      if (rowMatches(text, { kind: plan.kind, time: timeArg })) { matched = text; break; }
+    }
+    if (!matched) {
+      observed = 'NOT_FOUND';
+      observedText = '(row not found on schedule)';
+    } else {
+      observed = rowStatus(matched);
+      observedText = matched;
+    }
+  } catch (e) {
+    observed = 'ERROR';
+    observedText = e.message;
+  } finally {
+    try { await ctx.storageState({ path: authPath }); } catch {}
+    await browser.close();
+  }
+
+  console.log(`observed: ${observed} — ${observedText.slice(0, 160)}`);
+
+  state.polls += 1;
+  state.lastChecked = new Date().toISOString();
+  state.lastStatus = observed;
+  if (!state.firstSeen) state.firstSeen = { at: state.lastChecked, status: observed };
+
+  // Alert condition: was-FULL/UNKNOWN, now anything actionable.
+  // BOOK_NOW = direct slot opened. WAITLIST = waitlist became available.
+  // Any other transition (DETAILS appearing, etc.) is also worth flagging once.
+  const actionable = ['BOOK_NOW', 'WAITLIST'];
+  const interesting = actionable.includes(observed);
+
+  if (interesting && !state.alerted) {
+    const dayLabel = DAY_SHORT[target.getDay()];
+    const banner = observed === 'BOOK_NOW' ? '🟢 *SLOT OPEN*' : '🟡 *WAITLIST AVAILABLE*';
+    const verb = observed === 'BOOK_NOW' ? 'book it' : 'join waitlist';
+    const msg =
+      `${banner}\n` +
+      `${plan.kind} @ ${timeArg} — ${dayLabel} ${dateArg}\n` +
+      `row: ${observedText.slice(0, 140)}\n` +
+      `→ open Mindbody and *${verb}* now\n` +
+      `https://www.mindbodyonline.com/explore/locations/ragtag`;
+    const ok = await tg(msg);
+    state.alerted = ok;
+    state.firedAt = new Date().toISOString();
+    state.firedStatus = observed;
+    console.log(`ALERT sent (tg=${ok}) — status=${observed}`);
+  } else if (interesting && state.alerted) {
+    console.log('already alerted — no re-send');
+  } else {
+    console.log(`no alert (status=${observed}, alerted=${state.alerted})`);
+  }
+
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  process.exit(0);
+})().catch(e => { console.error('FATAL', e.message); process.exit(1); });

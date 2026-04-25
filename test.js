@@ -162,10 +162,29 @@ test('decideNextAction: NOT_FOUND → fail', () => {
   assert.match(d.reason, /disappeared/);
 });
 
-test('decideNextAction: unexpected status → fail with diagnostic', () => {
+test('decideNextAction: WAITLIST → fail (manual join, never auto)', () => {
   const d = decideNextAction('WAITLIST');
   assert.equal(d.action, 'fail');
   assert.match(d.reason, /WAITLIST/);
+});
+
+test('decideNextAction: unexpected status → fail with diagnostic', () => {
+  const d = decideNextAction('GIBBERISH');
+  assert.equal(d.action, 'fail');
+  assert.match(d.reason, /GIBBERISH/);
+});
+
+test('rowStatus: JOIN WAITLIST detected', () => {
+  assert.equal(rowStatus('CROSSFIT® FIT 6:30am (60 min) JOIN WAITLIST'), 'WAITLIST');
+  assert.equal(rowStatus('CROSSFIT® FIT 6:30am (60 min) WAITLIST'), 'WAITLIST');
+});
+
+test('rowStatus: BOOK_NOW takes precedence over stray WAITLIST text', () => {
+  assert.equal(rowStatus('CROSSFIT® FIT 6:30am BOOK NOW (waitlist also visible elsewhere)'), 'BOOK_NOW');
+});
+
+test('rowStatus: WAITLIST takes precedence over FULL when both appear', () => {
+  assert.equal(rowStatus('CROSSFIT® FIT 6:30am FULL — JOIN WAITLIST'), 'WAITLIST');
 });
 
 test('isBookingWindowErrorText: exact modal copy from 2026-04-24 failure', () => {
