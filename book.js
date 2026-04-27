@@ -5,8 +5,12 @@ const fs = require('fs');
 const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
-  classifyButtonStates, parseBookingCard,
+  classifyButtonStates, parseBookingCard, timeToHHMM,
 } = require('./lib');
+const {
+  captureBearerToken, fetchScheduleClasses, findClass,
+  fetchPaymentPassUuid, bookViaApi, generateRecaptchaToken,
+} = require('./api-client');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
 const SGT_TZ = 'Asia/Singapore';
@@ -27,6 +31,9 @@ const noFallback = args.includes('--no-fallback');
 // Safety guard: refuse to book if /account/schedule already has a same-kind
 // booking on the target date. Override with --allow-duplicate (only for tests).
 const allowDuplicate = args.includes('--allow-duplicate');
+// API-direct mode: skip the React UI entirely (~2s vs ~12s). Default ON;
+// disable with --no-api-direct to force the legacy UI flow.
+const apiDirect = !args.includes('--no-api-direct');
 
 const RUN_ID = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
 const RUN_DIR = path.join(__dirname, 'runs', RUN_ID);
@@ -404,6 +411,100 @@ async function verifyOnSchedule(page, plan, target, time, { tries = 4, delayMs =
 
 function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
 
+// API-direct booking: capture Bearer, prefetch class metadata + payment pass,
+// busy-wait to 09:00:00.000, then fire the 6-call pipeline. Returns the same
+// status shape as the UI flow so the caller can treat it uniformly.
+async function executeApiDirect(page, plan, target, t9, noWait) {
+  const sgtDate = ymd(target);
+  const sgtHHMM = timeToHHMM(plan.primaryTime);
+  log(`api-direct: target ${plan.kind} @ ${plan.primaryTime} (SGT ${sgtHHMM}) on ${sgtDate}`);
+
+  // 1. Capture Bearer (~2s).
+  log('api-direct: capturing Bearer token');
+  let bearer;
+  try { bearer = await captureBearerToken(page, { timeoutMs: 20000 }); }
+  catch (e) { return { ok: false, reason: 'bearer-capture-failed', detail: e.message, time: plan.primaryTime }; }
+
+  // 2. Pre-fetch schedule + find target class.
+  log('api-direct: fetching schedule for target date');
+  const fromIso = new Date(`${sgtDate}T00:00:00+08:00`).toISOString();
+  const toIso = new Date(`${sgtDate}T23:59:59+08:00`).toISOString();
+  let classes;
+  try { classes = await fetchScheduleClasses(bearer, { fromIso, toIso }); }
+  catch (e) { return { ok: false, reason: 'schedule-fetch-failed', detail: e.message, time: plan.primaryTime }; }
+  let classMeta = findClass(classes, { kindNeedle: plan.kind, sgtDate, sgtHHMM });
+  if (!classMeta) {
+    // Try fallback time before giving up.
+    if (plan.fallback) {
+      const fbHHMM = timeToHHMM(plan.fallback);
+      classMeta = findClass(classes, { kindNeedle: plan.kind, sgtDate, sgtHHMM: fbHHMM });
+      if (classMeta) log(`api-direct: primary ${plan.primaryTime} not in schedule; using fallback ${plan.fallback}`);
+    }
+    if (!classMeta) return { ok: false, reason: 'class-not-found', detail: `${plan.kind} ${sgtHHMM} not in schedule (${classes.length} classes)`, time: plan.primaryTime };
+  }
+  log(`api-direct: class mb_class_id=${classMeta.mb_class_id} schedule_id=${classMeta.mb_class_schedule_id} status=${classMeta.statusText}`);
+
+  // 3. Pre-fetch payment pass.
+  log('api-direct: fetching payment pass UUID');
+  let paymentMethodUuid;
+  try { paymentMethodUuid = await fetchPaymentPassUuid(bearer, classMeta); }
+  catch (e) { return { ok: false, reason: 'pass-fetch-failed', detail: e.message, time: plan.primaryTime }; }
+  log(`api-direct: pass ${paymentMethodUuid}`);
+
+  // 4. Wait to 09:00:00.000 SGT.
+  const usedTime = classMeta.startTime
+    ? (() => { const d = new Date(classMeta.startTime); return `${(d.getHours()%12||12)}:${String(d.getMinutes()).padStart(2,'0')}${d.getHours()<12?'am':'pm'}`; })()
+    : plan.primaryTime;
+  if (!noWait) {
+    const ms = t9.getTime() - Date.now();
+    if (ms > 0) {
+      const secs = Math.round(ms/1000);
+      await tg(`⏸️ *ragtag booking* — *on standby*\n${plan.kind} @ ${plan.primaryTime} — pre-warmed via API\nwaiting ${secs}s to 09:00:00.000 SGT`);
+      log(`api-direct: waiting ${ms}ms to 09:00:00.000 SGT`);
+      if (ms > 500) await new Promise(r => setTimeout(r, ms - 400));
+      while (Date.now() < t9.getTime()) {}
+      log(`api-direct: drift ${Date.now() - t9.getTime()}ms`);
+    }
+  }
+
+  // 5. Fire the booking pipeline.
+  log('api-direct: firing booking pipeline');
+  let result;
+  try { result = await bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken: '' }); }
+  catch (e) { return { ok: false, reason: 'pipeline-exception', detail: e.message, time: plan.primaryTime }; }
+  log(`api-direct: result ${JSON.stringify(result)}`);
+
+  // 5b. If /process needed a real recaptcha, mint one and retry.
+  if (!result.ok && result.step === 'process' && /recaptcha|captcha/i.test(result.body || '')) {
+    log('api-direct: process needs real recaptcha — minting via browser');
+    try {
+      const tok = await generateRecaptchaToken(page);
+      result = await bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken: tok });
+      log(`api-direct: retry result ${JSON.stringify(result)}`);
+    } catch (e) {
+      log(`api-direct: recaptcha mint failed (${e.message.slice(0,120)})`);
+    }
+  }
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      reason: `api-${result.step}-failed`,
+      detail: `HTTP ${result.status}: ${(result.body || '').slice(0,300)}`,
+      time: usedTime,
+      timing: result.timing,
+    };
+  }
+  return {
+    ok: true,
+    reason: 'booked (api-direct)',
+    detail: `${plan.kind} @ ${usedTime} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} via API in ${result.timing.total}ms (${result.statusTitle})`,
+    time: usedTime,
+    timing: result.timing,
+    via: 'api',
+  };
+}
+
 // Pre-flight guard: fetch /account/schedule and return upcoming bookings.
 // The 2026-04-27 incident: my test run booked Tue 8:30am FIT while user
 // already had Tue 6:30am FIT — Mindbody's explore page row showed BOOK NOW
@@ -599,6 +700,24 @@ async function attemptFallbackBooking(page, plan, target) {
       await page.waitForTimeout(2000);
       await dismissCookieBanner(page);
     }
+
+    // ── API-DIRECT FAST PATH ──────────────────────────────────────────────
+    // Bypass the React UI and book via Mindbody's marketplace gateway directly.
+    // T+0 → committed in ~2.2s vs ~12s for the UI flow. Falls back to UI on
+    // any failure so we never miss a booking due to API regressions.
+    if (apiDirect && !dryRun) {
+      try {
+        const apiResult = await executeApiDirect(page, plan, target, t9, noWait);
+        if (apiResult.ok) {
+          status = apiResult;
+          return;
+        }
+        log(`api-direct failed (${apiResult.reason}: ${(apiResult.detail||'').slice(0,200)}) — falling back to UI flow`);
+      } catch (e) {
+        log(`api-direct exception (${e.message.slice(0,200)}) — falling back to UI flow`);
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────
 
     await clickClassesTab(page);
     await waitForScheduleView(page, 20000);

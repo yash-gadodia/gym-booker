@@ -4,6 +4,7 @@ const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyCheckoutButton, classifyButtonStates, parseBookingCard,
+  timeToHHMM, matchesScheduleEntry,
 } = require('./lib');
 
 test('DAY_SHORT is Sun..Sat indexed by getDay()', () => {
@@ -357,4 +358,64 @@ test('parseBookingCard: returns null for non-booking text', () => {
 test('parseBookingCard: month abbreviations work', () => {
   const b = parseBookingCard('1 Friday May, 2026 CROSSFIT® FIT Coach 6:30am (60 min) Cancel');
   assert.equal(b.ymd, '2026-05-01');
+});
+
+// ---------- timeToHHMM: API-direct uses 24h SGT for matching schedule entries ----------
+
+test('timeToHHMM: am/pm conversion', () => {
+  assert.equal(timeToHHMM('6:30am'), '06:30');
+  assert.equal(timeToHHMM('8:30am'), '08:30');
+  assert.equal(timeToHHMM('12:00am'), '00:00');   // midnight
+  assert.equal(timeToHHMM('12:30pm'), '12:30');   // noon-half
+  assert.equal(timeToHHMM('1:00pm'), '13:00');
+  assert.equal(timeToHHMM('6:30pm'), '18:30');
+  assert.equal(timeToHHMM('11:59pm'), '23:59');
+});
+
+test('timeToHHMM: case + whitespace tolerant', () => {
+  assert.equal(timeToHHMM('6:30 AM'), '06:30');
+  assert.equal(timeToHHMM('1:00 PM'), '13:00');
+});
+
+test('timeToHHMM: rejects bad input', () => {
+  assert.throws(() => timeToHHMM(''), /bad time/);
+  assert.throws(() => timeToHHMM('25:00am'), /hour out of range/);
+  assert.throws(() => timeToHHMM('630am'), /bad time/);
+  assert.throws(() => timeToHHMM(null), /bad time/);
+});
+
+// ---------- matchesScheduleEntry: API-direct picks the right class instance ----------
+
+test('matchesScheduleEntry: real class on Tue 28 8:30am SGT', () => {
+  // Captured 2026-04-27: Tue 28 8:30am FIT had startTime 2026-04-28T00:30:00Z (UTC).
+  // 00:30 UTC == 08:30 SGT (UTC+8). Matcher must convert and align.
+  const entry = { startTime: '2026-04-28T00:30:00Z', courseName: 'FIT' };
+  assert.equal(matchesScheduleEntry(entry, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), true);
+});
+
+test('matchesScheduleEntry: kind mismatch rejected', () => {
+  const entry = { startTime: '2026-04-28T00:30:00Z', courseName: 'Open Gym' };
+  assert.equal(matchesScheduleEntry(entry, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), false);
+});
+
+test('matchesScheduleEntry: time mismatch rejected (5min off)', () => {
+  const entry = { startTime: '2026-04-28T00:35:00Z', courseName: 'FIT' };
+  assert.equal(matchesScheduleEntry(entry, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), false);
+});
+
+test('matchesScheduleEntry: 30s drift accepted (within 1min window)', () => {
+  const entry = { startTime: '2026-04-28T00:30:30Z', courseName: 'FIT' };
+  assert.equal(matchesScheduleEntry(entry, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), true);
+});
+
+test('matchesScheduleEntry: kind needle is case-insensitive substring', () => {
+  const entry = { startTime: '2026-04-28T00:30:00Z', courseName: 'CROSSFIT FIT' };
+  assert.equal(matchesScheduleEntry(entry, { kindNeedle: 'fit', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), true);
+});
+
+test('matchesScheduleEntry: missing fields → false', () => {
+  assert.equal(matchesScheduleEntry({}, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), false);
+  assert.equal(matchesScheduleEntry({ startTime: '2026-04-28T00:30:00Z' }, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), false);
+  assert.equal(matchesScheduleEntry({ courseName: 'FIT' }, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), false);
+  assert.equal(matchesScheduleEntry(null, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), false);
 });

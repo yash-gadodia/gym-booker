@@ -12,6 +12,8 @@ check-status.png
 cancel-modal.png
 cancel-after.png
 my-schedule.png
+# Recon captures contain Bearer JWTs — never commit
+recon-api/
 
 # Dependencies
 node_modules/

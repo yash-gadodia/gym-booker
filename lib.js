@@ -105,6 +105,33 @@ function classifyButtonStates(buttonTexts) {
   return 'settled';                 // neither BUY nor PURCHASING — checkout closed
 }
 
+// Convert a "8:30am" / "12:30pm" / "1:00pm" string to a "HH:MM" 24h string.
+// Used by the API-direct path to match Mindbody's UTC startTime against our
+// SGT-local target time.
+function timeToHHMM(t) {
+  if (!t || typeof t !== 'string') throw new Error(`bad time: ${t}`);
+  const m = t.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/i);
+  if (!m) throw new Error(`bad time: ${t}`);
+  let h = parseInt(m[1], 10);
+  const ap = m[3].toLowerCase();
+  if (ap === 'pm' && h !== 12) h += 12;
+  if (ap === 'am' && h === 12) h = 0;
+  if (h < 0 || h > 23) throw new Error(`hour out of range: ${t}`);
+  return `${String(h).padStart(2, '0')}:${m[2]}`;
+}
+
+// Match a Mindbody schedule entry against (kind, sgtDate, sgtHHMM). Returns
+// true if courseName contains kindNeedle (case-insensitive) and startTime is
+// within 60s of the target SGT moment. Pure function for testing the matcher
+// independently of the network layer in api-client.
+function matchesScheduleEntry(entry, { kindNeedle, sgtDate, sgtHHMM }) {
+  if (!entry || !entry.startTime || !entry.courseName) return false;
+  if (!entry.courseName.toLowerCase().includes(kindNeedle.toLowerCase())) return false;
+  const targetMs = new Date(`${sgtDate}T${sgtHHMM}:00+08:00`).getTime();
+  const t = new Date(entry.startTime).getTime();
+  return Math.abs(t - targetMs) < 60_000;
+}
+
 // Parse a single booking card's flat text from /explore/account/schedule into
 // { date, ymd, kind, time, raw }. Returns null if any field can't be extracted.
 // Format observed 2026-04-27:
@@ -143,4 +170,6 @@ module.exports = {
   classifyCheckoutButton,
   classifyButtonStates,
   parseBookingCard,
+  timeToHHMM,
+  matchesScheduleEntry,
 };
