@@ -8,6 +8,7 @@ auth.json
 runs/
 screenshots/
 netlog.json
+check-status.png
 
 # Dependencies
 node_modules/

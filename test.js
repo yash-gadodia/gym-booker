@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
+  classifyCheckoutButton, classifyButtonStates,
 } = require('./lib');
 
 test('DAY_SHORT is Sun..Sat indexed by getDay()', () => {
@@ -251,4 +252,64 @@ test('regression 2026-04-24: DETAILS row at T+0 → poll (not click)', () => {
 test('regression 2026-04-24: the exact modal copy is recognised', () => {
   // Screenshot from runs/2026-04-24T00-57-04/92400183-post-click.png
   assert.equal(isBookingWindowErrorText('You missed the booking window for this class.'), true);
+});
+
+// ---------- regression: 2026-04-27 PURCHASING false-positive ----------
+
+test('classifyCheckoutButton: BUY (idle)', () => {
+  assert.equal(classifyCheckoutButton('BUY'), 'buy');
+  assert.equal(classifyCheckoutButton('Buy'), 'buy');
+  assert.equal(classifyCheckoutButton('  BUY  '), 'buy');
+});
+
+test('classifyCheckoutButton: PURCHASING and other in-flight labels', () => {
+  // Exact label seen on 2026-04-27 post-buy screenshot.
+  assert.equal(classifyCheckoutButton('PURCHASING'), 'pending');
+  assert.equal(classifyCheckoutButton('Purchasing'), 'pending');
+  assert.equal(classifyCheckoutButton('PROCESSING'), 'pending');
+  assert.equal(classifyCheckoutButton('LOADING'), 'pending');
+  assert.equal(classifyCheckoutButton('PLEASE WAIT'), 'pending');
+  assert.equal(classifyCheckoutButton('SUBMITTING'), 'pending');
+  assert.equal(classifyCheckoutButton('BUYING'), 'pending');
+});
+
+test('classifyCheckoutButton: unrelated buttons fall through', () => {
+  assert.equal(classifyCheckoutButton('Edit'), 'other');
+  assert.equal(classifyCheckoutButton('Cancel'), 'other');
+  assert.equal(classifyCheckoutButton(''), 'absent');
+  assert.equal(classifyCheckoutButton(null), 'absent');
+  assert.equal(classifyCheckoutButton(undefined), 'absent');
+});
+
+test('classifyButtonStates: page with PURCHASING is "pending" (regression)', () => {
+  // 2026-04-27 post-buy.png had buttons: ['Edit', 'Edit', 'Edit', 'Edit', 'PURCHASING'].
+  // Old code: BUY missing → returned ok=true after 2s → bug.
+  // New: PURCHASING dominates → classifier returns 'pending' → caller keeps waiting.
+  const labels = ['Edit', 'Edit', 'Edit', 'Edit', 'PURCHASING'];
+  assert.equal(classifyButtonStates(labels), 'pending');
+});
+
+test('classifyButtonStates: idle checkout with BUY is "buy"', () => {
+  const labels = ['Edit', 'Edit', 'Edit', 'Edit', 'BUY'];
+  assert.equal(classifyButtonStates(labels), 'buy');
+});
+
+test('classifyButtonStates: pending wins over BUY (Mindbody flicker)', () => {
+  // If both labels somehow co-exist mid-render, treat as pending — never settled.
+  const labels = ['BUY', 'PURCHASING'];
+  assert.equal(classifyButtonStates(labels), 'pending');
+});
+
+test('classifyButtonStates: empty / non-checkout page is "settled"', () => {
+  assert.equal(classifyButtonStates([]), 'settled');
+  assert.equal(classifyButtonStates(['Home', 'Logout', 'My Account']), 'settled');
+  assert.equal(classifyButtonStates(null), 'settled');
+});
+
+test('classifyButtonStates: 2026-04-26 false-negative (BUY back after error toast) is "buy" not "settled"', () => {
+  // Yesterday's run: error toast shown but booking succeeded, BUY re-rendered.
+  // The classifier must say 'buy' — caller should not call this "checkout closed".
+  // Verify step (schedule = ground truth) handles the actual outcome.
+  const labels = ['Edit', 'Edit', 'Edit', 'Edit', 'BUY'];
+  assert.equal(classifyButtonStates(labels), 'buy');
 });

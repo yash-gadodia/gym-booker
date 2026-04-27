@@ -5,6 +5,7 @@ const fs = require('fs');
 const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
+  classifyButtonStates,
 } = require('./lib');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
@@ -14,6 +15,15 @@ const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
 const noWait = args.includes('--now') || args.includes('--no-wait');
 const dateArg = args.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a));
+// --time / --kind / --no-fallback: ad-hoc overrides for testing without changing classPlan defaults.
+// Example: node book.js 2026-04-28 --now --time 8:30am --kind FIT --no-fallback
+function getOpt(name) {
+  const i = args.indexOf(`--${name}`);
+  return i >= 0 && args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : null;
+}
+const timeOverride = getOpt('time');
+const kindOverride = getOpt('kind');
+const noFallback = args.includes('--no-fallback');
 
 const RUN_ID = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
 const RUN_DIR = path.join(__dirname, 'runs', RUN_ID);
@@ -274,43 +284,119 @@ async function waitForCheckout(page, { timeoutMs = 45000 } = {}) {
   return { ok: false, reason: `no BUY button within ${timeoutMs}ms` };
 }
 
-// After clicking BUY we need to know within ~10s whether it worked. Old code
-// just slept 5s and took a screenshot — that's what let "Sorry! Something went
-// wrong... try a different payment method" slip through unlogged. Now we
-// actively scrape the page every 250ms for either a success signal (URL change
-// to a confirmation, BUY disappeared) or the error modal's full text — so the
-// run log tells us exactly what Mindbody said.
-async function waitForBuyOutcome(page, { timeoutMs = 12000 } = {}) {
+// After clicking BUY we need to know within ~30s whether it worked.
+//
+// Mindbody's UI is unreliable here — observed behaviors:
+//   - Day-1 (2026-04-25): clean — BUY → modal vanishes → schedule shows BOOKED.
+//   - Day-2 (2026-04-26): BUY → red error toast "We're unable to complete your
+//     order at this time. Please try again." but schedule STILL showed BOOKED.
+//     Error modals can be false negatives.
+//   - Day-3 (2026-04-27): BUY → button text changes to "PURCHASING" (greyed
+//     out, click registered, transaction in-flight) for ~5-10s before resolving.
+//     Old code's "BUY missing → success" heuristic fired in 4.6s while
+//     PURCHASING was still rendering, then we navigated away mid-transaction.
+//     Class went FULL — booking aborted. False positive.
+//
+// New rules (in priority order):
+//   1. Explicit success signal (URL change, success text) → ok=true.
+//   2. PURCHASING/PROCESSING button visible → still in-flight, keep waiting.
+//   3. Error modal text → record but DON'T return early — schedule is ground truth.
+//   4. Both BUY and PURCHASING gone for 1.5s → checkout settled → return.
+//   5. Timeout → return ambiguous result; verify step decides.
+async function waitForBuyOutcome(page, { timeoutMs = 30000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   const errorSelectors = '[role="dialog"], [role="alertdialog"], [class*="Modal"], [class*="modal"], [class*="Error"], [class*="error"], [class*="Toast"]';
   const errorPatterns = /(something went wrong|checkout failed|unable to complete|different payment method|try again|declined|insufficient|expired|invalid)/i;
-  const successPatterns = /(booking confirmed|thank you|your booking|order complete|confirmation)/i;
+  const successPatterns = /(booking confirmed|thank you|your booking|order complete|confirmation|you'?re booked|reserved)/i;
+  let lastError = null;
+  let pendingSeenAt = null;
+  let allButtonsGoneSince = null;
+
   while (Date.now() < deadline) {
-    // Success via URL
+    // 1. Explicit URL success.
     if (/thank|confirm|success|receipt/i.test(page.url())) {
       return { ok: true, reason: 'url', detail: page.url() };
     }
-    // Success via body copy
+    // 2. Explicit body success copy (modal/page text).
     const bodyText = await page.locator('body').innerText({ timeout: 500 }).catch(() => '');
     if (successPatterns.test(bodyText)) {
       return { ok: true, reason: 'confirmation text', detail: (bodyText.match(successPatterns) || [''])[0] };
     }
-    // Error modal / toast
-    const modals = await page.locator(errorSelectors).all().catch(() => []);
-    for (const m of modals) {
-      const t = await m.innerText({ timeout: 300 }).catch(() => '');
-      if (t && errorPatterns.test(t)) {
-        return { ok: false, reason: 'error modal', detail: t.replace(/\s+/g,' ').trim().slice(0, 400) };
+    // 3. Inspect button state via the lib helper (testable).
+    const buttonStates = await page.locator('button').evaluateAll(btns =>
+      btns.map(b => (b.innerText || '').trim()).filter(Boolean)
+    ).catch(() => []);
+    const buttonState = classifyButtonStates(buttonStates);
+    if (buttonState === 'pending') {
+      if (!pendingSeenAt) pendingSeenAt = Date.now();
+      allButtonsGoneSince = null;  // restart the "settled" timer
+    } else if (buttonState === 'settled') {
+      // Both BUY and PURCHASING are gone — could be settled (checkout closed)
+      // OR transient render. Require sustained absence of 1.5s to call it done.
+      if (!allButtonsGoneSince) allButtonsGoneSince = Date.now();
+      const stableMs = Date.now() - allButtonsGoneSince;
+      // We need enough elapsed time since BUY click that the in-flight XHR has had a chance to resolve.
+      const elapsedSinceStart = timeoutMs - (deadline - Date.now());
+      if (stableMs >= 1500 && elapsedSinceStart >= 4000) {
+        return {
+          ok: true,
+          reason: 'checkout closed',
+          detail: `BUY/PURCHASING gone for ${stableMs}ms after ${elapsedSinceStart}ms; pending seen=${pendingSeenAt ? 'yes' : 'no'}`,
+        };
       }
+    } else {
+      // 'buy' — still visible. Could be (a) we never clicked, (b) Mindbody re-rendered BUY after
+      // error, (c) Mindbody re-rendered BUY after success (yesterday's case). Keep waiting.
+      allButtonsGoneSince = null;
     }
-    // Success via BUY vanishing (checkout closed → booking accepted)
-    const buyCount = await page.locator('button').filter({ hasText: /^BUY$/i }).count().catch(() => 1);
-    if (buyCount === 0 && Date.now() > deadline - (timeoutMs - 2000)) {
-      return { ok: true, reason: 'BUY dismissed', detail: 'no BUY button present after click' };
+    // 4. Capture error modal text but don't return — schedule is ground truth.
+    if (!lastError) {
+      const modals = await page.locator(errorSelectors).all().catch(() => []);
+      for (const m of modals) {
+        const t = await m.innerText({ timeout: 300 }).catch(() => '');
+        if (t && errorPatterns.test(t)) {
+          lastError = t.replace(/\s+/g, ' ').trim().slice(0, 400);
+          break;
+        }
+      }
     }
     await page.waitForTimeout(250);
   }
-  return { ok: false, reason: 'timeout', detail: `no success/error signal within ${timeoutMs}ms` };
+  // Timeout — return what we have. ambiguous=true tells caller to lean harder on verify.
+  return {
+    ok: false,
+    ambiguous: true,
+    reason: lastError ? 'error modal (unconfirmed)' : 'timeout',
+    detail: lastError || `no settled signal within ${timeoutMs}ms; pendingSeen=${pendingSeenAt ? 'yes' : 'no'}`,
+  };
+}
+
+// Re-check the schedule page for our row, retrying since Mindbody commits
+// the booking asynchronously (server may take 2-5s to update the row).
+// Returns the BEST status seen across retries — BOOKED beats DETAILS beats FULL.
+async function verifyOnSchedule(page, plan, target, time, { tries = 4, delayMs = 1500 } = {}) {
+  const seen = [];
+  let bestStatus = 'NOT_FOUND';
+  let bestText = null;
+  const rank = { BOOKED: 5, BOOK_NOW: 4, DETAILS: 3, FULL: 2, WAITLIST: 2, UNKNOWN: 1, NOT_FOUND: 0 };
+  for (let i = 0; i < tries; i++) {
+    if (i > 0) {
+      await page.waitForTimeout(delayMs);
+      // Re-render the day to force a refetch.
+      try { await softRefreshSchedule(page, target); } catch {}
+    }
+    const hit = await findRow(page, plan, time);
+    const s = hit ? rowStatus(hit.text) : 'NOT_FOUND';
+    seen.push(s);
+    if ((rank[s] || 0) > (rank[bestStatus] || 0)) {
+      bestStatus = s;
+      bestText = hit ? hit.text : null;
+    }
+    log(`verify try ${i + 1}/${tries}: ${s}${hit ? ` — ${hit.text.slice(0,120)}` : ''}`);
+    // Short-circuit on definitive states.
+    if (s === 'BOOKED' || s === 'FULL' || s === 'BOOK_NOW') break;
+  }
+  return { status: bestStatus, text: bestText, seen };
 }
 
 function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
@@ -359,23 +445,26 @@ async function attemptFallbackBooking(page, plan, target) {
     if (await buy2.count() === 0) return { ok: false, reason: 'fallback BUY button missing' };
     log('CLICK fallback BUY');
     await buy2.click();
-    const o2 = await waitForBuyOutcome(page, { timeoutMs: 12000 });
+    const o2 = await waitForBuyOutcome(page, { timeoutMs: 30000 });
     await snap(page, 'fallback-post-buy');
-    log(`fallback BUY outcome: ok=${o2.ok} reason=${o2.reason} — ${(o2.detail||'').slice(0,300)}`);
+    log(`fallback BUY outcome: ok=${o2.ok}${o2.ambiguous ? ' (ambiguous)' : ''} reason=${o2.reason} — ${(o2.detail||'').slice(0,300)}`);
 
-    // Re-verify on schedule
+    // Re-verify on schedule using the retry-aware helper.
     await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2000);
     await dismissCookieBanner(page);
     await clickClassesTab(page);
     await waitForScheduleView(page, 15000);
     await clickDayTab(page, target);
-    const v = await findRow(page, plan, plan.fallback);
-    const vS = v ? rowStatus(v.text) : 'NOT_FOUND';
-    log(`fallback verify: ${vS}`);
+    const v2 = await verifyOnSchedule(page, plan, target, plan.fallback, { tries: 4, delayMs: 1500 });
+    log(`fallback verify final: ${v2.status} (saw: ${v2.seen.join('→')})`);
     await snap(page, 'fallback-verify');
-    if (vS === 'BOOKED') return { ok: true, reason: 'fallback booked' };
-    return { ok: false, reason: `fallback unverified (row ${vS}; BUY ${o2.ok ? 'ok' : o2.reason + ': ' + (o2.detail||'').slice(0,120)})` };
+    if (v2.status === 'BOOKED') return { ok: true, reason: 'fallback booked' };
+    if (o2.ok && v2.status !== 'BOOK_NOW' && v2.status !== 'FULL') {
+      // Same trust logic as primary: BUY settled cleanly + ambiguous verify → trust BUY.
+      return { ok: true, reason: `fallback booked (BUY-confirmed, verify=${v2.status})` };
+    }
+    return { ok: false, reason: `fallback unverified (row ${v2.status}; BUY ${o2.ok ? 'ok' : o2.reason + ': ' + (o2.detail||'').slice(0,120)})` };
   } catch (e) {
     return { ok: false, reason: `fallback exception: ${e.message}` };
   }
@@ -384,7 +473,12 @@ async function attemptFallbackBooking(page, plan, target) {
 (async () => {
   const today = new Date();
   const target = dateArg ? new Date(`${dateArg}T00:00:00`) : addDays(today, 2);
-  const plan = classPlan(target);
+  const basePlan = classPlan(target);
+  const plan = {
+    kind: kindOverride || basePlan.kind,
+    primaryTime: timeOverride || basePlan.primaryTime,
+    fallback: noFallback || timeOverride ? null : basePlan.fallback,
+  };
   const t9 = nineAmToday();
 
   log(`RUN ${RUN_ID}`);
@@ -562,10 +656,14 @@ async function attemptFallbackBooking(page, plan, target) {
     log('CLICK BUY');
     await buy.click();
 
-    const buyOutcome = await waitForBuyOutcome(page, { timeoutMs: 12000 });
+    // Wait for the PURCHASING transient to fully resolve before navigating away.
+    // The 2026-04-27 failure was navigating during PURCHASING, which aborted the in-flight transaction.
+    const buyOutcome = await waitForBuyOutcome(page, { timeoutMs: 30000 });
     await snap(page, 'post-buy');
-    log(`BUY outcome: ok=${buyOutcome.ok} reason=${buyOutcome.reason} — ${(buyOutcome.detail||'').slice(0,300)}`);
+    log(`BUY outcome: ok=${buyOutcome.ok}${buyOutcome.ambiguous ? ' (ambiguous)' : ''} reason=${buyOutcome.reason} — ${(buyOutcome.detail||'').slice(0,300)}`);
 
+    // Schedule is the ground truth — Mindbody's checkout UI is unreliable
+    // (false-positive "BUY missing", false-negative "error modal but actually booked").
     log('verifying booked status on schedule');
     await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2500);
@@ -573,27 +671,38 @@ async function attemptFallbackBooking(page, plan, target) {
     await clickClassesTab(page);
     await waitForScheduleView(page, 20000);
     await clickDayTab(page, target);
-    const verify = await findRow(page, plan, chosen.time);
-    const vStatus = verify ? rowStatus(verify.text) : 'NOT_FOUND';
-    log(`verify status: ${vStatus}, text: ${verify ? verify.text.slice(0,160) : '(no row)'}`);
+    const verify = await verifyOnSchedule(page, plan, target, chosen.time, { tries: 4, delayMs: 1500 });
+    log(`verify final: ${verify.status} (saw: ${verify.seen.join('→')})`);
     await snap(page, 'verify');
 
-    if (vStatus === 'BOOKED') {
+    if (verify.status === 'BOOKED') {
       status = { ok: true, reason: 'booked', detail: `${plan.kind} @ ${chosen.time} on ${DAY_SHORT[target.getDay()]} ${ymd(target)}`, time: chosen.time };
-    } else if (plan.fallback && chosen.time === plan.primaryTime) {
-      // Primary did not book (checkout error, race lost, etc). Try the 7:30am fallback
-      // before giving up — may still be available if primary-race losers also fell back.
-      const fbReason = buyOutcome.ok ? `row shows ${vStatus}` : `BUY ${buyOutcome.reason}: ${(buyOutcome.detail||'').slice(0,120)}`;
-      log(`primary unverified (${fbReason}) — attempting fallback ${plan.fallback}`);
-      const fb = await attemptFallbackBooking(page, plan, target);
-      if (fb.ok) {
-        status = { ok: true, reason: 'booked (fallback)', detail: `${plan.kind} @ ${plan.fallback} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} (primary ${plan.primaryTime} failed: ${fbReason})`, time: plan.fallback };
+    } else if (verify.status === 'FULL') {
+      // Race lost — the spot we tried to book is gone. Fallback may still be open.
+      const fbReason = `row went FULL (race lost)`;
+      if (plan.fallback && chosen.time === plan.primaryTime) {
+        log(`primary FULL — attempting fallback ${plan.fallback}`);
+        const fb = await attemptFallbackBooking(page, plan, target);
+        if (fb.ok) {
+          status = { ok: true, reason: 'booked (fallback)', detail: `${plan.kind} @ ${plan.fallback} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} (primary ${plan.primaryTime}: ${fbReason})`, time: plan.fallback };
+        } else {
+          status = { ok: false, reason: 'unverified', detail: `primary: ${fbReason}; fallback: ${fb.reason}`, time: chosen.time };
+        }
       } else {
-        status = { ok: false, reason: 'unverified', detail: `primary: ${fbReason}; fallback: ${fb.reason}`, time: chosen.time };
+        status = { ok: false, reason: 'unverified', detail: fbReason, time: chosen.time };
       }
+    } else if (verify.status === 'BOOK_NOW') {
+      // Definitively NOT booked — BUY click never landed, or checkout was aborted.
+      // Don't fire fallback to avoid double-booking; user can retry manually.
+      status = { ok: false, reason: 'not booked', detail: `row still BOOK NOW after BUY (BUY outcome: ${buyOutcome.reason} — ${(buyOutcome.detail||'').slice(0,150)})`, time: chosen.time };
+    } else if (buyOutcome.ok) {
+      // Verify is ambiguous (DETAILS or NOT_FOUND), but waitForBuyOutcome saw a clean settle.
+      // Mindbody hides booked classes from the explore view sometimes — trust the BUY signal.
+      status = { ok: true, reason: 'booked (BUY-confirmed)', detail: `${plan.kind} @ ${chosen.time} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} — verify ${verify.status} but BUY ok (${buyOutcome.reason})`, time: chosen.time };
     } else {
-      const fbReason = buyOutcome.ok ? `row shows ${vStatus}` : `BUY ${buyOutcome.reason}: ${(buyOutcome.detail||'').slice(0,200)}`;
-      status = { ok: false, reason: 'unverified', detail: fbReason, time: chosen.time };
+      // Truly ambiguous: BUY didn't settle cleanly AND verify isn't BOOKED.
+      // Don't double-book by firing fallback — report and let user check.
+      status = { ok: false, reason: 'unverified', detail: `verify=${verify.status} (${verify.seen.join('→')}); BUY=${buyOutcome.reason}: ${(buyOutcome.detail||'').slice(0,150)}`, time: chosen.time };
     }
   } catch (e) {
     log('ERROR', e.message);
