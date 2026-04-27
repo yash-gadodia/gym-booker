@@ -105,6 +105,30 @@ function classifyButtonStates(buttonTexts) {
   return 'settled';                 // neither BUY nor PURCHASING — checkout closed
 }
 
+// Parse a single booking card's flat text from /explore/account/schedule into
+// { date, ymd, kind, time, raw }. Returns null if any field can't be extracted.
+// Format observed 2026-04-27:
+//   "28 Tuesday April, 2026 CROSSFIT® FIT RagTag Training w/ Sam Chappie 6:30am (60 min) Cancel +CALENDAR"
+const _MONTHS = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+function parseBookingCard(text) {
+  if (!text || typeof text !== 'string') return null;
+  const flat = text.replace(/\s+/g, ' ');
+  const dayM = flat.match(/\b(\d{1,2})\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i);
+  const monthM = flat.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*,?\s+(\d{4})/i);
+  const timeM = flat.match(/\b(\d{1,2}:\d{2})\s*(am|pm)\b/i);
+  const kind = /CROSSFIT®\s*FIT\b/i.test(flat) ? 'FIT'
+             : /CROSSFIT®\s*Gymnastics\b/i.test(flat) ? 'Gymnastics'
+             : /CROSSFIT®\s*Lift\b/i.test(flat) ? 'Lift'
+             : /Open Gym/i.test(flat) ? 'Open Gym'
+             : null;
+  if (!dayM || !monthM || !timeM || !kind) return null;
+  const dom = parseInt(dayM[1], 10);
+  const mon = _MONTHS[monthM[1].toLowerCase().slice(0, 3)];
+  const yr = parseInt(monthM[2], 10);
+  const date = new Date(yr, mon, dom);
+  return { date, ymd: ymd(date), kind, time: `${timeM[1]}${timeM[2].toLowerCase()}`, raw: flat };
+}
+
 module.exports = {
   DAY_SHORT,
   addDays,
@@ -118,4 +142,5 @@ module.exports = {
   isLoginRedirectUrl,
   classifyCheckoutButton,
   classifyButtonStates,
+  parseBookingCard,
 };

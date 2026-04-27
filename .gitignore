@@ -9,6 +9,9 @@ runs/
 screenshots/
 netlog.json
 check-status.png
+cancel-modal.png
+cancel-after.png
+my-schedule.png
 
 # Dependencies
 node_modules/

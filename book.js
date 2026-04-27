@@ -5,7 +5,7 @@ const fs = require('fs');
 const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
-  classifyButtonStates,
+  classifyButtonStates, parseBookingCard,
 } = require('./lib');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
@@ -24,6 +24,9 @@ function getOpt(name) {
 const timeOverride = getOpt('time');
 const kindOverride = getOpt('kind');
 const noFallback = args.includes('--no-fallback');
+// Safety guard: refuse to book if /account/schedule already has a same-kind
+// booking on the target date. Override with --allow-duplicate (only for tests).
+const allowDuplicate = args.includes('--allow-duplicate');
 
 const RUN_ID = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
 const RUN_DIR = path.join(__dirname, 'runs', RUN_ID);
@@ -401,6 +404,44 @@ async function verifyOnSchedule(page, plan, target, time, { tries = 4, delayMs =
 
 function nineAmToday() { const d = new Date(); d.setHours(9,0,0,0); return d; }
 
+// Pre-flight guard: fetch /account/schedule and return upcoming bookings.
+// The 2026-04-27 incident: my test run booked Tue 8:30am FIT while user
+// already had Tue 6:30am FIT — Mindbody's explore page row showed BOOK NOW
+// (not DETAILS/BOOKED), so the row-status check missed the duplicate. The
+// authoritative list lives at /account/schedule, which we should consult
+// before clicking anything.
+async function fetchMyUpcomingBookings(page) {
+  const acctUrl = 'https://www.mindbodyonline.com/explore/account/schedule';
+  await page.goto(acctUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(3000);
+  await dismissCookieBanner(page);
+  // The page renders one card per booking under the UPCOMING tab. Each card
+  // contains: day-of-month, weekday, "Month, YYYY", kind ("CROSSFIT® FIT" /
+  // "CROSSFIT® Gymnastics"), instructor line, time, "Cancel" button.
+  // Use the same per-card scoping logic as cancel-booking.js (smallest
+  // ancestor containing exactly one Cancel button).
+  const cards = await page.evaluate(() => {
+    const cancelBtns = Array.from(document.querySelectorAll('button, a'))
+      .filter(e => /^Cancel$/i.test((e.innerText || '').trim()));
+    const out = [];
+    for (const btn of cancelBtns) {
+      let n = btn.parentElement;
+      let best = (btn.innerText || '').trim();
+      for (let j = 0; j < 15 && n; j++) {
+        const cancelCount = Array.from(n.querySelectorAll('button, a'))
+          .filter(e => /^Cancel$/i.test((e.innerText || '').trim())).length;
+        if (cancelCount > 1) break;
+        const t = (n.innerText || '').trim();
+        if (t.length > best.length && t.length < 600) best = t;
+        n = n.parentElement;
+      }
+      out.push(best.replace(/\s+/g, ' '));
+    }
+    return out;
+  });
+  return cards.map(parseBookingCard).filter(Boolean);
+}
+
 // Last-resort fallback: primary class failed post-BUY. Try the fallback time
 // from the schedule page we're already on. Keeps the logic here (not in the
 // main flow) to avoid nesting — primary attempt is the bulk of book.js.
@@ -529,6 +570,34 @@ async function attemptFallbackBooking(page, plan, target) {
       await snap(page, 'post-relogin');
       if (await isLoggedOut(page)) throw new Error('still logged out after re-login attempt');
       await tg(`🔐 *ragtag booking* — *logged in*\nfresh session saved (${forceLogin ? 'proactive' : 'reactive'})`);
+    }
+
+    // Pre-flight: /account/schedule is the authoritative bookings list. Skip
+    // if user already has a same-kind booking on the target date — explore-page
+    // row text can show stale BOOK NOW even when the user is already booked
+    // (caused the 2026-04-27 duplicate-booking incident).
+    if (!allowDuplicate) {
+      try {
+        const myBookings = await fetchMyUpcomingBookings(page);
+        log(`my-schedule: ${myBookings.length} upcoming bookings`);
+        for (const b of myBookings) log(`  ${b.ymd} ${b.kind} @ ${b.time}`);
+        const dup = myBookings.find(b => b.ymd === ymd(target) && b.kind === plan.kind);
+        if (dup) {
+          status = {
+            ok: true,
+            reason: 'already_booked',
+            detail: `${plan.kind} on ${ymd(target)} already booked at ${dup.time} (skipped, would have tried ${plan.primaryTime})`,
+            time: dup.time,
+          };
+          return;
+        }
+      } catch (e) {
+        log(`my-schedule pre-flight failed (${e.message.slice(0,120)}) — continuing without guard`);
+      }
+      // Re-land on ragtag for the rest of the flow.
+      await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(2000);
+      await dismissCookieBanner(page);
     }
 
     await clickClassesTab(page);

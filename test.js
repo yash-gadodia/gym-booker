@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
-  classifyCheckoutButton, classifyButtonStates,
+  classifyCheckoutButton, classifyButtonStates, parseBookingCard,
 } = require('./lib');
 
 test('DAY_SHORT is Sun..Sat indexed by getDay()', () => {
@@ -312,4 +312,49 @@ test('classifyButtonStates: 2026-04-26 false-negative (BUY back after error toas
   // Verify step (schedule = ground truth) handles the actual outcome.
   const labels = ['Edit', 'Edit', 'Edit', 'Edit', 'BUY'];
   assert.equal(classifyButtonStates(labels), 'buy');
+});
+
+// ---------- parseBookingCard: source of truth for "already booked" guard ----------
+
+test('parseBookingCard: real card from 2026-04-27 /account/schedule', () => {
+  const text = '28 Tuesday April, 2026 CROSSFIT® FIT RagTag Training w/ Sam Chappie 6:30am (60 min) Cancel +CALENDAR';
+  const b = parseBookingCard(text);
+  assert.ok(b);
+  assert.equal(b.ymd, '2026-04-28');
+  assert.equal(b.kind, 'FIT');
+  assert.equal(b.time, '6:30am');
+});
+
+test('parseBookingCard: 8:30am variant', () => {
+  const text = '28 Tuesday April, 2026 CROSSFIT® FIT RagTag Training w/ Sam Chappie 8:30am (60 min) Cancel +CALENDAR';
+  const b = parseBookingCard(text);
+  assert.equal(b.time, '8:30am');
+  assert.equal(b.kind, 'FIT');
+});
+
+test('parseBookingCard: Gymnastics kind', () => {
+  const text = '26 Sunday April, 2026 CROSSFIT® Gymnastics Tris Kong 1:00pm (90 min) Cancel +CALENDAR';
+  const b = parseBookingCard(text);
+  assert.equal(b.kind, 'Gymnastics');
+  assert.equal(b.time, '1:00pm');
+  assert.equal(b.ymd, '2026-04-26');
+});
+
+test('parseBookingCard: Lift and Open Gym kinds', () => {
+  assert.equal(parseBookingCard('30 Friday April, 2026 CROSSFIT® Lift Sam Chappie 6:30pm (60 min) Cancel +CALENDAR').kind, 'Lift');
+  assert.equal(parseBookingCard('27 Monday April, 2026 OTHER Open Gym RAGTAG Staff 5:30pm (60 min) Cancel +CALENDAR').kind, 'Open Gym');
+});
+
+test('parseBookingCard: returns null for non-booking text', () => {
+  assert.equal(parseBookingCard('foo bar baz'), null);
+  assert.equal(parseBookingCard(''), null);
+  assert.equal(parseBookingCard(null), null);
+  assert.equal(parseBookingCard(undefined), null);
+  // Missing time
+  assert.equal(parseBookingCard('28 Tuesday April, 2026 CROSSFIT® FIT Cancel'), null);
+});
+
+test('parseBookingCard: month abbreviations work', () => {
+  const b = parseBookingCard('1 Friday May, 2026 CROSSFIT® FIT Coach 6:30am (60 min) Cancel');
+  assert.equal(b.ymd, '2026-05-01');
 });
