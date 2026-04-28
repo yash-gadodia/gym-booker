@@ -57,13 +57,23 @@ async function tg(text) {
   if (suppressTg) { log(`tg: suppressed (dry/now mode): ${text.split('\n')[0]}`); return; }
   if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) { log('tg: missing creds'); return; }
   const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const post = async (body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   try {
-    const r = await fetch(url, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown', disable_web_page_preview: true }),
-    });
-    if (!r.ok) log('tg FAIL', r.status, await r.text());
-    else log('tg sent');
+    let r = await post({ chat_id: process.env.TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown', disable_web_page_preview: true });
+    if (!r.ok) {
+      const errText = await r.text();
+      // Markdown is brittle — any unbalanced `_*[]` in dynamic content (e.g.
+      // statusTitle="processing_requested") triggers a 400 "can't parse entities".
+      // Fall back to plain text so the user always gets the booking outcome.
+      if (r.status === 400 && /parse|entit/i.test(errText)) {
+        log('tg FAIL (parse) — retrying as plain text');
+        r = await post({ chat_id: process.env.TELEGRAM_CHAT_ID, text: `[parse fallback]\n${text}`, disable_web_page_preview: true });
+        if (r.ok) { log('tg sent (plain fallback)'); return; }
+        log('tg FAIL (plain retry)', r.status, await r.text());
+        return;
+      }
+      log('tg FAIL', r.status, errText);
+    } else { log('tg sent'); }
   } catch (e) { log('tg ERR', e.message); }
 }
 
@@ -498,7 +508,7 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
   return {
     ok: true,
     reason: 'booked (api-direct)',
-    detail: `${plan.kind} @ ${usedTime} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} via API in ${result.timing.total}ms (${result.statusTitle})`,
+    detail: `${plan.kind} @ ${usedTime} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} via API in ${result.timing.total}ms (\`${result.statusTitle}\`)`,
     time: usedTime,
     timing: result.timing,
     via: 'api',
