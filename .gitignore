@@ -6,6 +6,8 @@ auth.json
 # Multi-user creds + per-user storage state
 users.json
 users-auth/
+# Per-date overrides + pause windows (managed by ~/.openclaw/scripts/gym-override.py)
+overrides.json
 
 # Per-run artifacts
 runs/

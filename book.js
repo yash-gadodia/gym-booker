@@ -6,6 +6,7 @@ const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
+  loadOverrides, resolveBookingForDate,
 } = require('./lib');
 const {
   captureBearerToken, fetchScheduleClasses, findClass,
@@ -650,18 +651,29 @@ async function attemptFallbackBooking(page, plan, target) {
 (async () => {
   const today = new Date();
   const target = dateArg ? new Date(`${dateArg}T00:00:00`) : addDays(today, 2);
-  // For Yash (no --user): always use classPlan defaults.
-  // For other users: resolve from their schedule override; null = opt-out for this DOW.
-  const basePlan = user ? resolveSchedule(target, user.schedule) : classPlan(target);
-  if (!basePlan) {
-    // User explicitly has no schedule for this day-of-week — exit before
-    // browser launch, no booking attempted, no error alert.
+  // Per-date overrides + pause windows are layered on top of the user's
+  // baseline schedule. Override file is gym-booker/overrides.json (gitignored,
+  // managed via gym-override.py — Lawrence writes to it on user request).
+  // Yash has no users.json row, so his override key is the literal string 'yash'.
+  const userKey = user ? user.id : 'yash';
+  const overridesPath = path.join(__dirname, 'overrides.json');
+  const dateOverrides = loadOverrides(overridesPath);
+  const decision = resolveBookingForDate(target, userKey, user ? user.schedule : null, dateOverrides);
+  if (decision.skip) {
+    // Three skip kinds, all clean exits (ok=true so launchd / book-all reads as success):
+    //   opt_out_day → no class scheduled for this DOW (user pref)
+    //   date_skip   → user explicitly cancelled this date
+    //   paused      → user is on leave through pauseUntil
     const dayLabel = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
-    log(`opt_out_day: ${user.label || user.id} has no schedule for ${dayLabel}`);
-    await tg(personality.outcome(user, { ok: true, reason: 'opt_out_day' }, { dayLabel, planLine: '', runId: RUN_ID }));
+    const who = user ? (user.label || user.id) : 'Yash';
+    log(`skip ${decision.skip}: ${who} on ${dayLabel}${decision.detail ? ` (${decision.detail})` : ''}`);
+    await tg(personality.outcome(user,
+      { ok: true, reason: decision.skip, detail: decision.detail },
+      { dayLabel, planLine: '', runId: RUN_ID }));
     flushLog();
     process.exit(0);
   }
+  const basePlan = decision;
   const plan = {
     kind: kindOverride || basePlan.kind,
     primaryTime: timeOverride || basePlan.primaryTime,

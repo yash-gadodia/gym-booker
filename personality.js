@@ -191,6 +191,29 @@ const OUTCOME = {
       ({ dayLabel }) => `🥗 ${dayLabel} is a rest day — hydrate, stretch, snack 💚`,
     ],
   },
+  // User is on a multi-day pause (pauseUntil window).
+  paused: {
+    chaotic: [
+      ({ dayLabel, detail }) => `⏸️ *Bookings paused.* ${dayLabel}: standing down (${detail || 'pause active'}). Resume on your word, captain.`,
+      ({ dayLabel }) => `⏸️ *On ice.* ${dayLabel} is inside your pause window. Lawrence stays in his lane.`,
+      ({ dayLabel, detail }) => `🛑 *Paused.* No booking for ${dayLabel} — ${detail || 'on leave'}. DM me to un-pause anytime.`,
+    ],
+    wholesome: [
+      ({ dayLabel, detail }) => `⏸️ Bookings paused for ${dayLabel} — ${detail || 'on leave'}. Lmk when you're back! 💛`,
+      ({ dayLabel }) => `🛑 You're on a break — no booking for ${dayLabel}. Enjoy the time off ✨`,
+    ],
+  },
+  // User explicitly skipped this single date.
+  dateSkip: {
+    chaotic: [
+      ({ dayLabel }) => `⏭️ *Skipped on request.* ${dayLabel} — you said no, Lawrence said cool.`,
+      ({ dayLabel }) => `❎ *${dayLabel}: cancelled by you.* Honoring the override. Tomorrow's still on.`,
+    ],
+    wholesome: [
+      ({ dayLabel }) => `❎ Skipping ${dayLabel} as you asked! Have a lovely day 💛`,
+      ({ dayLabel }) => `⏭️ ${dayLabel} skipped per your request. See you next class! 🌟`,
+    ],
+  },
   // Race lost — class went FULL before we could BUY.
   full: {
     chaotic: [
@@ -247,6 +270,8 @@ function _bucket(status) {
     return 'exception';
   }
   if (r === 'opt_out_day') return 'optOut';
+  if (r === 'paused') return 'paused';
+  if (r === 'date_skip') return 'dateSkip';
   if (r === 'dry_run') return 'dryRun';
   if (r === 'already_booked') return 'alreadyBooked';
   if (status.via === 'api' && status.timing && status.timing.total) return 'bookedFast';

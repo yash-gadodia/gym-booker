@@ -1,10 +1,14 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
 const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyCheckoutButton, classifyButtonStates, parseBookingCard,
   timeToHHMM, matchesScheduleEntry, resolveSchedule,
+  loadOverrides, resolveBookingForDate,
 } = require('./lib');
 const { getTelegramTarget } = require('./users');
 const personality = require('./personality');
@@ -731,4 +735,129 @@ test('safe: real-world dynamic content from book.js does not break', () => {
     // Must not contain unbalanced markdown-breaking chars after cleaning
     assert.doesNotMatch(cleaned, /[*_[\]`]/, `safe() left a chr in: ${cleaned}`);
   }
+});
+
+// ──────────────────────── overrides + resolveBookingForDate ────────────────────────
+
+test('loadOverrides: missing file returns empty shell', () => {
+  const o = loadOverrides('/tmp/this-file-definitely-does-not-exist-9z8y.json');
+  assert.deepEqual(o, { users: {} });
+});
+
+test('loadOverrides: malformed JSON returns empty shell (does not throw)', () => {
+  const tmp = path.join(os.tmpdir(), `gym-overrides-bad-${Date.now()}.json`);
+  fs.writeFileSync(tmp, '{this is not valid json');
+  try {
+    const o = loadOverrides(tmp);
+    assert.deepEqual(o, { users: {} });
+  } finally { fs.unlinkSync(tmp); }
+});
+
+test('loadOverrides: missing top-level "users" key returns empty shell', () => {
+  const tmp = path.join(os.tmpdir(), `gym-overrides-noroot-${Date.now()}.json`);
+  fs.writeFileSync(tmp, JSON.stringify({ version: 1 }));
+  try {
+    const o = loadOverrides(tmp);
+    assert.deepEqual(o, { users: {} });
+  } finally { fs.unlinkSync(tmp); }
+});
+
+test('loadOverrides: well-formed file round-trips', () => {
+  const tmp = path.join(os.tmpdir(), `gym-overrides-good-${Date.now()}.json`);
+  const payload = { version: 1, users: { yash: { pauseUntil: '2026-05-15' } } };
+  fs.writeFileSync(tmp, JSON.stringify(payload));
+  try {
+    const o = loadOverrides(tmp);
+    assert.deepEqual(o, payload);
+  } finally { fs.unlinkSync(tmp); }
+});
+
+test('resolveBookingForDate: no overrides → falls through to classPlan (Yash)', () => {
+  const r = resolveBookingForDate(new Date('2026-05-04T00:00:00'), 'yash', null, { users: {} });
+  assert.deepEqual(r, { kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' });
+});
+
+test('resolveBookingForDate: per-date time override (Yash) — fallback is dropped', () => {
+  const o = { users: { yash: { perDate: { '2026-05-04': { time: '7:30am' } } } } };
+  const r = resolveBookingForDate(new Date('2026-05-04T00:00:00'), 'yash', null, o);
+  assert.deepEqual(r, { kind: 'FIT', primaryTime: '7:30am', fallback: null });
+});
+
+test('resolveBookingForDate: per-date kind override picks up explicit kind', () => {
+  const o = { users: { yash: { perDate: { '2026-05-04': { time: '12:30pm', kind: 'Gymnastics' } } } } };
+  const r = resolveBookingForDate(new Date('2026-05-04T00:00:00'), 'yash', null, o);
+  assert.deepEqual(r, { kind: 'Gymnastics', primaryTime: '12:30pm', fallback: null });
+});
+
+test('resolveBookingForDate: per-date null = date_skip', () => {
+  const o = { users: { yash: { perDate: { '2026-05-04': null } } } };
+  const r = resolveBookingForDate(new Date('2026-05-04T00:00:00'), 'yash', null, o);
+  assert.deepEqual(r, { skip: 'date_skip' });
+});
+
+test('resolveBookingForDate: pauseUntil window skips dates within range (inclusive)', () => {
+  const o = { users: { yash: { pauseUntil: '2026-05-15' } } };
+  // before pause start — pause window is "until X", so any date <= X is paused
+  const r1 = resolveBookingForDate(new Date('2026-05-11T00:00:00'), 'yash', null, o);  // Mon
+  assert.equal(r1.skip, 'paused');
+  // exact boundary day (inclusive) — Fri
+  const r2 = resolveBookingForDate(new Date('2026-05-15T00:00:00'), 'yash', null, o);
+  assert.equal(r2.skip, 'paused');
+  // day after pause ends — booking resumes (use Mon to keep FIT default)
+  const r3 = resolveBookingForDate(new Date('2026-05-18T00:00:00'), 'yash', null, o);  // Mon
+  assert.equal(r3.kind, 'FIT');
+  assert.equal(r3.skip, undefined);
+});
+
+test('resolveBookingForDate: explicit perDate beats pauseUntil (break-the-pause for one class)', () => {
+  const o = { users: { yash: {
+    pauseUntil: '2026-05-15',
+    perDate: { '2026-05-11': { time: '8:30am' } },  // Mon, inside pause
+  } } };
+  const r = resolveBookingForDate(new Date('2026-05-11T00:00:00'), 'yash', null, o);
+  assert.deepEqual(r, { kind: 'FIT', primaryTime: '8:30am', fallback: null });
+});
+
+test('resolveBookingForDate: per-user isolation (yash override does not affect dani)', () => {
+  const o = { users: { yash: { pauseUntil: '2030-01-01' } } };
+  const r = resolveBookingForDate(new Date('2026-05-04T00:00:00'), 'dani', null, o);
+  assert.equal(r.skip, undefined);
+  assert.equal(r.kind, 'FIT');
+});
+
+test('resolveBookingForDate: DOW opt-out via userScheduleOverride → opt_out_day', () => {
+  // Dani has Mon-Wed only; Thursday is opt-out
+  const danischedule = { Mon: {kind:'FIT', primaryTime:'7:30am'}, Tue: {kind:'FIT', primaryTime:'7:30am'}, Wed: {kind:'FIT', primaryTime:'7:30am'} };
+  // 2026-05-07 = Thursday (no Mon/Tue/Wed → null)
+  const r = resolveBookingForDate(new Date('2026-05-07T00:00:00'), 'dani', danischedule, { users: {} });
+  assert.deepEqual(r, { skip: 'opt_out_day' });
+});
+
+test('resolveBookingForDate: explicit perDate beats DOW opt-out', () => {
+  const danischedule = { Mon: {kind:'FIT', primaryTime:'7:30am'} };
+  const o = { users: { dani: { perDate: { '2026-05-07': { time: '8:30am' } } } } };  // Thu, normally opt-out
+  const r = resolveBookingForDate(new Date('2026-05-07T00:00:00'), 'dani', danischedule, o);
+  // Thu DOW default in classPlan is FIT @ 6:30am, but override sets time → 8:30am
+  assert.deepEqual(r, { kind: 'FIT', primaryTime: '8:30am', fallback: null });
+});
+
+test('resolveBookingForDate: malformed dateOverrides arg does not crash', () => {
+  const r1 = resolveBookingForDate(new Date('2026-05-04T00:00:00'), 'yash', null, null);
+  assert.equal(r1.kind, 'FIT');
+  const r2 = resolveBookingForDate(new Date('2026-05-04T00:00:00'), 'yash', null, undefined);
+  assert.equal(r2.kind, 'FIT');
+  const r3 = resolveBookingForDate(new Date('2026-05-04T00:00:00'), 'yash', null, { users: null });
+  assert.equal(r3.kind, 'FIT');
+});
+
+test('resolveBookingForDate: Saturday gymnastics default carries through override-free path', () => {
+  const r = resolveBookingForDate(new Date('2026-05-02T00:00:00'), 'yash', null, { users: {} });
+  assert.deepEqual(r, { kind: 'Gymnastics', primaryTime: '12:30pm', fallback: null });
+});
+
+test('resolveBookingForDate: Saturday with time-only override defaults kind to Gymnastics', () => {
+  // User says "do 11am instead of 12:30pm Saturday" — kind should still be Gymnastics
+  const o = { users: { yash: { perDate: { '2026-05-02': { time: '11:00am' } } } } };
+  const r = resolveBookingForDate(new Date('2026-05-02T00:00:00'), 'yash', null, o);
+  assert.deepEqual(r, { kind: 'Gymnastics', primaryTime: '11:00am', fallback: null });
 });

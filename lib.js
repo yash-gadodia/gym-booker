@@ -1,3 +1,5 @@
+const fs = require('fs');
+
 const DAY_SHORT = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
 function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
@@ -26,6 +28,62 @@ function resolveSchedule(targetDate, scheduleOverride) {
   const entry = scheduleOverride[dayKey];
   if (!entry) return null;
   return { kind: entry.kind, primaryTime: entry.primaryTime, fallback: entry.fallback || null };
+}
+
+// Read overrides.json. Returns the parsed object on success, or an empty
+// shell { users: {} } on missing/malformed — bookings must never crash on a
+// bad override file, and an empty file means "no overrides, use baseline".
+function loadOverrides(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return { users: {} };
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const j = JSON.parse(raw);
+    if (!j || typeof j !== 'object' || !j.users || typeof j.users !== 'object') return { users: {} };
+    return j;
+  } catch {
+    return { users: {} };
+  }
+}
+
+// Final booking decision for (targetDate, userKey). Layered precedence:
+//   1. perDate[ymd] is an object   → use it (kind/time fall back to classPlan defaults)
+//   2. perDate[ymd] === null       → skip this date
+//   3. pauseUntil >= targetDate    → paused (skip)
+//   4. baseline schedule           → resolveSchedule or classPlan; null → opt_out_day
+//
+// Note: explicit perDate beats pauseUntil — if you set an override for a date
+// that's inside your pause window, the override wins (treated as "break the pause
+// for this one class"). Explicit perDate also beats DOW opt-out for the same reason.
+//
+// Returns either a plan { kind, primaryTime, fallback } OR a skip object
+// { skip: 'paused'|'date_skip'|'opt_out_day', detail? }.
+function resolveBookingForDate(targetDate, userKey, userScheduleOverride, dateOverrides) {
+  const target = ymd(targetDate);
+  const userOverride = (dateOverrides && dateOverrides.users && dateOverrides.users[userKey]) || {};
+  const perDate = userOverride.perDate || {};
+
+  if (Object.prototype.hasOwnProperty.call(perDate, target)) {
+    const entry = perDate[target];
+    if (entry === null) return { skip: 'date_skip' };
+    if (entry && typeof entry === 'object') {
+      const dowDefault = classPlan(targetDate);
+      return {
+        kind: entry.kind || dowDefault.kind,
+        primaryTime: entry.time || dowDefault.primaryTime,
+        fallback: null,
+      };
+    }
+  }
+
+  if (userOverride.pauseUntil && target <= userOverride.pauseUntil) {
+    return { skip: 'paused', detail: `paused until ${userOverride.pauseUntil}` };
+  }
+
+  const base = userScheduleOverride
+    ? resolveSchedule(targetDate, userScheduleOverride)
+    : classPlan(targetDate);
+  if (!base) return { skip: 'opt_out_day' };
+  return base;
 }
 
 function normalize(t) { return (t || '').replace(/\s+/g, ' ').trim(); }
@@ -188,4 +246,6 @@ module.exports = {
   timeToHHMM,
   matchesScheduleEntry,
   resolveSchedule,
+  loadOverrides,
+  resolveBookingForDate,
 };
