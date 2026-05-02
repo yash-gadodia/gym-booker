@@ -100,6 +100,9 @@ function findMatch(updates) {
     console.error(`note: getUpdates only returns messages from the last ~24h that no other`);
     console.error(`      receiver has consumed. If the bot has a webhook or a separate poller,`);
     console.error(`      messages may be drained — ask the user to send a fresh one.`);
+    console.error(`      KNOWN: OpenClaw daemon polls @Lawrence_sg_bot and drains the queue.`);
+    console.error(`      Workaround: grep ~/.openclaw/agents/lawrence/sessions/sessions.json`);
+    console.error(`      for the user's @handle — the label includes id:<chat_id>.`);
     process.exit(1);
   }
 
