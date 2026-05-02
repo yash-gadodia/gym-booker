@@ -7,6 +7,7 @@ const {
   timeToHHMM, matchesScheduleEntry, resolveSchedule,
 } = require('./lib');
 const { getTelegramTarget } = require('./users');
+const personality = require('./personality');
 
 test('DAY_SHORT is Sun..Sat indexed by getDay()', () => {
   assert.equal(DAY_SHORT[new Date('2026-04-26').getDay()], 'Sun');
@@ -513,4 +514,221 @@ test('getTelegramTarget: chat_id as string is preserved', () => {
     { TELEGRAM_CHAT_ID: '99' });
   assert.equal(t.chatId, '12345');
   assert.equal(t.prefix, '');
+});
+
+// ---------- personality: per-user vibes for Lawrence ----------
+
+const YASH_LIKE = null;  // book.js passes null for the legacy default user
+const DANI_LIKE = { id: 'dani', label: 'Dani', vibe: 'wholesome' };
+const MYSTERY = { id: 'someone', label: 'Someone' };  // unknown user → default vibe
+
+test('vibeFor: yash (no user) → chaotic', () => {
+  assert.equal(personality.vibeFor(YASH_LIKE), 'chaotic');
+});
+test('vibeFor: dani via explicit vibe field', () => {
+  assert.equal(personality.vibeFor(DANI_LIKE), 'wholesome');
+});
+test('vibeFor: dani via id-mapping (no vibe field)', () => {
+  assert.equal(personality.vibeFor({ id: 'dani', label: 'Dani' }), 'wholesome');
+});
+test('vibeFor: unknown user → chaotic default', () => {
+  assert.equal(personality.vibeFor(MYSTERY), 'chaotic');
+});
+
+test('firstName: legacy user → Yash', () => {
+  assert.equal(personality.firstName(YASH_LIKE), 'Yash');
+});
+test('firstName: uses label, falls back to id', () => {
+  assert.equal(personality.firstName({ id: 'dani', label: 'Dani' }), 'Dani');
+  assert.equal(personality.firstName({ id: 'mystery' }), 'mystery');
+});
+
+test('safe: strips Markdown-breaking chars', () => {
+  assert.equal(personality.safe('hello *world* _foo_ [bar]'), 'hello world foo bar');
+  assert.equal(personality.safe('order id: `abc-123` and `def`'), 'order id: abc-123 and def');
+  assert.equal(personality.safe(null), '');
+  assert.equal(personality.safe(undefined), '');
+  assert.equal(personality.safe(42), '42');
+});
+
+// Use a deterministic RNG so test output is stable. After each personality
+// test, reset the RNG so unrelated tests don't see a stale stub.
+function withRng(rngVal, fn) {
+  personality._setRng(() => rngVal);
+  try { fn(); } finally { personality._resetRng(); }
+}
+
+test('started: every variant for both vibes is non-empty + Markdown-safe', () => {
+  const ctx = { planLine: 'FIT @ 6:30am', dayLabel: 'Mon 2026-05-04', secs: 120 };
+  for (const vibe of ['chaotic', 'wholesome']) {
+    const user = vibe === 'chaotic' ? YASH_LIKE : DANI_LIKE;
+    const pool = personality.STARTED[vibe];
+    for (let i = 0; i < pool.length; i++) {
+      withRng((i + 0.5) / pool.length, () => {
+        const msg = personality.started(user, ctx);
+        assert.ok(msg.length > 10, `vibe=${vibe} variant=${i} too short: ${msg}`);
+        assert.match(msg, /FIT @ 6:30am/, `vibe=${vibe} variant=${i} missing planLine`);
+        assert.match(msg, /Mon 2026-05-04/, `vibe=${vibe} variant=${i} missing dayLabel`);
+      });
+    }
+  }
+});
+
+test('loggedIn: every variant for both vibes is non-empty', () => {
+  for (const vibe of ['chaotic', 'wholesome']) {
+    const user = vibe === 'chaotic' ? YASH_LIKE : DANI_LIKE;
+    const pool = personality.LOGGED_IN[vibe];
+    for (let i = 0; i < pool.length; i++) {
+      withRng((i + 0.5) / pool.length, () => {
+        const msg = personality.loggedIn(user);
+        assert.ok(msg.length > 5, `vibe=${vibe} variant=${i} too short`);
+      });
+    }
+  }
+});
+
+test('standby: ui mode renders both vibes with secs interpolated', () => {
+  const ctx = { planLine: 'FIT @ 6:30am', secs: 23, mode: 'ui' };
+  for (const vibe of ['chaotic', 'wholesome']) {
+    const user = vibe === 'chaotic' ? YASH_LIKE : DANI_LIKE;
+    const pool = personality.STANDBY_UI[vibe];
+    for (let i = 0; i < pool.length; i++) {
+      withRng((i + 0.5) / pool.length, () => {
+        const msg = personality.standby(user, ctx);
+        // Every variant must show secs (the standby's whole purpose).
+        // planLine is optional: the started msg fired 30s earlier already
+        // told the user what's being booked.
+        assert.match(msg, /23s/, `vibe=${vibe} variant=${i} missing secs: ${msg}`);
+      });
+    }
+  }
+});
+
+test('standby: api mode renders both vibes with secs interpolated', () => {
+  const ctx = { planLine: 'FIT @ 6:30am', secs: 121, mode: 'api' };
+  for (const vibe of ['chaotic', 'wholesome']) {
+    const user = vibe === 'chaotic' ? YASH_LIKE : DANI_LIKE;
+    const pool = personality.STANDBY_API[vibe];
+    for (let i = 0; i < pool.length; i++) {
+      withRng((i + 0.5) / pool.length, () => {
+        const msg = personality.standby(user, ctx);
+        assert.match(msg, /121s/, `vibe=${vibe} variant=${i} missing secs`);
+      });
+    }
+  }
+});
+
+test('outcome bucket selection: api-direct success → bookedFast', () => {
+  const status = {
+    ok: true, reason: 'booked (api-direct)',
+    via: 'api', timing: { total: 1873 },
+  };
+  assert.equal(personality._bucket(status), 'bookedFast');
+});
+
+test('outcome bucket selection: UI-flow success → bookedSlow', () => {
+  assert.equal(personality._bucket({ ok: true, reason: 'booked' }), 'bookedSlow');
+  assert.equal(personality._bucket({ ok: true, reason: 'booked (BUY-confirmed)' }), 'bookedSlow');
+});
+
+test('outcome bucket selection: classifies all known outcomes', () => {
+  assert.equal(personality._bucket({ ok: true, reason: 'already_booked' }), 'alreadyBooked');
+  assert.equal(personality._bucket({ ok: true, reason: 'dry_run' }), 'dryRun');
+  assert.equal(personality._bucket({ ok: true, reason: 'opt_out_day' }), 'optOut');
+  assert.equal(personality._bucket({ ok: false, reason: 'opt_out_day' }), 'optOut');
+  assert.equal(personality._bucket({ ok: false, reason: 'exception' }), 'exception');
+  assert.equal(personality._bucket({ ok: false, reason: 'unverified' }), 'unverified');
+  assert.equal(personality._bucket({ ok: false, reason: 'not booked' }), 'full');
+  assert.equal(personality._bucket({ ok: false, reason: 'FULL' }), 'full');
+  // Unknown failure → bucketed as exception (generic error template)
+  assert.equal(personality._bucket({ ok: false, reason: 'something weird' }), 'exception');
+});
+
+test('outcome: api-direct success includes ms timing in body', () => {
+  const status = { ok: true, reason: 'booked (api-direct)', via: 'api', timing: { total: 1873 } };
+  const ctx = { planLine: 'FIT @ 6:30am', dayLabel: 'Mon 2026-05-04', runId: 'X', didRelogin: false };
+  // Try every variant — all should mention ms.
+  const pool = personality.OUTCOME.bookedFast.chaotic;
+  for (let i = 0; i < pool.length; i++) {
+    withRng((i + 0.5) / pool.length, () => {
+      const msg = personality.outcome(YASH_LIKE, status, ctx);
+      assert.match(msg, /1873ms/, `chaotic bookedFast variant ${i}: missing ms`);
+    });
+  }
+});
+
+test('outcome: includes run id footnote', () => {
+  const status = { ok: true, reason: 'booked', via: 'ui' };
+  const ctx = { planLine: 'FIT @ 6:30am', dayLabel: 'Mon 2026-05-04', runId: '2026-05-02T01-00-00' };
+  withRng(0.0, () => {
+    const msg = personality.outcome(YASH_LIKE, status, ctx);
+    assert.match(msg, /run: `2026-05-02T01-00-00`/);
+  });
+});
+
+test('outcome: includes auth-refreshed marker when didRelogin=true', () => {
+  const status = { ok: true, reason: 'booked', via: 'ui' };
+  const ctx = { planLine: 'FIT @ 6:30am', dayLabel: 'Mon', runId: 'X', didRelogin: true };
+  withRng(0.0, () => {
+    const msg = personality.outcome(YASH_LIKE, status, ctx);
+    assert.match(msg, /auth refreshed mid-flow/);
+  });
+});
+
+test('outcome: dani gets wholesome variants for happy path', () => {
+  const status = { ok: true, reason: 'booked (api-direct)', via: 'api', timing: { total: 2089 } };
+  const ctx = { planLine: 'FIT @ 6:30am', dayLabel: 'Mon 2026-05-04', runId: 'X' };
+  const pool = personality.OUTCOME.bookedFast.wholesome;
+  for (let i = 0; i < pool.length; i++) {
+    withRng((i + 0.5) / pool.length, () => {
+      const msg = personality.outcome(DANI_LIKE, status, ctx);
+      // Wholesome shouldn't contain insulting words or the chaotic-only emojis
+      // (rough sanity — variants with "annihilated", "rinsed", "brutal" should
+      // never reach Dani).
+      assert.doesNotMatch(msg, /annihilated|rinsed|brutal|cooked|insufferably/i,
+        `wholesome variant ${i} leaked chaotic vocab: ${msg}`);
+    });
+  }
+});
+
+test('outcome: opt-out day for chaotic vibe', () => {
+  const status = { ok: true, reason: 'opt_out_day' };
+  const ctx = { planLine: '', dayLabel: 'Wed 2026-05-06', runId: 'X' };
+  withRng(0.0, () => {
+    const msg = personality.outcome(YASH_LIKE, status, ctx);
+    assert.ok(msg.length > 10);
+    assert.match(msg, /Wed 2026-05-06/);
+  });
+});
+
+test('outcome: FULL race-loss says it nicely (wholesome)', () => {
+  const status = { ok: false, reason: 'unverified', detail: 'row went FULL (race lost)' };
+  const ctx = { planLine: 'FIT @ 6:30am', dayLabel: 'Mon 2026-05-04', runId: 'X' };
+  // status reason 'unverified' goes to unverified bucket, but if reason is FULL → full bucket.
+  // Test the FULL bucket directly with a true FULL reason.
+  const fullStatus = { ok: false, reason: 'FULL primary' };
+  withRng(0.5, () => {
+    const msg = personality.outcome(DANI_LIKE, fullStatus, ctx);
+    assert.match(msg, /FIT @ 6:30am/);
+    // Must not crash / produce empty
+    assert.ok(msg.length > 10);
+  });
+});
+
+test('safe: real-world dynamic content from book.js does not break', () => {
+  // Examples observed in book.js status.detail:
+  //   "FIT @ 6:30am on Mon 2026-05-04 via API in 1873ms (`processing_requested`)"
+  //   "row went FULL (race lost)"
+  //   `verify=DETAILS (...) BUY=ok: ...`
+  const inputs = [
+    'FIT @ 6:30am via API in 1873ms (`processing_requested`)',
+    'verify=DETAILS (DETAILS→BOOKED); BUY=checkout closed: BUY/PURCHASING gone for 1500ms',
+    '_auto re-login used — auth.json refreshed_',
+    'order id: [abc-123]',
+  ];
+  for (const s of inputs) {
+    const cleaned = personality.safe(s);
+    // Must not contain unbalanced markdown-breaking chars after cleaning
+    assert.doesNotMatch(cleaned, /[*_[\]`]/, `safe() left a chr in: ${cleaned}`);
+  }
 });

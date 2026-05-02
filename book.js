@@ -12,6 +12,7 @@ const {
   fetchPaymentPassUuid, bookViaApi, generateRecaptchaToken,
 } = require('./api-client');
 const usersLib = require('./users');
+const personality = require('./personality');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
 const SGT_TZ = 'Asia/Singapore';
@@ -489,7 +490,11 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
     const ms = t9.getTime() - Date.now();
     if (ms > 0) {
       const secs = Math.round(ms/1000);
-      await tg(`⏸️ *ragtag booking* — *on standby*\n${plan.kind} @ ${plan.primaryTime} — pre-warmed via API\nwaiting ${secs}s to 09:00:00.000 SGT`);
+      await tg(personality.standby(user, {
+        planLine: `${plan.kind} @ ${plan.primaryTime}`,
+        secs,
+        mode: 'api',
+      }));
       log(`api-direct: waiting ${ms}ms to 09:00:00.000 SGT`);
       if (ms > 500) await new Promise(r => setTimeout(r, ms - 400));
       while (Date.now() < t9.getTime()) {}
@@ -653,7 +658,7 @@ async function attemptFallbackBooking(page, plan, target) {
     // browser launch, no booking attempted, no error alert.
     const dayLabel = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
     log(`opt_out_day: ${user.label || user.id} has no schedule for ${dayLabel}`);
-    await tg(`⏭️ *ragtag booking* — *opt_out_day*\n${user.label || user.id} has no class booked for ${dayLabel}`);
+    await tg(personality.outcome(user, { ok: true, reason: 'opt_out_day' }, { dayLabel, planLine: '', runId: RUN_ID }));
     flushLog();
     process.exit(0);
   }
@@ -672,11 +677,12 @@ async function attemptFallbackBooking(page, plan, target) {
   log(`9am SGT target: ${t9.toISOString()} (ms-from-now: ${t9.getTime() - Date.now()})`);
 
   const planLineForMsg = `${plan.kind} @ ${plan.primaryTime}${plan.fallback ? ` (fallback ${plan.fallback})` : ''}`;
-  await tg(
-    `🚀 *ragtag booking* — *started*\n` +
-    `target: ${DAY_SHORT[target.getDay()]} ${ymd(target)} — ${planLineForMsg}\n` +
-    `run: \`${RUN_ID}\``
-  );
+  const dayLabelForMsg = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
+  await tg(personality.started(user, {
+    planLine: planLineForMsg,
+    dayLabel: dayLabelForMsg,
+    secs: Math.max(0, Math.round((t9.getTime() - Date.now()) / 1000)),
+  }));
 
   const authPath = user
     ? usersLib.getAuthPath(user)
@@ -713,7 +719,7 @@ async function attemptFallbackBooking(page, plan, target) {
       await dismissCookieBanner(page);
       await snap(page, 'post-relogin');
       if (await isLoggedOut(page)) throw new Error('still logged out after re-login attempt');
-      await tg(`🔐 *ragtag booking* — *logged in*\nfresh session saved (${forceLogin ? 'proactive' : 'reactive'})`);
+      await tg(personality.loggedIn(user));
     }
 
     // Pre-flight: /account/schedule is the authoritative bookings list. Skip
@@ -798,11 +804,11 @@ async function attemptFallbackBooking(page, plan, target) {
     const msLeft = t9.getTime() - Date.now();
     if (!noWait && msLeft > 0) {
       const secs = Math.round(msLeft / 1000);
-      await tg(
-        `⏸️ *ragtag booking* — *on standby*\n` +
-        `${plan.kind} @ ${chosen.time} — row staged (${chosen.status})\n` +
-        `waiting ${secs}s to 09:00:00.000 SGT`
-      );
+      await tg(personality.standby(user, {
+        planLine: `${plan.kind} @ ${chosen.time}`,
+        secs,
+        mode: 'ui',
+      }));
       log(`waiting ${msLeft}ms to 09:00:00.000 SGT`);
       if (msLeft > 15000) {
         await new Promise(r => setTimeout(r, msLeft - 10000));
@@ -943,14 +949,9 @@ async function attemptFallbackBooking(page, plan, target) {
     try { await ctx.storageState({ path: authPath }); } catch {}
     await browser.close();
 
-    const icon = status.ok ? '✅' : '❌';
     const planLine = `${plan.kind} @ ${status.time || plan.primaryTime}${plan.fallback && status.time === plan.fallback ? ' (fallback)' : ''}`;
-    const reloginLine = didRelogin ? `\n_auto re-login used — auth.json refreshed_` : '';
-    const msg =
-      `${icon} *ragtag booking* — ${ymd(target)} ${DAY_SHORT[target.getDay()]}\n` +
-      `${planLine}\n` +
-      `*${status.reason}:* ${status.detail}${reloginLine}\n` +
-      `run: \`${RUN_ID}\``;
+    const dayLabel = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
+    const msg = personality.outcome(user, status, { planLine, dayLabel, runId: RUN_ID, didRelogin });
     await tg(msg);
     flushLog();
     process.exit(status.ok ? 0 : 1);
