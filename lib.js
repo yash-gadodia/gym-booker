@@ -13,6 +13,21 @@ function classPlan(targetDate) {
   return { kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' };
 }
 
+// Per-user schedule resolution. `scheduleOverride` is either:
+//   - null/undefined → use classPlan() (Yash's default rules)
+//   - { Mon: {...}|null, Tue: {...}|null, ... } → per-day map keyed by DAY_SHORT
+// Returns the same shape as classPlan() OR null when the user has explicitly
+// opted out of booking on this day of week (key present and value === null).
+// Missing keys also return null — only explicit days are booked when override is set.
+function resolveSchedule(targetDate, scheduleOverride) {
+  if (!scheduleOverride) return classPlan(targetDate);
+  const dayKey = DAY_SHORT[targetDate.getDay()];
+  if (!(dayKey in scheduleOverride)) return null;
+  const entry = scheduleOverride[dayKey];
+  if (!entry) return null;
+  return { kind: entry.kind, primaryTime: entry.primaryTime, fallback: entry.fallback || null };
+}
+
 function normalize(t) { return (t || '').replace(/\s+/g, ' ').trim(); }
 
 function rowMatches(text, { kind, time }) {
@@ -172,4 +187,5 @@ module.exports = {
   parseBookingCard,
   timeToHHMM,
   matchesScheduleEntry,
+  resolveSchedule,
 };

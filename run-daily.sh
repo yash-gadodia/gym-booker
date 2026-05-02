@@ -14,6 +14,6 @@ LOG="$LOG_DIR/launchd-$STAMP.log"
   echo "PATH=$PATH"
   echo "HOME=$HOME  TZ=$TZ  PWD=$(pwd)  node=$(command -v node)"
   echo "args: ${BOOK_ARGS:-}"
-  /opt/homebrew/bin/node "$HOME/gym-booker/book.js" ${BOOK_ARGS:-}
+  /opt/homebrew/bin/node "$HOME/gym-booker/book-all.js" ${BOOK_ARGS:-}
   echo "=== exit $? $(date) ==="
 } >>"$LOG" 2>&1

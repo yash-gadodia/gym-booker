@@ -4,8 +4,9 @@ const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyCheckoutButton, classifyButtonStates, parseBookingCard,
-  timeToHHMM, matchesScheduleEntry,
+  timeToHHMM, matchesScheduleEntry, resolveSchedule,
 } = require('./lib');
+const { getTelegramTarget } = require('./users');
 
 test('DAY_SHORT is Sun..Sat indexed by getDay()', () => {
   assert.equal(DAY_SHORT[new Date('2026-04-26').getDay()], 'Sun');
@@ -418,4 +419,98 @@ test('matchesScheduleEntry: missing fields → false', () => {
   assert.equal(matchesScheduleEntry({ startTime: '2026-04-28T00:30:00Z' }, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), false);
   assert.equal(matchesScheduleEntry({ courseName: 'FIT' }, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), false);
   assert.equal(matchesScheduleEntry(null, { kindNeedle: 'FIT', sgtDate: '2026-04-28', sgtHHMM: '08:30' }), false);
+});
+
+// ---------- resolveSchedule: per-user schedule overrides ----------
+
+test('resolveSchedule: null override → falls back to classPlan (Yash default)', () => {
+  // Mon-Fri default
+  assert.deepEqual(resolveSchedule(new Date('2026-04-27'), null),
+    { kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' });
+  // Sat default
+  assert.deepEqual(resolveSchedule(new Date('2026-04-25'), null),
+    { kind: 'Gymnastics', primaryTime: '12:30pm', fallback: null });
+  // Sun default
+  assert.deepEqual(resolveSchedule(new Date('2026-04-26'), null),
+    { kind: 'Gymnastics', primaryTime: '1:00pm', fallback: null });
+});
+
+test('resolveSchedule: undefined override → also falls back to classPlan', () => {
+  assert.deepEqual(resolveSchedule(new Date('2026-04-27'), undefined),
+    { kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' });
+});
+
+test('resolveSchedule: per-day entry returned with explicit override', () => {
+  const sched = {
+    Mon: { kind: 'FIT', primaryTime: '7:30am', fallback: null },
+    Wed: { kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' },
+  };
+  // Mon → custom 7:30am
+  assert.deepEqual(resolveSchedule(new Date('2026-04-27'), sched),
+    { kind: 'FIT', primaryTime: '7:30am', fallback: null });
+  // Wed → custom 6:30am with fallback
+  assert.deepEqual(resolveSchedule(new Date('2026-04-29'), sched),
+    { kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' });
+});
+
+test('resolveSchedule: explicit-null day entry → null (opt out of that day)', () => {
+  const sched = {
+    Mon: { kind: 'FIT', primaryTime: '6:30am', fallback: null },
+    Tue: null,  // explicit opt-out
+    Wed: { kind: 'FIT', primaryTime: '6:30am', fallback: null },
+  };
+  assert.equal(resolveSchedule(new Date('2026-04-28'), sched), null);  // Tue
+});
+
+test('resolveSchedule: missing day key in override → null (opt out)', () => {
+  // Override has Mon only — Tue/Wed/etc. all return null.
+  const sched = { Mon: { kind: 'FIT', primaryTime: '6:30am', fallback: null } };
+  assert.equal(resolveSchedule(new Date('2026-04-28'), sched), null);  // Tue
+  assert.equal(resolveSchedule(new Date('2026-04-25'), sched), null);  // Sat
+  assert.equal(resolveSchedule(new Date('2026-04-26'), sched), null);  // Sun
+});
+
+test('resolveSchedule: empty override object → all days null (opt out of everything)', () => {
+  const sched = {};
+  assert.equal(resolveSchedule(new Date('2026-04-27'), sched), null);
+  assert.equal(resolveSchedule(new Date('2026-04-25'), sched), null);
+});
+
+test('resolveSchedule: fallback defaults to null when omitted from entry', () => {
+  const sched = { Mon: { kind: 'FIT', primaryTime: '7:30am' } };  // no fallback key
+  assert.deepEqual(resolveSchedule(new Date('2026-04-27'), sched),
+    { kind: 'FIT', primaryTime: '7:30am', fallback: null });
+});
+
+// ---------- users.getTelegramTarget: per-user routing ----------
+
+test('getTelegramTarget: null chat_id → fallback to env with [Label] prefix', () => {
+  const t = getTelegramTarget(
+    { id: 'dani', label: 'Dani', telegramChatId: null },
+    { TELEGRAM_CHAT_ID: '166637821' });
+  assert.equal(t.chatId, '166637821');
+  assert.equal(t.prefix, '[Dani] ');
+});
+
+test('getTelegramTarget: missing label → falls back to id in prefix', () => {
+  const t = getTelegramTarget(
+    { id: 'someone', telegramChatId: null },
+    { TELEGRAM_CHAT_ID: '166637821' });
+  assert.equal(t.prefix, '[someone] ');
+});
+
+test('getTelegramTarget: chat_id set → routes to user, no prefix', () => {
+  const t = getTelegramTarget(
+    { id: 'dani', label: 'Dani', telegramChatId: 999888777 },
+    { TELEGRAM_CHAT_ID: '166637821' });
+  assert.equal(t.chatId, '999888777');
+  assert.equal(t.prefix, '');
+});
+
+test('getTelegramTarget: chat_id as string is preserved', () => {
+  const t = getTelegramTarget(
+    { id: 'x', label: 'X', telegramChatId: '12345' },
+    { TELEGRAM_CHAT_ID: '99' });
+  assert.equal(t.chatId, '12345');
+  assert.equal(t.prefix, '');
 });

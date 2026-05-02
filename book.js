@@ -5,12 +5,13 @@ const fs = require('fs');
 const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
-  classifyButtonStates, parseBookingCard, timeToHHMM,
+  classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
 } = require('./lib');
 const {
   captureBearerToken, fetchScheduleClasses, findClass,
   fetchPaymentPassUuid, bookViaApi, generateRecaptchaToken,
 } = require('./api-client');
+const usersLib = require('./users');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
 const SGT_TZ = 'Asia/Singapore';
@@ -28,6 +29,10 @@ function getOpt(name) {
 const timeOverride = getOpt('time');
 const kindOverride = getOpt('kind');
 const noFallback = args.includes('--no-fallback');
+// --user <id>: book on behalf of a non-default user from users.json. When unset,
+// every code path below uses Yash's legacy .env / auth.json / runs/<ts>/ flow.
+const userId = getOpt('user');
+const user = userId ? usersLib.getUser(userId) : null;
 // Safety guard: refuse to book if /account/schedule already has a same-kind
 // booking on the target date. Override with --allow-duplicate (only for tests).
 const allowDuplicate = args.includes('--allow-duplicate');
@@ -36,7 +41,9 @@ const allowDuplicate = args.includes('--allow-duplicate');
 const apiDirect = !args.includes('--no-api-direct');
 
 const RUN_ID = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
-const RUN_DIR = path.join(__dirname, 'runs', RUN_ID);
+const RUN_DIR = user
+  ? usersLib.getRunsDir(user, RUN_ID)
+  : path.join(__dirname, 'runs', RUN_ID);
 fs.mkdirSync(RUN_DIR, { recursive: true });
 const LOG_LINES = [];
 function log(...a) {
@@ -53,13 +60,20 @@ async function snap(page, name) {
 // Interactive test modes (--dry-run / --now) skip telegram — otherwise every
 // smoke-test spams the user's DMs. The real launchd run uses neither flag.
 const suppressTg = dryRun || noWait;
+// Resolve the Telegram destination once. For Yash (no --user): env TELEGRAM_CHAT_ID,
+// no prefix. For other users: their own chat_id (or env fallback with [Label] prefix
+// while their chat_id hasn't been captured yet).
+const tgTarget = user
+  ? usersLib.getTelegramTarget(user)
+  : { chatId: process.env.TELEGRAM_CHAT_ID, prefix: '' };
 async function tg(text) {
   if (suppressTg) { log(`tg: suppressed (dry/now mode): ${text.split('\n')[0]}`); return; }
-  if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) { log('tg: missing creds'); return; }
+  if (!process.env.TELEGRAM_BOT_TOKEN || !tgTarget.chatId) { log('tg: missing creds'); return; }
+  const body = tgTarget.prefix ? `${tgTarget.prefix}${text}` : text;
   const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const post = async (body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const post = async (b) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) });
   try {
-    let r = await post({ chat_id: process.env.TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown', disable_web_page_preview: true });
+    let r = await post({ chat_id: tgTarget.chatId, text: body, parse_mode: 'Markdown', disable_web_page_preview: true });
     if (!r.ok) {
       const errText = await r.text();
       // Markdown is brittle — any unbalanced `_*[]` in dynamic content (e.g.
@@ -67,7 +81,7 @@ async function tg(text) {
       // Fall back to plain text so the user always gets the booking outcome.
       if (r.status === 400 && /parse|entit/i.test(errText)) {
         log('tg FAIL (parse) — retrying as plain text');
-        r = await post({ chat_id: process.env.TELEGRAM_CHAT_ID, text: `[parse fallback]\n${text}`, disable_web_page_preview: true });
+        r = await post({ chat_id: tgTarget.chatId, text: `[parse fallback]\n${body}`, disable_web_page_preview: true });
         if (r.ok) { log('tg sent (plain fallback)'); return; }
         log('tg FAIL (plain retry)', r.status, await r.text());
         return;
@@ -99,10 +113,16 @@ async function clickVisible(page, selector) {
   return { ok: false };
 }
 
+// Resolve creds once. Yash uses env, other users use their users.json record.
+const creds = user
+  ? usersLib.getCreds(user)
+  : { email: process.env.MINDBODY_EMAIL, password: process.env.MINDBODY_PASSWORD };
+
 async function loginAndSave(page, ctx, authPath) {
   log('AUTH: re-login starting');
-  if (!process.env.MINDBODY_EMAIL || !process.env.MINDBODY_PASSWORD) {
-    throw new Error('auth expired but MINDBODY_EMAIL/MINDBODY_PASSWORD not set in .env');
+  if (!creds.email || !creds.password) {
+    throw new Error('auth expired but creds not available' +
+      (user ? ` for user "${user.id}" in users.json` : ' (MINDBODY_EMAIL/PASSWORD not set in .env)'));
   }
   let clicked = await clickVisible(page, 'button[data-name="NavigationBar.Login.Button"]');
   if (clicked.ok) log(`AUTH: clicked Login button (${clicked.rect.width}x${clicked.rect.height}) via data-name`);
@@ -119,11 +139,11 @@ async function loginAndSave(page, ctx, authPath) {
   await page.waitForTimeout(2500);
   const emailInput = page.locator('input:visible').first();
   await emailInput.waitFor({ state: 'visible', timeout: 15000 });
-  await emailInput.fill(process.env.MINDBODY_EMAIL);
+  await emailInput.fill(creds.email);
   await page.click('button:has-text("Continue"), button:has-text("Next"), button[type="submit"]');
   await page.waitForSelector('input[type="password"]', { timeout: 20000 });
   await page.waitForTimeout(800);
-  await page.fill('input[type="password"]', process.env.MINDBODY_PASSWORD);
+  await page.fill('input[type="password"]', creds.password);
   await Promise.all([
     page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {}),
     page.click('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Continue")'),
@@ -625,7 +645,18 @@ async function attemptFallbackBooking(page, plan, target) {
 (async () => {
   const today = new Date();
   const target = dateArg ? new Date(`${dateArg}T00:00:00`) : addDays(today, 2);
-  const basePlan = classPlan(target);
+  // For Yash (no --user): always use classPlan defaults.
+  // For other users: resolve from their schedule override; null = opt-out for this DOW.
+  const basePlan = user ? resolveSchedule(target, user.schedule) : classPlan(target);
+  if (!basePlan) {
+    // User explicitly has no schedule for this day-of-week — exit before
+    // browser launch, no booking attempted, no error alert.
+    const dayLabel = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
+    log(`opt_out_day: ${user.label || user.id} has no schedule for ${dayLabel}`);
+    await tg(`⏭️ *ragtag booking* — *opt_out_day*\n${user.label || user.id} has no class booked for ${dayLabel}`);
+    flushLog();
+    process.exit(0);
+  }
   const plan = {
     kind: kindOverride || basePlan.kind,
     primaryTime: timeOverride || basePlan.primaryTime,
@@ -647,7 +678,9 @@ async function attemptFallbackBooking(page, plan, target) {
     `run: \`${RUN_ID}\``
   );
 
-  const authPath = path.join(__dirname, 'auth.json');
+  const authPath = user
+    ? usersLib.getAuthPath(user)
+    : path.join(__dirname, 'auth.json');
   const msToNine = t9.getTime() - Date.now();
   const forceLogin = !noWait && msToNine > 90000;
   log(`auth: ${forceLogin ? `FORCE fresh login (${msToNine}ms to 9am, >90s safety margin)` : 'using cached auth.json if available'}`);

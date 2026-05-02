@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 auth.json
+# Multi-user creds + per-user storage state
+users.json
+users-auth/
 
 # Per-run artifacts
 runs/
