@@ -106,6 +106,40 @@ test('rowMatches: time with space "6:30 am" still matches', () => {
   assert.equal(rowMatches(text, { kind: 'FIT', time: '6:30am' }), true);
 });
 
+test('rowMatches: BURN kind matches "Gym classes Burn" row', () => {
+  const text = 'Gym classes Burn Annie Set 6:30pm (60 min) BOOK NOW';
+  assert.equal(rowMatches(text, { kind: 'BURN', time: '6:30pm' }), true);
+});
+
+test('rowMatches: BURN kind rejects co-timed FIT row', () => {
+  const text = 'CROSSFIT® FIT Sam Chappie 6:30pm (60 min) BOOK NOW';
+  assert.equal(rowMatches(text, { kind: 'BURN', time: '6:30pm' }), false);
+});
+
+test('rowMatches: BURN kind rejects co-timed Lift row', () => {
+  const text = 'CROSSFIT® Lift Sam Chappie 6:30pm (60 min) BOOK NOW';
+  assert.equal(rowMatches(text, { kind: 'BURN', time: '6:30pm' }), false);
+});
+
+test('rowMatches: FIT kind rejects BURN row', () => {
+  const text = 'Gym classes Burn Annie Set 6:30pm (60 min) BOOK NOW';
+  assert.equal(rowMatches(text, { kind: 'FIT', time: '6:30pm' }), false);
+});
+
+test('rowMatches: BURN at 7:30pm is rejected when target is 6:30pm', () => {
+  const text = 'Gym classes Burn Annie Set 7:30pm (60 min) BOOK NOW';
+  assert.equal(rowMatches(text, { kind: 'BURN', time: '6:30pm' }), false);
+});
+
+test('parseBookingCard: parses a Burn booking confirmation card', () => {
+  const text = '05 Tuesday May, 2026 Burn Annie Set 6:30pm (60 min) Cancel +CALENDAR';
+  const got = parseBookingCard(text);
+  assert.ok(got, 'expected non-null');
+  assert.equal(got.kind, 'BURN');
+  assert.equal(got.time, '6:30pm');
+  assert.equal(got.ymd, '2026-05-05');
+});
+
 test('rowStatus: BOOKED wins over stray BOOK NOW', () => {
   const text = 'CROSSFIT® FIT Aidan 6:30am (60 min) BOOKED  — also Book Now for another class';
   assert.equal(rowStatus(text), 'BOOKED');
@@ -526,17 +560,20 @@ const YASH_LIKE = null;  // book.js passes null for the legacy default user
 const DANI_LIKE = { id: 'dani', label: 'Dani', vibe: 'wholesome' };
 const MYSTERY = { id: 'someone', label: 'Someone' };  // unknown user → default vibe
 
-test('vibeFor: yash (no user) → chaotic', () => {
-  assert.equal(personality.vibeFor(YASH_LIKE), 'chaotic');
+test('vibeFor: yash (no user) → gymbro default', () => {
+  assert.equal(personality.vibeFor(YASH_LIKE), 'gymbro');
 });
-test('vibeFor: dani via explicit vibe field', () => {
+test('vibeFor: dani via explicit vibe field still honors override', () => {
   assert.equal(personality.vibeFor(DANI_LIKE), 'wholesome');
 });
-test('vibeFor: dani via id-mapping (no vibe field)', () => {
-  assert.equal(personality.vibeFor({ id: 'dani', label: 'Dani' }), 'wholesome');
+test('vibeFor: dani via id-mapping with no vibe field falls back to default', () => {
+  assert.equal(personality.vibeFor({ id: 'dani', label: 'Dani' }), 'gymbro');
 });
-test('vibeFor: unknown user → chaotic default', () => {
-  assert.equal(personality.vibeFor(MYSTERY), 'chaotic');
+test('vibeFor: unknown user → gymbro default', () => {
+  assert.equal(personality.vibeFor(MYSTERY), 'gymbro');
+});
+test('vibeFor: explicit gymbro vibe field returns gymbro', () => {
+  assert.equal(personality.vibeFor({ id: 'melissa', vibe: 'gymbro' }), 'gymbro');
 });
 
 test('firstName: legacy user → Yash', () => {
@@ -562,10 +599,15 @@ function withRng(rngVal, fn) {
   try { fn(); } finally { personality._resetRng(); }
 }
 
-test('started: every variant for both vibes is non-empty + Markdown-safe', () => {
+test('started: every variant for all vibes is non-empty + Markdown-safe', () => {
   const ctx = { planLine: 'FIT @ 6:30am', dayLabel: 'Mon 2026-05-04', secs: 120 };
-  for (const vibe of ['chaotic', 'wholesome']) {
-    const user = vibe === 'chaotic' ? YASH_LIKE : DANI_LIKE;
+  const userByVibe = {
+    chaotic: YASH_LIKE,
+    wholesome: DANI_LIKE,
+    gymbro: { id: 'melissa', label: 'Melissa', vibe: 'gymbro' },
+  };
+  for (const vibe of ['chaotic', 'wholesome', 'gymbro']) {
+    const user = userByVibe[vibe];
     const pool = personality.STARTED[vibe];
     for (let i = 0; i < pool.length; i++) {
       withRng((i + 0.5) / pool.length, () => {
@@ -578,9 +620,14 @@ test('started: every variant for both vibes is non-empty + Markdown-safe', () =>
   }
 });
 
-test('loggedIn: every variant for both vibes is non-empty', () => {
-  for (const vibe of ['chaotic', 'wholesome']) {
-    const user = vibe === 'chaotic' ? YASH_LIKE : DANI_LIKE;
+test('loggedIn: every variant for all vibes is non-empty', () => {
+  const userByVibe = {
+    chaotic: YASH_LIKE,
+    wholesome: DANI_LIKE,
+    gymbro: { id: 'melissa', label: 'Melissa', vibe: 'gymbro' },
+  };
+  for (const vibe of ['chaotic', 'wholesome', 'gymbro']) {
+    const user = userByVibe[vibe];
     const pool = personality.LOGGED_IN[vibe];
     for (let i = 0; i < pool.length; i++) {
       withRng((i + 0.5) / pool.length, () => {
@@ -591,32 +638,70 @@ test('loggedIn: every variant for both vibes is non-empty', () => {
   }
 });
 
-test('standby: ui mode renders both vibes with secs interpolated', () => {
+test('standby: ui mode renders all vibes with secs interpolated', () => {
   const ctx = { planLine: 'FIT @ 6:30am', secs: 23, mode: 'ui' };
-  for (const vibe of ['chaotic', 'wholesome']) {
-    const user = vibe === 'chaotic' ? YASH_LIKE : DANI_LIKE;
+  const userByVibe = {
+    chaotic: YASH_LIKE,
+    wholesome: DANI_LIKE,
+    gymbro: { id: 'melissa', label: 'Melissa', vibe: 'gymbro' },
+  };
+  for (const vibe of ['chaotic', 'wholesome', 'gymbro']) {
+    const user = userByVibe[vibe];
     const pool = personality.STANDBY_UI[vibe];
     for (let i = 0; i < pool.length; i++) {
       withRng((i + 0.5) / pool.length, () => {
         const msg = personality.standby(user, ctx);
         // Every variant must show secs (the standby's whole purpose).
-        // planLine is optional: the started msg fired 30s earlier already
-        // told the user what's being booked.
         assert.match(msg, /23s/, `vibe=${vibe} variant=${i} missing secs: ${msg}`);
       });
     }
   }
 });
 
-test('standby: api mode renders both vibes with secs interpolated', () => {
+test('standby: api mode renders all vibes with secs interpolated', () => {
   const ctx = { planLine: 'FIT @ 6:30am', secs: 121, mode: 'api' };
-  for (const vibe of ['chaotic', 'wholesome']) {
-    const user = vibe === 'chaotic' ? YASH_LIKE : DANI_LIKE;
+  const userByVibe = {
+    chaotic: YASH_LIKE,
+    wholesome: DANI_LIKE,
+    gymbro: { id: 'melissa', label: 'Melissa', vibe: 'gymbro' },
+  };
+  for (const vibe of ['chaotic', 'wholesome', 'gymbro']) {
+    const user = userByVibe[vibe];
     const pool = personality.STANDBY_API[vibe];
     for (let i = 0; i < pool.length; i++) {
       withRng((i + 0.5) / pool.length, () => {
         const msg = personality.standby(user, ctx);
         assert.match(msg, /121s/, `vibe=${vibe} variant=${i} missing secs`);
+      });
+    }
+  }
+});
+
+test('outcome: every gymbro variant in every bucket renders without crash', () => {
+  const ctx = { planLine: 'FIT @ 6:30am', dayLabel: 'Mon 2026-05-04', didRelogin: false, runId: 'r1' };
+  const user = { id: 'melissa', label: 'Melissa', vibe: 'gymbro' };
+  const buckets = ['bookedFast', 'bookedSlow', 'alreadyBooked', 'dryRun', 'optOut',
+                   'paused', 'dateSkip', 'full', 'unverified', 'notBooked', 'exception'];
+  const statusByBucket = {
+    bookedFast:    { ok: true, reason: 'booked (api-direct)', via: 'api', timing: { total: 1873 } },
+    bookedSlow:    { ok: true, reason: 'booked' },
+    alreadyBooked: { ok: true, reason: 'already_booked' },
+    dryRun:        { ok: true, reason: 'dry_run' },
+    optOut:        { ok: true, reason: 'opt_out_day' },
+    paused:        { ok: true, reason: 'paused', detail: 'on leave until 2026-05-15' },
+    dateSkip:      { ok: true, reason: 'date_skip' },
+    full:          { ok: false, reason: 'class is FULL' },
+    unverified:    { ok: false, reason: 'unverified', detail: 'BUY ambiguous' },
+    notBooked:     { ok: false, reason: 'not booked', detail: 'row stayed BOOK NOW' },
+    exception:     { ok: false, reason: 'exception', detail: 'auth-flow-broke' },
+  };
+  for (const bucket of buckets) {
+    const pool = personality.OUTCOME[bucket].gymbro;
+    assert.ok(Array.isArray(pool) && pool.length > 0, `bucket=${bucket} missing gymbro pool`);
+    for (let i = 0; i < pool.length; i++) {
+      withRng((i + 0.5) / pool.length, () => {
+        const msg = personality.outcome(user, statusByBucket[bucket], ctx);
+        assert.ok(msg.length > 5, `bucket=${bucket} variant=${i} too short: ${msg}`);
       });
     }
   }

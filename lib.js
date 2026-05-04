@@ -92,6 +92,13 @@ function rowMatches(text, { kind, time }) {
   const t = normalize(text);
   if (kind === 'FIT' && !/CROSSFIT® FIT\b/i.test(t)) return false;
   if (kind === 'Gymnastics' && !/CROSSFIT® Gymnastics\b/i.test(t)) return false;
+  // BURN appears under "Gym classes Burn" prefix (not Crossfit®). Reject rows
+  // that are clearly other kinds so a BURN search at 6:30pm doesn't latch onto
+  // a co-timed FIT/Lift row.
+  if (kind === 'BURN') {
+    if (!/\bBurn\b/i.test(t)) return false;
+    if (/CROSSFIT®\s*(FIT|Lift|Gymnastics|Foundations)\b/i.test(t)) return false;
+  }
   const [hhmm, ap] = time.split(/(am|pm)/i);
   const timeRe = new RegExp(`${hhmm.trim().replace(':','\\:')}\\s*${ap}`, 'i');
   return timeRe.test(t);
@@ -219,6 +226,7 @@ function parseBookingCard(text) {
   const kind = /CROSSFIT®\s*FIT\b/i.test(flat) ? 'FIT'
              : /CROSSFIT®\s*Gymnastics\b/i.test(flat) ? 'Gymnastics'
              : /CROSSFIT®\s*Lift\b/i.test(flat) ? 'Lift'
+             : /\bBurn\b/i.test(flat) ? 'BURN'
              : /Open Gym/i.test(flat) ? 'Open Gym'
              : null;
   if (!dayM || !monthM || !timeM || !kind) return null;
