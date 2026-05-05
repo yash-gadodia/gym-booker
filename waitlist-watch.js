@@ -38,16 +38,26 @@ function targetClassStartMs(dateYmd, timeStr) {
 
 async function tg(text) {
   if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) return false;
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: process.env.TELEGRAM_CHAT_ID, text,
-        parse_mode: 'Markdown', disable_web_page_preview: true,
-      }),
-    });
-    return r.ok;
-  } catch { return false; }
+  const ids = String(process.env.TELEGRAM_CHAT_ID).split(',').map(s => s.trim()).filter(Boolean);
+  let allOk = ids.length > 0;
+  for (const chatId of ids) {
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId, text,
+          parse_mode: 'Markdown', disable_web_page_preview: true,
+        }),
+      });
+      if (!r.ok) allOk = false;
+    } catch { allOk = false; }
+  }
+  return allOk;
+}
+
+function fmtDmy(dateYmd) {
+  const [y, m, d] = dateYmd.split('-');
+  return `${d}-${m}-${y}`;
 }
 
 (async () => {
@@ -184,9 +194,10 @@ async function tg(text) {
     const dayLabel = DAY_SHORT[target.getDay()];
     const banner = observed === 'BOOK_NOW' ? '🟢 *SLOT OPEN*' : '🟡 *WAITLIST AVAILABLE*';
     const verb = observed === 'BOOK_NOW' ? 'book it' : 'join waitlist';
+    const greeting = process.env.WAITLIST_NAME ? `Hey ${process.env.WAITLIST_NAME} — ` : '';
     const msg =
-      `${banner}\n` +
-      `${plan.kind} @ ${timeArg} — ${dayLabel} ${dateArg}\n` +
+      `${greeting}${banner}\n` +
+      `${plan.kind} @ ${timeArg} — ${dayLabel} ${fmtDmy(dateArg)}\n` +
       `row: ${observedText.slice(0, 140)}\n` +
       `→ open Mindbody and *${verb}* now\n` +
       `https://www.mindbodyonline.com/explore/locations/ragtag`;

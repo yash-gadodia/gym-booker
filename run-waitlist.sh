@@ -1,6 +1,6 @@
 #!/bin/bash
 # LaunchAgent wrapper for waitlist watcher.
-# Polls Mon 6:30am FIT every 5 min. Auto-unloads when alert fires or class starts.
+# Polls a target class every 5 min. Auto-unloads when alert fires or class starts.
 
 set -e
 
@@ -8,8 +8,13 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 export TZ="Asia/Singapore"
 export HOME="/Users/yash"
 
-WATCH_DATE="${WAITLIST_DATE:-2026-04-27}"
+WATCH_DATE="${WAITLIST_DATE:-2026-05-07}"
 WATCH_TIME="${WAITLIST_TIME:-6:30am}"
+
+# Recipient(s) for the alert: Dani (80151943). Override TELEGRAM_CHAT_ID
+# so the alert routes to her instead of Yash. Comma-separated supported.
+export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-80151943}"
+export WAITLIST_NAME="${WAITLIST_NAME:-Dani}"
 WATCH_ID="${WATCH_DATE}_${WATCH_TIME/:/}"
 PLIST="${HOME}/Library/LaunchAgents/com.voltade.gym-waitlist.plist"
 STATE_FILE="${HOME}/gym-booker/runs/waitlist-state-${WATCH_ID}.json"
