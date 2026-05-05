@@ -102,11 +102,12 @@ function fmtDmy(dateYmd) {
   console.log(`[${ts}] poll #${state.polls + 1}: ${plan.kind} @ ${timeArg} on ${DAY_SHORT[target.getDay()]} ${dateArg}`);
 
   const authPath = path.join(__dirname, 'auth.json');
+  const useAuth = !process.env.WAITLIST_NO_AUTH;
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     viewport: { width: 1440, height: 900 }, locale: 'en-SG', timezoneId: 'Asia/Singapore',
-    storageState: fs.existsSync(authPath) ? authPath : undefined,
+    storageState: useAuth && fs.existsSync(authPath) ? authPath : undefined,
   });
   const page = await ctx.newPage();
 
@@ -122,7 +123,7 @@ function fmtDmy(dateYmd) {
 
     // Reactive login — only if logged out. We don't need a fresh session for read-only polling.
     const loggedOut = await page.locator('button[data-name="NavigationBar.Login.Button"]').count() > 0;
-    if (loggedOut && process.env.MINDBODY_EMAIL && process.env.MINDBODY_PASSWORD) {
+    if (loggedOut && useAuth && process.env.MINDBODY_EMAIL && process.env.MINDBODY_PASSWORD) {
       console.log('logged out — re-login');
       didLogin = true;
       await page.click('button[data-name="NavigationBar.Login.Button"]');
@@ -173,7 +174,7 @@ function fmtDmy(dateYmd) {
     observed = 'ERROR';
     observedText = e.message;
   } finally {
-    try { await ctx.storageState({ path: authPath }); } catch {}
+    if (useAuth) { try { await ctx.storageState({ path: authPath }); } catch {} }
     await browser.close();
   }
 
