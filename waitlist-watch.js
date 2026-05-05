@@ -133,8 +133,27 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
   const ts = new Date().toISOString();
   console.log(`[${ts}] poll #${state.polls + 1}: ${plan.kind} @ ${timeArg} on ${DAY_SHORT[target.getDay()]} ${dateArg}`);
 
-  const authPath = path.join(__dirname, 'auth.json');
+  // Per-user auth: WAITLIST_USER=dani → users-auth/dani.json. The Mindbody
+  // marketplace API status is personalised — Yash's auth returns "Booked" for
+  // a class he's in, masking the public capacity state. Use the watch target's
+  // own auth so statusText reflects what *they* would see.
+  const watchUser = process.env.WAITLIST_USER || null;
+  const authPath = watchUser
+    ? path.join(__dirname, 'users-auth', `${watchUser}.json`)
+    : path.join(__dirname, 'auth.json');
   const useAuth = !process.env.WAITLIST_NO_AUTH;
+
+  // Pull MB credentials for reactive login. WAITLIST_USER overrides .env from users.json.
+  let mbEmail = process.env.MINDBODY_EMAIL;
+  let mbPassword = process.env.MINDBODY_PASSWORD;
+  if (watchUser) {
+    try {
+      const users = JSON.parse(fs.readFileSync(path.join(__dirname, 'users.json'), 'utf8')).users;
+      const u = users.find(x => x.id === watchUser);
+      if (u) { mbEmail = u.email; mbPassword = u.password; }
+    } catch {}
+  }
+
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -155,18 +174,18 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
 
     // Reactive login — only if logged out. We don't need a fresh session for read-only polling.
     const loggedOut = await page.locator('button[data-name="NavigationBar.Login.Button"]').count() > 0;
-    if (loggedOut && useAuth && process.env.MINDBODY_EMAIL && process.env.MINDBODY_PASSWORD) {
-      console.log('logged out — re-login');
+    if (loggedOut && useAuth && mbEmail && mbPassword) {
+      console.log(`logged out — re-login as ${mbEmail}`);
       didLogin = true;
       await page.click('button[data-name="NavigationBar.Login.Button"]');
       await page.waitForTimeout(2000);
       const emailInput = page.locator('input:visible').first();
       await emailInput.waitFor({ state: 'visible', timeout: 15000 });
-      await emailInput.fill(process.env.MINDBODY_EMAIL);
+      await emailInput.fill(mbEmail);
       await page.click('button:has-text("Continue"), button:has-text("Next"), button[type="submit"]');
       await page.waitForSelector('input[type="password"]', { timeout: 20000 });
       await page.waitForTimeout(800);
-      await page.fill('input[type="password"]', process.env.MINDBODY_PASSWORD);
+      await page.fill('input[type="password"]', mbPassword);
       await Promise.all([
         page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {}),
         page.click('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")'),

@@ -16,6 +16,10 @@ WATCH_TIME="${WAITLIST_TIME:-6:30am}"
 export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-80151943}"
 export WAITLIST_NAME="${WAITLIST_NAME:-Dani}"
 
+# Use Dani's auth so the API status reflects what *she* would see (Yash's
+# auth would return "Booked" for this class, masking the public capacity).
+export WAITLIST_USER="${WAITLIST_USER:-dani}"
+
 WATCH_ID="${WATCH_DATE}_${WATCH_TIME/:/}"
 PLIST="${HOME}/Library/LaunchAgents/com.voltade.gym-waitlist.plist"
 STATE_FILE="${HOME}/gym-booker/runs/waitlist-state-${WATCH_ID}.json"
