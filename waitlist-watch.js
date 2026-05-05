@@ -14,8 +14,9 @@ const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 const {
-  DAY_SHORT, ymd, classPlan, normalize, rowMatches, rowStatus,
+  DAY_SHORT, ymd, classPlan,
 } = require('./lib');
+const { captureBearerToken, fetchScheduleClasses, findClass } = require('./api-client');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
 
@@ -58,6 +59,37 @@ async function tg(text) {
 function fmtDmy(dateYmd) {
   const [y, m, d] = dateYmd.split('-');
   return `${d}-${m}-${y}`;
+}
+
+function timeToHHMM(timeArg) {
+  const minutes = parseTimeToMinutes(timeArg);
+  const h = Math.floor(minutes / 60), m = minutes % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+// Authoritative class status via Mindbody marketplace API. The public web
+// schedule shows "BOOK NOW" even when classes are at max capacity, so DOM
+// scraping produces false positives. The API returns bookable + statusText
+// (e.g. "Class is at Max Capacity") which the booker pipeline already trusts.
+async function checkApiStatus(page, plan, dateArg, timeArg) {
+  const bearer = await captureBearerToken(page, { timeoutMs: 20000 });
+  const fromIso = new Date(`${dateArg}T00:00:00+08:00`).toISOString();
+  const toIso = new Date(`${dateArg}T23:59:59+08:00`).toISOString();
+  const classes = await fetchScheduleClasses(bearer, { fromIso, toIso });
+  const cls = findClass(classes, {
+    kindNeedle: plan.kind, sgtDate: dateArg, sgtHHMM: timeToHHMM(timeArg),
+  });
+  if (!cls) return { observed: 'NOT_FOUND', observedText: '(class not in API schedule)' };
+  const txt = cls.statusText || '';
+  let observed;
+  if (cls.bookable) observed = 'BOOK_NOW';
+  else if (/wait[- ]?list/i.test(txt)) observed = 'WAITLIST';
+  else if (/max capacity|full/i.test(txt)) observed = 'FULL';
+  else observed = 'UNKNOWN';
+  return {
+    observed,
+    observedText: `bookable=${cls.bookable} status="${txt}" id=${cls.mb_class_id}/${cls.mb_class_schedule_id}`,
+  };
 }
 
 (async () => {
@@ -145,31 +177,9 @@ function fmtDmy(dateYmd) {
       await page.waitForTimeout(2500);
     }
 
-    // Click Schedule tab and target day
-    const tab = page.locator('button, a, [role="tab"]').filter({ hasText: /^(Classes|Schedule)$/i }).first();
-    await tab.click({ timeout: 8000 });
-    await page.waitForTimeout(2500);
-
-    const dayShort = DAY_SHORT[target.getDay()].toUpperCase();
-    const dom = String(target.getDate());
-    const dayTab = page.locator('[class*="Day_item"]').filter({ hasText: new RegExp(`^${dayShort}\\s*${dom}$`, 'i') }).first();
-    await dayTab.waitFor({ state: 'visible', timeout: 10000 });
-    await dayTab.click();
-    await page.waitForTimeout(2000);
-
-    const rows = await page.locator('[class*="ClassTimeScheduleItemDesktop"]').all();
-    let matched = null;
-    for (const r of rows) {
-      const text = normalize(await r.innerText().catch(() => ''));
-      if (rowMatches(text, { kind: plan.kind, time: timeArg })) { matched = text; break; }
-    }
-    if (!matched) {
-      observed = 'NOT_FOUND';
-      observedText = '(row not found on schedule)';
-    } else {
-      observed = rowStatus(matched);
-      observedText = matched;
-    }
+    const result = await checkApiStatus(page, plan, dateArg, timeArg);
+    observed = result.observed;
+    observedText = result.observedText;
   } catch (e) {
     observed = 'ERROR';
     observedText = e.message;
@@ -199,7 +209,6 @@ function fmtDmy(dateYmd) {
     const msg =
       `${greeting}${banner}\n` +
       `${plan.kind} @ ${timeArg} — ${dayLabel} ${fmtDmy(dateArg)}\n` +
-      `row: ${observedText.slice(0, 140)}\n` +
       `→ open Mindbody and *${verb}* now\n` +
       `https://www.mindbodyonline.com/explore/locations/ragtag`;
     const ok = await tg(msg);

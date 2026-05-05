@@ -16,9 +16,6 @@ WATCH_TIME="${WAITLIST_TIME:-6:30am}"
 export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-80151943}"
 export WAITLIST_NAME="${WAITLIST_NAME:-Dani}"
 
-# Poll the public schedule view (no shared auth.json) so the row reflects the
-# class's true open/full/waitlist state, not Yash's BOOKED status.
-export WAITLIST_NO_AUTH="${WAITLIST_NO_AUTH:-1}"
 WATCH_ID="${WATCH_DATE}_${WATCH_TIME/:/}"
 PLIST="${HOME}/Library/LaunchAgents/com.voltade.gym-waitlist.plist"
 STATE_FILE="${HOME}/gym-booker/runs/waitlist-state-${WATCH_ID}.json"
