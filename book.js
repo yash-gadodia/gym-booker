@@ -531,6 +531,40 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
       timing: result.timing,
     };
   }
+
+  // 5c. Post-flight verification. statusTitle "processing_requested" (status.code 10)
+  // is an async-commit acknowledgement, not confirmation — Mindbody silently drops
+  // the request if the class hits max capacity between schedule fetch and process
+  // commit. Confirm the booking actually appears on /account/schedule before
+  // claiming success; otherwise return ok=false so the caller can fall back.
+  if (result.statusTitle === 'processing_requested') {
+    const targetYmd = ymd(target);
+    let upcoming = null;
+    for (const waitMs of [3500, 3500]) {
+      await new Promise(r => setTimeout(r, waitMs));
+      try { upcoming = await fetchMyUpcomingBookings(page); }
+      catch (e) { log(`api-direct: confirm fetch failed (${e.message.slice(0,140)})`); break; }
+      if (upcoming.some(b => b.ymd === targetYmd && b.kind === plan.kind && b.time === usedTime)) {
+        log(`api-direct: confirmed ${plan.kind} @ ${usedTime} on ${targetYmd} in /account/schedule`);
+        upcoming = 'confirmed';
+        break;
+      }
+      log(`api-direct: not yet confirmed (${upcoming.length} upcoming, none matched ${plan.kind} @ ${usedTime} on ${targetYmd}) — re-checking`);
+    }
+    if (upcoming !== 'confirmed' && upcoming !== null) {
+      // fetchMyUpcomingBookings navigated to /account/schedule. Restore the
+      // gym URL so the UI-flow fallback (clickClassesTab) finds its anchors.
+      try { await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+      return {
+        ok: false,
+        reason: 'api-process-silently-dropped',
+        detail: `Mindbody returned processing_requested (orderId=${result.orderId}) but ${plan.kind} @ ${usedTime} on ${targetYmd} did not appear on /account/schedule after 7s — class likely at max capacity, async commit was rejected. Class status at fetch was: ${classMeta.statusText || 'unknown'}.`,
+        time: usedTime,
+        timing: result.timing,
+      };
+    }
+  }
+
   return {
     ok: true,
     reason: 'booked (api-direct)',
