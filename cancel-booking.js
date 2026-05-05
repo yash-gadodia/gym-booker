@@ -1,5 +1,5 @@
 // Cancel a single booking from /explore/account/schedule by matching kind+time+date.
-// Usage: node cancel-booking.js --date 2026-04-28 --time 8:30am [--kind FIT] [--dry-run]
+// Usage: node cancel-booking.js [--user dani] --date 2026-04-28 --time 8:30am [--kind FIT] [--dry-run] [--json]
 require('dotenv').config();
 const { chromium } = require('playwright');
 const path = require('path');
@@ -7,25 +7,38 @@ const fs = require('fs');
 
 const args = process.argv.slice(2);
 const opt = name => { const i = args.indexOf(`--${name}`); return i >= 0 && args[i+1] && !args[i+1].startsWith('--') ? args[i+1] : null; };
+const userArg = opt('user');
 const dateArg = opt('date');
 const timeArg = opt('time');
 const kindArg = opt('kind') || 'FIT';
 const dryRun = args.includes('--dry-run');
+const jsonOut = args.includes('--json');
 
 if (!dateArg || !timeArg) {
-  console.error('Usage: node cancel-booking.js --date YYYY-MM-DD --time H:MMam [--kind FIT|Gymnastics] [--dry-run]');
+  console.error('Usage: node cancel-booking.js [--user <id>] --date YYYY-MM-DD --time H:MMam [--kind FIT|Gymnastics] [--dry-run] [--json]');
   process.exit(2);
 }
 
-const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
+const log = (...a) => (jsonOut ? console.error : console.log)(`[${new Date().toISOString()}]`, ...a);
+function emit(payload) {
+  if (jsonOut) process.stdout.write(JSON.stringify(payload) + '\n');
+}
 
 (async () => {
+  const authPath = userArg
+    ? path.join(__dirname, 'users-auth', `${userArg}.json`)
+    : path.join(__dirname, 'auth.json');
+  if (userArg && !fs.existsSync(authPath)) {
+    emit({ ok: false, reason: 'no-auth', detail: `users-auth/${userArg}.json missing` });
+    console.error(`no users-auth/${userArg}.json — run the daily booker once for ${userArg} first`);
+    process.exit(2);
+  }
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     viewport: { width: 1440, height: 900 },
     locale: 'en-SG', timezoneId: 'Asia/Singapore',
-    storageState: fs.existsSync(path.join(__dirname, 'auth.json')) ? path.join(__dirname, 'auth.json') : undefined,
+    storageState: fs.existsSync(authPath) ? authPath : undefined,
   });
   const page = await ctx.newPage();
 
@@ -78,10 +91,20 @@ const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
     }
   }
 
-  if (!target) { log('no matching booking found — aborting'); await browser.close(); process.exit(1); }
+  if (!target) {
+    log('no matching booking found — aborting');
+    emit({ ok: false, reason: 'not-found', detail: `no card matched ${kindArg} @ ${timeArg} on ${dateArg}` });
+    await browser.close();
+    process.exit(1);
+  }
   log(`MATCHED CARD: ${target.card.slice(0, 300)}`);
 
-  if (dryRun) { log('DRY RUN — not clicking Cancel'); await browser.close(); return; }
+  if (dryRun) {
+    log('DRY RUN — not clicking Cancel');
+    emit({ ok: true, reason: 'dry-run', target: { date: dateArg, time: timeArg, kind: kindArg }, card: target.card.slice(0, 300) });
+    await browser.close();
+    return;
+  }
 
   log('clicking Cancel');
   await target.btn.click();
@@ -109,6 +132,7 @@ const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
         log(`  confirm clicked: "${txt}" (${sel})`);
         await page.waitForTimeout(2500);
         await page.screenshot({ path: path.join(__dirname, 'cancel-after.png'), fullPage: true });
+        emit({ ok: true, reason: 'cancelled', target: { date: dateArg, time: timeArg, kind: kindArg }, card: target.card.slice(0, 300), confirmedVia: txt });
         await browser.close();
         return;
       } catch {}
@@ -116,5 +140,7 @@ const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
   }
 
   log('no confirmation button found — booking may not have been cancelled. Check screenshot.');
+  emit({ ok: false, reason: 'no-confirmation-button', detail: 'click landed but no modal-confirm button matched; check cancel-modal.png', card: target.card.slice(0, 300) });
   await browser.close();
+  process.exit(1);
 })();
