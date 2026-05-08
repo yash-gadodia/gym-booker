@@ -7,8 +7,8 @@ const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyCheckoutButton, classifyButtonStates, parseBookingCard,
-  timeToHHMM, matchesScheduleEntry, resolveSchedule,
-  loadOverrides, resolveBookingForDate,
+  timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
+  loadOverrides, resolveBookingForDate, resolveBookingsForDate,
 } = require('./lib');
 const { getTelegramTarget } = require('./users');
 const personality = require('./personality');
@@ -945,4 +945,141 @@ test('resolveBookingForDate: Saturday with time-only override defaults kind to G
   const o = { users: { yash: { perDate: { '2026-05-02': { time: '11:00am' } } } } };
   const r = resolveBookingForDate(new Date('2026-05-02T00:00:00'), 'yash', null, o);
   assert.deepEqual(r, { kind: 'Gymnastics', primaryTime: '11:00am', fallback: null });
+});
+
+// ──────────── resolveSchedulePlans / resolveBookingsForDate (back-to-back) ────────────
+
+test('resolveSchedulePlans: null override → 1-element list with classPlan default', () => {
+  // Mon — Yash default is FIT 6:30am with 7:30am fallback
+  assert.deepEqual(resolveSchedulePlans(new Date('2026-04-27'), null),
+    [{ kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' }]);
+});
+
+test('resolveSchedulePlans: single-class day → 1-element list', () => {
+  const sched = { Mon: { kind: 'FIT', primaryTime: '7:30pm' } };
+  assert.deepEqual(resolveSchedulePlans(new Date('2026-04-27'), sched),
+    [{ kind: 'FIT', primaryTime: '7:30pm', fallback: null }]);
+});
+
+test('resolveSchedulePlans: array entry → multi-plan list preserves order', () => {
+  const sched = { Mon: [
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]};
+  assert.deepEqual(resolveSchedulePlans(new Date('2026-04-27'), sched), [
+    { kind: 'BURN', primaryTime: '6:30pm', fallback: null },
+    { kind: 'FIT',  primaryTime: '7:30pm', fallback: null },
+  ]);
+});
+
+test('resolveSchedulePlans: empty array → [] (treated as opt-out)', () => {
+  const sched = { Mon: [] };
+  assert.deepEqual(resolveSchedulePlans(new Date('2026-04-27'), sched), []);
+});
+
+test('resolveSchedulePlans: null entry → [] (explicit opt-out)', () => {
+  const sched = { Mon: null };
+  assert.deepEqual(resolveSchedulePlans(new Date('2026-04-27'), sched), []);
+});
+
+test('resolveSchedulePlans: missing day key → []', () => {
+  const sched = { Mon: { kind: 'FIT', primaryTime: '7:30pm' } };
+  assert.deepEqual(resolveSchedulePlans(new Date('2026-04-29'), sched), []);  // Wed
+});
+
+test('resolveSchedulePlans: array entries preserve fallback when set', () => {
+  const sched = { Fri: [
+    { kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' },
+  ]};
+  assert.deepEqual(resolveSchedulePlans(new Date('2026-05-01'), sched),
+    [{ kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' }]);
+});
+
+test('resolveSchedule (singular): array entry returns first plan only', () => {
+  const sched = { Mon: [
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]};
+  assert.deepEqual(resolveSchedule(new Date('2026-04-27'), sched),
+    { kind: 'BURN', primaryTime: '6:30pm', fallback: null });
+});
+
+test('resolveSchedule (singular): empty array returns null', () => {
+  const sched = { Mon: [] };
+  assert.equal(resolveSchedule(new Date('2026-04-27'), sched), null);
+});
+
+test('resolveBookingsForDate: back-to-back day → { plans: [BURN, FIT] }', () => {
+  const sched = { Mon: [
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]};
+  const r = resolveBookingsForDate(new Date('2026-04-27T00:00:00'), 'melissa', sched, { users: {} });
+  assert.deepEqual(r, { plans: [
+    { kind: 'BURN', primaryTime: '6:30pm', fallback: null },
+    { kind: 'FIT',  primaryTime: '7:30pm', fallback: null },
+  ]});
+});
+
+test('resolveBookingsForDate: single-class day → 1-element plans array', () => {
+  const sched = { Fri: { kind: 'FIT', primaryTime: '7:30am' } };
+  const r = resolveBookingsForDate(new Date('2026-05-01T00:00:00'), 'melissa', sched, { users: {} });
+  assert.deepEqual(r, { plans: [{ kind: 'FIT', primaryTime: '7:30am', fallback: null }]});
+});
+
+test('resolveBookingsForDate: opt-out day → { skip: opt_out_day }', () => {
+  const sched = { Mon: { kind: 'FIT', primaryTime: '7:30pm' } };  // no Wed key
+  const r = resolveBookingsForDate(new Date('2026-04-29T00:00:00'), 'melissa', sched, { users: {} });
+  assert.deepEqual(r, { skip: 'opt_out_day' });
+});
+
+test('resolveBookingsForDate: explicit-null day → { skip: opt_out_day }', () => {
+  const sched = { Mon: null };
+  const r = resolveBookingsForDate(new Date('2026-04-27T00:00:00'), 'melissa', sched, { users: {} });
+  assert.deepEqual(r, { skip: 'opt_out_day' });
+});
+
+test('resolveBookingsForDate: per-date override → single plan (back-to-back not supported via overrides)', () => {
+  const sched = { Mon: [
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]};
+  const overrides = { users: { melissa: { perDate: { '2026-04-27': { kind: 'FIT', time: '8:00pm' } } } } };
+  const r = resolveBookingsForDate(new Date('2026-04-27T00:00:00'), 'melissa', sched, overrides);
+  assert.deepEqual(r, { plans: [{ kind: 'FIT', primaryTime: '8:00pm', fallback: null }]});
+});
+
+test('resolveBookingsForDate: per-date null on back-to-back day → date_skip (cancels both)', () => {
+  const sched = { Mon: [
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]};
+  const overrides = { users: { melissa: { perDate: { '2026-04-27': null } } } };
+  const r = resolveBookingsForDate(new Date('2026-04-27T00:00:00'), 'melissa', sched, overrides);
+  assert.deepEqual(r, { skip: 'date_skip' });
+});
+
+test('resolveBookingsForDate: pauseUntil window cancels back-to-back day', () => {
+  const sched = { Mon: [
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]};
+  const overrides = { users: { melissa: { pauseUntil: '2026-05-15' } } };
+  const r = resolveBookingsForDate(new Date('2026-05-04T00:00:00'), 'melissa', sched, overrides);
+  assert.equal(r.skip, 'paused');
+});
+
+test('resolveBookingsForDate: no override → Yash default classPlan as 1-element list', () => {
+  // Yash has no users.json schedule; Tue → FIT 6:30am/7:30am
+  const r = resolveBookingsForDate(new Date('2026-05-05T00:00:00'), 'yash', null, { users: {} });
+  assert.deepEqual(r, { plans: [{ kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' }]});
+});
+
+test('resolveBookingForDate (singular): back-to-back day still returns first plan only (legacy callers)', () => {
+  const sched = { Mon: [
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]};
+  const r = resolveBookingForDate(new Date('2026-04-27T00:00:00'), 'melissa', sched, { users: {} });
+  assert.deepEqual(r, { kind: 'BURN', primaryTime: '6:30pm', fallback: null });
 });

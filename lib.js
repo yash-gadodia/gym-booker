@@ -17,17 +17,38 @@ function classPlan(targetDate) {
 
 // Per-user schedule resolution. `scheduleOverride` is either:
 //   - null/undefined → use classPlan() (Yash's default rules)
-//   - { Mon: {...}|null, Tue: {...}|null, ... } → per-day map keyed by DAY_SHORT
-// Returns the same shape as classPlan() OR null when the user has explicitly
-// opted out of booking on this day of week (key present and value === null).
-// Missing keys also return null — only explicit days are booked when override is set.
+//   - { Mon: {...}|[{...},{...}]|null, Tue: ..., ... } → per-day map keyed by DAY_SHORT
+//
+// Returns a single plan { kind, primaryTime, fallback } OR null when the user
+// has explicitly opted out of that DOW. When the day's entry is an array
+// (back-to-back classes), this returns the FIRST plan only — callers that
+// need all classes for the day should use resolveSchedulePlans (plural).
 function resolveSchedule(targetDate, scheduleOverride) {
   if (!scheduleOverride) return classPlan(targetDate);
   const dayKey = DAY_SHORT[targetDate.getDay()];
   if (!(dayKey in scheduleOverride)) return null;
   const entry = scheduleOverride[dayKey];
   if (!entry) return null;
+  if (Array.isArray(entry)) {
+    if (entry.length === 0) return null;
+    const e = entry[0];
+    return { kind: e.kind, primaryTime: e.primaryTime, fallback: e.fallback || null };
+  }
   return { kind: entry.kind, primaryTime: entry.primaryTime, fallback: entry.fallback || null };
+}
+
+// Plural variant: returns ALL plans for the day, in order. Single-class days
+// produce a 1-element array; back-to-back days produce N elements; opted-out
+// days return []. Used by the booking loop in book.js to support users like
+// Melissa who book BURN + FIT back-to-back on the same evening.
+function resolveSchedulePlans(targetDate, scheduleOverride) {
+  if (!scheduleOverride) return [classPlan(targetDate)];
+  const dayKey = DAY_SHORT[targetDate.getDay()];
+  if (!(dayKey in scheduleOverride)) return [];
+  const entry = scheduleOverride[dayKey];
+  if (!entry) return [];
+  const arr = Array.isArray(entry) ? entry : [entry];
+  return arr.map(e => ({ kind: e.kind, primaryTime: e.primaryTime, fallback: e.fallback || null }));
 }
 
 // Read overrides.json. Returns the parsed object on success, or an empty
@@ -84,6 +105,42 @@ function resolveBookingForDate(targetDate, userKey, userScheduleOverride, dateOv
     : classPlan(targetDate);
   if (!base) return { skip: 'opt_out_day' };
   return base;
+}
+
+// Plural variant of resolveBookingForDate: returns either { skip, detail? }
+// or { plans: [{kind, primaryTime, fallback}, ...] }. Per-date overrides and
+// pause windows always produce a single plan (back-to-back is only supported
+// in the baseline weekly schedule). DOW opt-outs and missing-key days surface
+// as { skip: 'opt_out_day' }.
+function resolveBookingsForDate(targetDate, userKey, userScheduleOverride, dateOverrides) {
+  const target = ymd(targetDate);
+  const userOverride = (dateOverrides && dateOverrides.users && dateOverrides.users[userKey]) || {};
+  const perDate = userOverride.perDate || {};
+
+  if (Object.prototype.hasOwnProperty.call(perDate, target)) {
+    const entry = perDate[target];
+    if (entry === null) return { skip: 'date_skip' };
+    if (entry && typeof entry === 'object') {
+      const dowDefault = classPlan(targetDate);
+      return {
+        plans: [{
+          kind: entry.kind || dowDefault.kind,
+          primaryTime: entry.time || dowDefault.primaryTime,
+          fallback: null,
+        }],
+      };
+    }
+  }
+
+  if (userOverride.pauseUntil && target <= userOverride.pauseUntil) {
+    return { skip: 'paused', detail: `paused until ${userOverride.pauseUntil}` };
+  }
+
+  const plans = userScheduleOverride
+    ? resolveSchedulePlans(targetDate, userScheduleOverride)
+    : [classPlan(targetDate)];
+  if (plans.length === 0) return { skip: 'opt_out_day' };
+  return { plans };
 }
 
 function normalize(t) { return (t || '').replace(/\s+/g, ' ').trim(); }
@@ -254,6 +311,8 @@ module.exports = {
   timeToHHMM,
   matchesScheduleEntry,
   resolveSchedule,
+  resolveSchedulePlans,
   loadOverrides,
   resolveBookingForDate,
+  resolveBookingsForDate,
 };

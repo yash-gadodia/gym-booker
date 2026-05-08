@@ -6,7 +6,7 @@ const {
   DAY_SHORT, addDays, ymd, classPlan, normalize, rowMatches, rowStatus,
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
-  loadOverrides, resolveBookingForDate,
+  loadOverrides, resolveBookingForDate, resolveBookingsForDate,
 } = require('./lib');
 const {
   captureBearerToken, fetchScheduleClasses, findClass,
@@ -692,38 +692,50 @@ async function attemptFallbackBooking(page, plan, target) {
   const userKey = user ? user.id : 'yash';
   const overridesPath = path.join(__dirname, 'overrides.json');
   const dateOverrides = loadOverrides(overridesPath);
-  const decision = resolveBookingForDate(target, userKey, user ? user.schedule : null, dateOverrides);
+  const decision = resolveBookingsForDate(target, userKey, user ? user.schedule : null, dateOverrides);
+  const dayLabelForMsg = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
   if (decision.skip) {
     // Three skip kinds, all clean exits (ok=true so launchd / book-all reads as success):
     //   opt_out_day → no class scheduled for this DOW (user pref)
     //   date_skip   → user explicitly cancelled this date
     //   paused      → user is on leave through pauseUntil
-    const dayLabel = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
     const who = user ? (user.label || user.id) : 'Yash';
-    log(`skip ${decision.skip}: ${who} on ${dayLabel}${decision.detail ? ` (${decision.detail})` : ''}`);
+    log(`skip ${decision.skip}: ${who} on ${dayLabelForMsg}${decision.detail ? ` (${decision.detail})` : ''}`);
     await tg(personality.outcome(user,
       { ok: true, reason: decision.skip, detail: decision.detail },
-      { dayLabel, planLine: '', runId: RUN_ID }));
+      { dayLabel: dayLabelForMsg, planLine: '', runId: RUN_ID }));
     flushLog();
     process.exit(0);
   }
-  const basePlan = decision;
-  const plan = {
-    kind: kindOverride || basePlan.kind,
-    primaryTime: timeOverride || basePlan.primaryTime,
-    fallback: noFallback || timeOverride ? null : basePlan.fallback,
-  };
+
+  // CLI overrides (--time / --kind / --no-fallback) collapse to a single plan.
+  // The baseline can be a single class or a back-to-back list; with overrides,
+  // we treat the first plan as the base and apply the override fields. This
+  // preserves the legacy `node book.js <date> --time 8:30am --kind FIT` smoke
+  // test path where you book exactly one class.
+  const hasCliOverride = !!(timeOverride || kindOverride || noFallback);
+  const plans = hasCliOverride
+    ? [{
+        kind: kindOverride || decision.plans[0].kind,
+        primaryTime: timeOverride || decision.plans[0].primaryTime,
+        fallback: noFallback || timeOverride ? null : decision.plans[0].fallback,
+      }]
+    : decision.plans.map(p => ({ kind: p.kind, primaryTime: p.primaryTime, fallback: p.fallback }));
+
   const t9 = nineAmToday();
 
   log(`RUN ${RUN_ID}`);
   log(`today: ${ymd(today)} ${DAY_SHORT[today.getDay()]}`);
   log(`target: ${ymd(target)} ${DAY_SHORT[target.getDay()]}`);
-  log(`plan: ${plan.kind} @ ${plan.primaryTime}` + (plan.fallback ? ` (fallback ${plan.fallback})` : ''));
-  log(`mode: dry=${dryRun} nowait=${noWait}`);
+  for (const p of plans) {
+    log(`plan: ${p.kind} @ ${p.primaryTime}` + (p.fallback ? ` (fallback ${p.fallback})` : ''));
+  }
+  log(`mode: dry=${dryRun} nowait=${noWait}` + (plans.length > 1 ? ` plans=${plans.length}` : ''));
   log(`9am SGT target: ${t9.toISOString()} (ms-from-now: ${t9.getTime() - Date.now()})`);
 
-  const planLineForMsg = `${plan.kind} @ ${plan.primaryTime}${plan.fallback ? ` (fallback ${plan.fallback})` : ''}`;
-  const dayLabelForMsg = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
+  const planLineForMsg = plans
+    .map(p => `${p.kind} @ ${p.primaryTime}${p.fallback ? ` (fallback ${p.fallback})` : ''}`)
+    .join(' + ');
   await tg(personality.started(user, {
     planLine: planLineForMsg,
     dayLabel: dayLabelForMsg,
@@ -744,8 +756,10 @@ async function attemptFallbackBooking(page, plan, target) {
     storageState: (!forceLogin && fs.existsSync(authPath)) ? authPath : undefined,
   });
   const page = await ctx.newPage();
-  let status = { ok: false, reason: 'unknown', detail: '', time: null };
   let didRelogin = false;
+  let myBookings = [];           // pre-flight, shared across plans
+  let setupError = null;          // login or pre-flight failure → all plans fail
+  const results = [];             // per-plan { plan, status }
 
   try {
     log('navigating to ragtag');
@@ -769,24 +783,15 @@ async function attemptFallbackBooking(page, plan, target) {
     }
 
     // Pre-flight: /account/schedule is the authoritative bookings list. Skip
-    // if user already has a same-kind booking on the target date — explore-page
+    // any plan whose kind is already booked on the target date — explore-page
     // row text can show stale BOOK NOW even when the user is already booked
-    // (caused the 2026-04-27 duplicate-booking incident).
+    // (caused the 2026-04-27 duplicate-booking incident). For back-to-back
+    // days we fetch this ONCE and dup-check each plan against the same list.
     if (!allowDuplicate) {
       try {
-        const myBookings = await fetchMyUpcomingBookings(page);
+        myBookings = await fetchMyUpcomingBookings(page);
         log(`my-schedule: ${myBookings.length} upcoming bookings`);
         for (const b of myBookings) log(`  ${b.ymd} ${b.kind} @ ${b.time}`);
-        const dup = myBookings.find(b => b.ymd === ymd(target) && b.kind === plan.kind);
-        if (dup) {
-          status = {
-            ok: true,
-            reason: 'already_booked',
-            detail: `${plan.kind} on ${ymd(target)} already booked at ${dup.time} (skipped, would have tried ${plan.primaryTime})`,
-            time: dup.time,
-          };
-          return;
-        }
       } catch (e) {
         log(`my-schedule pre-flight failed (${e.message.slice(0,120)}) — continuing without guard`);
       }
@@ -795,211 +800,275 @@ async function attemptFallbackBooking(page, plan, target) {
       await page.waitForTimeout(2000);
       await dismissCookieBanner(page);
     }
-
-    // ── API-DIRECT FAST PATH ──────────────────────────────────────────────
-    // Bypass the React UI and book via Mindbody's marketplace gateway directly.
-    // T+0 → committed in ~2.2s vs ~12s for the UI flow. Falls back to UI on
-    // any failure so we never miss a booking due to API regressions.
-    if (apiDirect && !dryRun) {
-      try {
-        const apiResult = await executeApiDirect(page, plan, target, t9, noWait);
-        if (apiResult.ok) {
-          status = apiResult;
-          return;
-        }
-        log(`api-direct failed (${apiResult.reason}: ${(apiResult.detail||'').slice(0,200)}) — falling back to UI flow`);
-      } catch (e) {
-        log(`api-direct exception (${e.message.slice(0,200)}) — falling back to UI flow`);
-      }
-    }
-    // ──────────────────────────────────────────────────────────────────────
-
-    await clickClassesTab(page);
-    await waitForScheduleView(page, 20000);
-    await clickDayTab(page, target);
-    await snap(page, 'day-selected');
-
-    // Pre-stage: verify the row exists and prefer fallback if primary is FULL/BOOKED-elsewhere.
-    // Status here may be DETAILS (window not yet open) — that's fine; we refresh at 9am.
-    async function pickRow(reason) {
-      log(`pickRow (${reason}): primary=${plan.primaryTime}${plan.fallback ? ` fallback=${plan.fallback}`:''}`);
-      const a = await attemptRow(page, plan, plan.primaryTime);
-      log(`  primary: ${a.notFound ? 'NOT FOUND' : `${a.status} — ${a.text.slice(0,140)}`}`);
-      if (!a.notFound && a.status === 'BOOKED') return a;
-      if (!a.notFound && (a.status === 'BOOK_NOW' || a.status === 'DETAILS')) return a;
-      if (plan.fallback) {
-        const b = await attemptRow(page, plan, plan.fallback);
-        log(`  fallback: ${b.notFound ? 'NOT FOUND' : `${b.status} — ${b.text.slice(0,140)}`}`);
-        if (!b.notFound && (b.status === 'BOOKED' || b.status === 'BOOK_NOW' || b.status === 'DETAILS')) return b;
-        return a.notFound ? b : a;
-      }
-      return a;
-    }
-
-    let chosen = await pickRow('pre-stage');
-    if (chosen.notFound) throw new Error(`no ${plan.kind} row found on ${ymd(target)} (tried ${plan.primaryTime}${plan.fallback ? ` + ${plan.fallback}`:''})`);
-    log(`chosen: ${plan.kind} @ ${chosen.time} — status=${chosen.status}`);
-
-    if (chosen.status === 'BOOKED') {
-      status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${chosen.time} was already BOOKED`, time: chosen.time };
-      return;
-    }
-    if (chosen.status === 'FULL') throw new Error(`${plan.kind} FULL (primary${plan.fallback ? ' and fallback' : ''})`);
-
-    // Wait to 09:00:00.000 SGT unless --now or already past.
-    const msLeft = t9.getTime() - Date.now();
-    if (!noWait && msLeft > 0) {
-      const secs = Math.round(msLeft / 1000);
-      await tg(personality.standby(user, {
-        planLine: `${plan.kind} @ ${chosen.time}`,
-        secs,
-        mode: 'ui',
-      }));
-      log(`waiting ${msLeft}ms to 09:00:00.000 SGT`);
-      if (msLeft > 15000) {
-        await new Promise(r => setTimeout(r, msLeft - 10000));
-        log('T-10s soft refresh: clicking day tab again');
-        await softRefreshSchedule(page, target);
-        const snapshot = await pickRow('T-10s refresh');
-        if (snapshot.notFound) throw new Error('row disappeared after refresh');
-        if (snapshot.status === 'BOOKED') {
-          status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${snapshot.time} — booked during refresh`, time: snapshot.time };
-          return;
-        }
-        if (snapshot.status === 'FULL') throw new Error(`${plan.kind} went FULL before 9am (all fallbacks too)`);
-        chosen = snapshot;
-      }
-      await busyWaitUntil(t9.getTime());
-      log(`drift from 09:00:00.000: ${Date.now() - t9.getTime()}ms`);
-    } else if (msLeft < 0) {
-      log(`already past 9am today (by ${-msLeft}ms) — clicking immediately`);
-    } else {
-      log('--now: clicking immediately');
-    }
-
-    // At T+0, MindBody's DOM is stale — the server has flipped the row to
-    // BOOK_NOW but the cached DOM still shows DETAILS. Progressive refresh
-    // tries a cheap soft re-click first (1.5s) before falling back to the
-    // expensive page.reload() (6.5s). Cuts happy-path BUY time by ~5 seconds,
-    // which is exactly the window in which popular slots get snatched.
-    const poll = !noWait
-      ? await progressivePollForBookNow(page, plan, chosen.time, target)
-      : await pollUntilBookable(page, plan, chosen.time, { timeoutMs: 20000, intervalMs: 250 });
-    if (poll.action === 'done') {
-      status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${chosen.time} — ${poll.detail}`, time: chosen.time };
-      return;
-    }
-    if (poll.action === 'fail') {
-      // Try fallback once if primary is FULL/NOT_FOUND (fast race: someone else booked it)
-      if (plan.fallback && chosen.time === plan.primaryTime) {
-        log(`primary ${poll.reason} — trying fallback ${plan.fallback}`);
-        const pollFb = await pollUntilBookable(page, plan, plan.fallback, { timeoutMs: 10000, intervalMs: 250 });
-        if (pollFb.action === 'click') {
-          chosen = { row: pollFb.row, text: pollFb.text, time: plan.fallback, status: 'BOOK_NOW' };
-        } else if (pollFb.action === 'done') {
-          status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${plan.fallback} — ${pollFb.detail}`, time: plan.fallback };
-          return;
-        } else {
-          throw new Error(`primary+fallback both failed: primary=${poll.reason}, fallback=${pollFb.reason}`);
-        }
-      } else {
-        throw new Error(`poll failed: ${poll.reason}`);
-      }
-    } else {
-      chosen = { row: poll.row, text: poll.text, time: chosen.time, status: 'BOOK_NOW' };
-    }
-
-    // Resolve BOOK NOW button on the fresh row
-    const resolved = await resolveBookButton(chosen.row);
-    if (!resolved) throw new Error('BOOK NOW button not resolvable on chosen row despite BOOK_NOW status');
-    log(`button label: ${resolved.label}`);
-
-    if (dryRun) {
-      log('DRY RUN — skipping click + buy');
-      await snap(page, 'dryrun-at-click');
-      status = { ok: true, reason: 'dry_run', detail: `would book ${plan.kind} @ ${chosen.time} on ${ymd(target)}`, time: chosen.time };
-      return;
-    }
-
-    log('CLICK book-now');
-    await resolved.btn.click({ timeout: 10000 });
-    await snap(page, 'post-click');
-
-    log('waiting for checkout BUY button (up to 45s)');
-    const checkout = await waitForCheckout(page, { timeoutMs: 45000 });
-    if (!checkout.ok) {
-      await snap(page, 'no-buy');
-      throw new Error(`checkout failed: ${checkout.reason}`);
-    }
-    await page.waitForTimeout(1000);
-    await snap(page, 'checkout');
-
-    const buy = page.locator('button').filter({ hasText: /^BUY$/i }).first();
-    if (await buy.count() === 0) throw new Error('BUY button missing on checkout after wait');
-    log('CLICK BUY');
-    await buy.click();
-
-    // Wait for the PURCHASING transient to fully resolve before navigating away.
-    // The 2026-04-27 failure was navigating during PURCHASING, which aborted the in-flight transaction.
-    const buyOutcome = await waitForBuyOutcome(page, { timeoutMs: 30000 });
-    await snap(page, 'post-buy');
-    log(`BUY outcome: ok=${buyOutcome.ok}${buyOutcome.ambiguous ? ' (ambiguous)' : ''} reason=${buyOutcome.reason} — ${(buyOutcome.detail||'').slice(0,300)}`);
-
-    // Schedule is the ground truth — Mindbody's checkout UI is unreliable
-    // (false-positive "BUY missing", false-negative "error modal but actually booked").
-    log('verifying booked status on schedule');
-    await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2500);
-    await dismissCookieBanner(page);
-    await clickClassesTab(page);
-    await waitForScheduleView(page, 20000);
-    await clickDayTab(page, target);
-    const verify = await verifyOnSchedule(page, plan, target, chosen.time, { tries: 4, delayMs: 1500 });
-    log(`verify final: ${verify.status} (saw: ${verify.seen.join('→')})`);
-    await snap(page, 'verify');
-
-    if (verify.status === 'BOOKED') {
-      status = { ok: true, reason: 'booked', detail: `${plan.kind} @ ${chosen.time} on ${DAY_SHORT[target.getDay()]} ${ymd(target)}`, time: chosen.time };
-    } else if (verify.status === 'FULL') {
-      // Race lost — the spot we tried to book is gone. Fallback may still be open.
-      const fbReason = `row went FULL (race lost)`;
-      if (plan.fallback && chosen.time === plan.primaryTime) {
-        log(`primary FULL — attempting fallback ${plan.fallback}`);
-        const fb = await attemptFallbackBooking(page, plan, target);
-        if (fb.ok) {
-          status = { ok: true, reason: 'booked (fallback)', detail: `${plan.kind} @ ${plan.fallback} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} (primary ${plan.primaryTime}: ${fbReason})`, time: plan.fallback };
-        } else {
-          status = { ok: false, reason: 'unverified', detail: `primary: ${fbReason}; fallback: ${fb.reason}`, time: chosen.time };
-        }
-      } else {
-        status = { ok: false, reason: 'unverified', detail: fbReason, time: chosen.time };
-      }
-    } else if (verify.status === 'BOOK_NOW') {
-      // Definitively NOT booked — BUY click never landed, or checkout was aborted.
-      // Don't fire fallback to avoid double-booking; user can retry manually.
-      status = { ok: false, reason: 'not booked', detail: `row still BOOK NOW after BUY (BUY outcome: ${buyOutcome.reason} — ${(buyOutcome.detail||'').slice(0,150)})`, time: chosen.time };
-    } else if (buyOutcome.ok) {
-      // Verify is ambiguous (DETAILS or NOT_FOUND), but waitForBuyOutcome saw a clean settle.
-      // Mindbody hides booked classes from the explore view sometimes — trust the BUY signal.
-      status = { ok: true, reason: 'booked (BUY-confirmed)', detail: `${plan.kind} @ ${chosen.time} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} — verify ${verify.status} but BUY ok (${buyOutcome.reason})`, time: chosen.time };
-    } else {
-      // Truly ambiguous: BUY didn't settle cleanly AND verify isn't BOOKED.
-      // Don't double-book by firing fallback — report and let user check.
-      status = { ok: false, reason: 'unverified', detail: `verify=${verify.status} (${verify.seen.join('→')}); BUY=${buyOutcome.reason}: ${(buyOutcome.detail||'').slice(0,150)}`, time: chosen.time };
-    }
   } catch (e) {
-    log('ERROR', e.message);
-    status = { ok: false, reason: status.reason === 'unknown' ? 'exception' : status.reason, detail: e.message, time: status.time };
-    try { await snap(page, 'error'); } catch {}
-  } finally {
-    try { await ctx.storageState({ path: authPath }); } catch {}
-    await browser.close();
-
-    const planLine = `${plan.kind} @ ${status.time || plan.primaryTime}${plan.fallback && status.time === plan.fallback ? ' (fallback)' : ''}`;
-    const dayLabel = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
-    const msg = personality.outcome(user, status, { planLine, dayLabel, runId: RUN_ID, didRelogin });
-    await tg(msg);
-    flushLog();
-    process.exit(status.ok ? 0 : 1);
+    log('ERROR (setup)', e.message);
+    try { await snap(page, 'error-setup'); } catch {}
+    setupError = e;
   }
+
+  // Per-plan booking flow. Shares browser/page/ctx across plans so we only
+  // log in once and only fetch myBookings once. Each plan runs with its own
+  // try/catch so a failure on plan #1 (BURN) doesn't prevent plan #2 (FIT).
+  async function bookOnePlan(plan, planIndex) {
+    let status = { ok: false, reason: 'unknown', detail: '', time: null };
+    const planTag = plans.length > 1 ? `[plan ${planIndex + 1}/${plans.length}] ` : '';
+    try {
+      log(`${planTag}booking: ${plan.kind} @ ${plan.primaryTime}` + (plan.fallback ? ` (fallback ${plan.fallback})` : ''));
+
+      // Per-plan dup check against the shared myBookings list.
+      if (!allowDuplicate) {
+        const dup = myBookings.find(b => b.ymd === ymd(target) && b.kind === plan.kind);
+        if (dup) {
+          status = {
+            ok: true,
+            reason: 'already_booked',
+            detail: `${plan.kind} on ${ymd(target)} already booked at ${dup.time} (skipped, would have tried ${plan.primaryTime})`,
+            time: dup.time,
+          };
+          return status;
+        }
+      }
+
+      // ── API-DIRECT FAST PATH ──────────────────────────────────────────
+      // Bypass the React UI and book via Mindbody's marketplace gateway directly.
+      // T+0 → committed in ~2.2s vs ~12s for the UI flow. Falls back to UI on
+      // any failure so we never miss a booking due to API regressions.
+      if (apiDirect && !dryRun) {
+        try {
+          const apiResult = await executeApiDirect(page, plan, target, t9, noWait);
+          if (apiResult.ok) {
+            status = apiResult;
+            return status;
+          }
+          log(`${planTag}api-direct failed (${apiResult.reason}: ${(apiResult.detail||'').slice(0,200)}) — falling back to UI flow`);
+        } catch (e) {
+          log(`${planTag}api-direct exception (${e.message.slice(0,200)}) — falling back to UI flow`);
+        }
+      }
+      // ────────────────────────────────────────────────────────────────────
+
+      // After api-direct (or its fallback), or fresh from setup, we may not be
+      // on the schedule view. Re-land on ragtag so the UI flow has a known
+      // starting point — especially important for plan #2+ where the previous
+      // plan's verify navigated to /account/schedule.
+      await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(2000);
+      await dismissCookieBanner(page);
+
+      await clickClassesTab(page);
+      await waitForScheduleView(page, 20000);
+      await clickDayTab(page, target);
+      await snap(page, `day-selected-p${planIndex + 1}`);
+
+      // Pre-stage: verify the row exists and prefer fallback if primary is FULL/BOOKED-elsewhere.
+      // Status here may be DETAILS (window not yet open) — that's fine; we refresh at 9am.
+      async function pickRow(reason) {
+        log(`${planTag}pickRow (${reason}): primary=${plan.primaryTime}${plan.fallback ? ` fallback=${plan.fallback}`:''}`);
+        const a = await attemptRow(page, plan, plan.primaryTime);
+        log(`  primary: ${a.notFound ? 'NOT FOUND' : `${a.status} — ${a.text.slice(0,140)}`}`);
+        if (!a.notFound && a.status === 'BOOKED') return a;
+        if (!a.notFound && (a.status === 'BOOK_NOW' || a.status === 'DETAILS')) return a;
+        if (plan.fallback) {
+          const b = await attemptRow(page, plan, plan.fallback);
+          log(`  fallback: ${b.notFound ? 'NOT FOUND' : `${b.status} — ${b.text.slice(0,140)}`}`);
+          if (!b.notFound && (b.status === 'BOOKED' || b.status === 'BOOK_NOW' || b.status === 'DETAILS')) return b;
+          return a.notFound ? b : a;
+        }
+        return a;
+      }
+
+      let chosen = await pickRow('pre-stage');
+      if (chosen.notFound) throw new Error(`no ${plan.kind} row found on ${ymd(target)} (tried ${plan.primaryTime}${plan.fallback ? ` + ${plan.fallback}`:''})`);
+      log(`${planTag}chosen: ${plan.kind} @ ${chosen.time} — status=${chosen.status}`);
+
+      if (chosen.status === 'BOOKED') {
+        status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${chosen.time} was already BOOKED`, time: chosen.time };
+        return status;
+      }
+      if (chosen.status === 'FULL') throw new Error(`${plan.kind} FULL (primary${plan.fallback ? ' and fallback' : ''})`);
+
+      // Wait to 09:00:00.000 SGT unless --now or already past. For plan #2+
+      // on a back-to-back day, msLeft is already negative (plan #1's BUY took
+      // ~10s past 9am) so we click immediately.
+      const msLeft = t9.getTime() - Date.now();
+      if (!noWait && msLeft > 0) {
+        const secs = Math.round(msLeft / 1000);
+        await tg(personality.standby(user, {
+          planLine: `${plan.kind} @ ${chosen.time}`,
+          secs,
+          mode: 'ui',
+        }));
+        log(`${planTag}waiting ${msLeft}ms to 09:00:00.000 SGT`);
+        if (msLeft > 15000) {
+          await new Promise(r => setTimeout(r, msLeft - 10000));
+          log(`${planTag}T-10s soft refresh: clicking day tab again`);
+          await softRefreshSchedule(page, target);
+          const snapshot = await pickRow('T-10s refresh');
+          if (snapshot.notFound) throw new Error('row disappeared after refresh');
+          if (snapshot.status === 'BOOKED') {
+            status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${snapshot.time} — booked during refresh`, time: snapshot.time };
+            return status;
+          }
+          if (snapshot.status === 'FULL') throw new Error(`${plan.kind} went FULL before 9am (all fallbacks too)`);
+          chosen = snapshot;
+        }
+        await busyWaitUntil(t9.getTime());
+        log(`${planTag}drift from 09:00:00.000: ${Date.now() - t9.getTime()}ms`);
+      } else if (msLeft < 0) {
+        log(`${planTag}already past 9am today (by ${-msLeft}ms) — clicking immediately`);
+      } else {
+        log(`${planTag}--now: clicking immediately`);
+      }
+
+      // At T+0, MindBody's DOM is stale — the server has flipped the row to
+      // BOOK_NOW but the cached DOM still shows DETAILS. Progressive refresh
+      // tries a cheap soft re-click first (1.5s) before falling back to the
+      // expensive page.reload() (6.5s). Cuts happy-path BUY time by ~5 seconds,
+      // which is exactly the window in which popular slots get snatched.
+      const poll = !noWait
+        ? await progressivePollForBookNow(page, plan, chosen.time, target)
+        : await pollUntilBookable(page, plan, chosen.time, { timeoutMs: 20000, intervalMs: 250 });
+      if (poll.action === 'done') {
+        status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${chosen.time} — ${poll.detail}`, time: chosen.time };
+        return status;
+      }
+      if (poll.action === 'fail') {
+        // Try fallback once if primary is FULL/NOT_FOUND (fast race: someone else booked it)
+        if (plan.fallback && chosen.time === plan.primaryTime) {
+          log(`${planTag}primary ${poll.reason} — trying fallback ${plan.fallback}`);
+          const pollFb = await pollUntilBookable(page, plan, plan.fallback, { timeoutMs: 10000, intervalMs: 250 });
+          if (pollFb.action === 'click') {
+            chosen = { row: pollFb.row, text: pollFb.text, time: plan.fallback, status: 'BOOK_NOW' };
+          } else if (pollFb.action === 'done') {
+            status = { ok: true, reason: 'already_booked', detail: `${plan.kind} @ ${plan.fallback} — ${pollFb.detail}`, time: plan.fallback };
+            return status;
+          } else {
+            throw new Error(`primary+fallback both failed: primary=${poll.reason}, fallback=${pollFb.reason}`);
+          }
+        } else {
+          throw new Error(`poll failed: ${poll.reason}`);
+        }
+      } else {
+        chosen = { row: poll.row, text: poll.text, time: chosen.time, status: 'BOOK_NOW' };
+      }
+
+      // Resolve BOOK NOW button on the fresh row
+      const resolved = await resolveBookButton(chosen.row);
+      if (!resolved) throw new Error('BOOK NOW button not resolvable on chosen row despite BOOK_NOW status');
+      log(`${planTag}button label: ${resolved.label}`);
+
+      if (dryRun) {
+        log(`${planTag}DRY RUN — skipping click + buy`);
+        await snap(page, `dryrun-at-click-p${planIndex + 1}`);
+        status = { ok: true, reason: 'dry_run', detail: `would book ${plan.kind} @ ${chosen.time} on ${ymd(target)}`, time: chosen.time };
+        return status;
+      }
+
+      log(`${planTag}CLICK book-now`);
+      await resolved.btn.click({ timeout: 10000 });
+      await snap(page, `post-click-p${planIndex + 1}`);
+
+      log(`${planTag}waiting for checkout BUY button (up to 45s)`);
+      const checkout = await waitForCheckout(page, { timeoutMs: 45000 });
+      if (!checkout.ok) {
+        await snap(page, `no-buy-p${planIndex + 1}`);
+        throw new Error(`checkout failed: ${checkout.reason}`);
+      }
+      await page.waitForTimeout(1000);
+      await snap(page, `checkout-p${planIndex + 1}`);
+
+      const buy = page.locator('button').filter({ hasText: /^BUY$/i }).first();
+      if (await buy.count() === 0) throw new Error('BUY button missing on checkout after wait');
+      log(`${planTag}CLICK BUY`);
+      await buy.click();
+
+      // Wait for the PURCHASING transient to fully resolve before navigating away.
+      // The 2026-04-27 failure was navigating during PURCHASING, which aborted the in-flight transaction.
+      const buyOutcome = await waitForBuyOutcome(page, { timeoutMs: 30000 });
+      await snap(page, `post-buy-p${planIndex + 1}`);
+      log(`${planTag}BUY outcome: ok=${buyOutcome.ok}${buyOutcome.ambiguous ? ' (ambiguous)' : ''} reason=${buyOutcome.reason} — ${(buyOutcome.detail||'').slice(0,300)}`);
+
+      // Schedule is the ground truth — Mindbody's checkout UI is unreliable
+      // (false-positive "BUY missing", false-negative "error modal but actually booked").
+      log(`${planTag}verifying booked status on schedule`);
+      await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(2500);
+      await dismissCookieBanner(page);
+      await clickClassesTab(page);
+      await waitForScheduleView(page, 20000);
+      await clickDayTab(page, target);
+      const verify = await verifyOnSchedule(page, plan, target, chosen.time, { tries: 4, delayMs: 1500 });
+      log(`${planTag}verify final: ${verify.status} (saw: ${verify.seen.join('→')})`);
+      await snap(page, `verify-p${planIndex + 1}`);
+
+      if (verify.status === 'BOOKED') {
+        status = { ok: true, reason: 'booked', detail: `${plan.kind} @ ${chosen.time} on ${DAY_SHORT[target.getDay()]} ${ymd(target)}`, time: chosen.time };
+      } else if (verify.status === 'FULL') {
+        // Race lost — the spot we tried to book is gone. Fallback may still be open.
+        const fbReason = `row went FULL (race lost)`;
+        if (plan.fallback && chosen.time === plan.primaryTime) {
+          log(`${planTag}primary FULL — attempting fallback ${plan.fallback}`);
+          const fb = await attemptFallbackBooking(page, plan, target);
+          if (fb.ok) {
+            status = { ok: true, reason: 'booked (fallback)', detail: `${plan.kind} @ ${plan.fallback} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} (primary ${plan.primaryTime}: ${fbReason})`, time: plan.fallback };
+          } else {
+            status = { ok: false, reason: 'unverified', detail: `primary: ${fbReason}; fallback: ${fb.reason}`, time: chosen.time };
+          }
+        } else {
+          status = { ok: false, reason: 'unverified', detail: fbReason, time: chosen.time };
+        }
+      } else if (verify.status === 'BOOK_NOW') {
+        // Definitively NOT booked — BUY click never landed, or checkout was aborted.
+        // Don't fire fallback to avoid double-booking; user can retry manually.
+        status = { ok: false, reason: 'not booked', detail: `row still BOOK NOW after BUY (BUY outcome: ${buyOutcome.reason} — ${(buyOutcome.detail||'').slice(0,150)})`, time: chosen.time };
+      } else if (buyOutcome.ok) {
+        // Verify is ambiguous (DETAILS or NOT_FOUND), but waitForBuyOutcome saw a clean settle.
+        // Mindbody hides booked classes from the explore view sometimes — trust the BUY signal.
+        status = { ok: true, reason: 'booked (BUY-confirmed)', detail: `${plan.kind} @ ${chosen.time} on ${DAY_SHORT[target.getDay()]} ${ymd(target)} — verify ${verify.status} but BUY ok (${buyOutcome.reason})`, time: chosen.time };
+      } else {
+        // Truly ambiguous: BUY didn't settle cleanly AND verify isn't BOOKED.
+        // Don't double-book by firing fallback — report and let user check.
+        status = { ok: false, reason: 'unverified', detail: `verify=${verify.status} (${verify.seen.join('→')}); BUY=${buyOutcome.reason}: ${(buyOutcome.detail||'').slice(0,150)}`, time: chosen.time };
+      }
+    } catch (e) {
+      log(`${planTag}ERROR`, e.message);
+      status = { ok: false, reason: status.reason === 'unknown' ? 'exception' : status.reason, detail: e.message, time: status.time };
+      try { await snap(page, `error-p${planIndex + 1}`); } catch {}
+    }
+    // After a successful booking we update myBookings so subsequent plans
+    // see the new entry (otherwise rare same-class same-day double-bookings
+    // could slip through if the schedule reflects the booking instantly).
+    if (status.ok && (status.reason === 'booked' || status.reason === 'booked (fallback)' || status.reason === 'booked (api-direct)' || status.reason === 'booked (BUY-confirmed)')) {
+      myBookings.push({ ymd: ymd(target), kind: plan.kind, time: status.time || plan.primaryTime });
+    }
+    return status;
+  }
+
+  if (setupError) {
+    // Login or pre-flight failed → mark every plan as exception, no per-plan attempt.
+    for (const plan of plans) {
+      results.push({ plan, status: { ok: false, reason: 'exception', detail: setupError.message, time: null } });
+    }
+  } else {
+    for (let i = 0; i < plans.length; i++) {
+      const status = await bookOnePlan(plans[i], i);
+      results.push({ plan: plans[i], status });
+    }
+  }
+
+  try { await ctx.storageState({ path: authPath }); } catch {}
+  await browser.close();
+
+  // Build aggregated Telegram message. For single-plan days this is identical
+  // to the legacy single-message output. For back-to-back days each plan gets
+  // its own personality.outcome line so Melissa sees both BURN and FIT.
+  const dayLabel = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
+  const messages = results.map(({ plan, status }) => {
+    const planLine = `${plan.kind} @ ${status.time || plan.primaryTime}${plan.fallback && status.time === plan.fallback ? ' (fallback)' : ''}`;
+    return personality.outcome(user, status, { planLine, dayLabel, runId: RUN_ID, didRelogin });
+  });
+  await tg(messages.join('\n\n'));
+  flushLog();
+  const allOk = results.every(r => r.status.ok);
+  process.exit(allOk ? 0 : 1);
 })();
