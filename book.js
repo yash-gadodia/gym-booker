@@ -722,6 +722,12 @@ async function attemptFallbackBooking(page, plan, target) {
       }]
     : decision.plans.map(p => ({ kind: p.kind, primaryTime: p.primaryTime, fallback: p.fallback }));
 
+  // FIT-priority ordering: when multiple plans exist on the same day, the FIT
+  // class is the limiting/popular slot (BURN rarely sells out at 9am, FIT does).
+  // Sort FIT-kind first so it gets the head start in the parallel race below —
+  // worst case if only one booking lands, FIT wins. Stable sort.
+  plans.sort((a, b) => (b.kind === 'FIT' ? 1 : 0) - (a.kind === 'FIT' ? 1 : 0));
+
   const t9 = nineAmToday();
 
   log(`RUN ${RUN_ID}`);
@@ -806,10 +812,13 @@ async function attemptFallbackBooking(page, plan, target) {
     setupError = e;
   }
 
-  // Per-plan booking flow. Shares browser/page/ctx across plans so we only
-  // log in once and only fetch myBookings once. Each plan runs with its own
-  // try/catch so a failure on plan #1 (BURN) doesn't prevent plan #2 (FIT).
-  async function bookOnePlan(plan, planIndex) {
+  // Per-plan booking flow. Shares browser/ctx (so login + cookies are reused)
+  // but receives its OWN page so multiple plans can run in parallel without
+  // page-state collisions (e.g. plan #1 navigating to checkout while plan #2
+  // is mid-poll). myBookings is shared (read-only here, mutated post-success).
+  // Each plan runs with its own try/catch so a failure on one doesn't prevent
+  // the other.
+  async function bookOnePlan(plan, planIndex, page) {
     let status = { ok: false, reason: 'unknown', detail: '', time: null };
     const planTag = plans.length > 1 ? `[plan ${planIndex + 1}/${plans.length}] ` : '';
     try {
@@ -1050,10 +1059,24 @@ async function attemptFallbackBooking(page, plan, target) {
       results.push({ plan, status: { ok: false, reason: 'exception', detail: setupError.message, time: null } });
     }
   } else {
-    for (let i = 0; i < plans.length; i++) {
-      const status = await bookOnePlan(plans[i], i);
-      results.push({ plan: plans[i], status });
-    }
+    // Parallel fan-out across plans. Each plan gets its own page (shares ctx,
+    // so login cookies + storage carry over). Promise.all preserves array
+    // order; plans are pre-sorted FIT-first so FIT's microtask queues first
+    // and wins any shared-resource race (e.g. account-side lock at 09:00:00).
+    log(`firing ${plans.length} plan(s) in parallel: ${plans.map(p => `${p.kind}@${p.primaryTime}`).join(', ')}`);
+    const settled = await Promise.all(plans.map(async (plan, i) => {
+      let planPage;
+      try {
+        planPage = await ctx.newPage();
+        const status = await bookOnePlan(plan, i, planPage);
+        return { plan, status };
+      } catch (e) {
+        return { plan, status: { ok: false, reason: 'exception', detail: e.message, time: null } };
+      } finally {
+        if (planPage) { try { await planPage.close(); } catch {} }
+      }
+    }));
+    results.push(...settled);
   }
 
   try { await ctx.storageState({ path: authPath }); } catch {}

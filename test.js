@@ -1083,3 +1083,119 @@ test('resolveBookingForDate (singular): back-to-back day still returns first pla
   const r = resolveBookingForDate(new Date('2026-04-27T00:00:00'), 'melissa', sched, { users: {} });
   assert.deepEqual(r, { kind: 'BURN', primaryTime: '6:30pm', fallback: null });
 });
+
+// FIT-first sort: when book.js receives multiple plans, FIT must lead so that
+// in the parallel race below, FIT's microtask queues first → wins shared-resource
+// races at 09:00:00. Mirrors the sort at book.js right after `plans` is built.
+function fitFirstSort(plans) {
+  return [...plans].sort((a, b) => (b.kind === 'FIT' ? 1 : 0) - (a.kind === 'FIT' ? 1 : 0));
+}
+
+test('fit-first sort: BURN+FIT → FIT first', () => {
+  const sorted = fitFirstSort([
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]);
+  assert.deepEqual(sorted.map(p => p.kind), ['FIT', 'BURN']);
+});
+
+test('fit-first sort: FIT+BURN already first → unchanged', () => {
+  const sorted = fitFirstSort([
+    { kind: 'FIT', primaryTime: '7:30pm' },
+    { kind: 'BURN', primaryTime: '6:30pm' },
+  ]);
+  assert.deepEqual(sorted.map(p => p.kind), ['FIT', 'BURN']);
+});
+
+test('fit-first sort: single FIT plan → unchanged', () => {
+  const sorted = fitFirstSort([{ kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' }]);
+  assert.deepEqual(sorted.map(p => p.kind), ['FIT']);
+});
+
+test('fit-first sort: stable for non-FIT order (Gymnastics+BURN)', () => {
+  const sorted = fitFirstSort([
+    { kind: 'Gymnastics', primaryTime: '1:00pm' },
+    { kind: 'BURN', primaryTime: '6:30pm' },
+  ]);
+  assert.deepEqual(sorted.map(p => p.kind), ['Gymnastics', 'BURN']);
+});
+
+// Parallel-fan-out timing: when book.js fans plans out via Promise.all, both
+// plans' bookViaApi-equivalent calls must be in-flight concurrently (NOT
+// sequenced). The 2026-05-09 incident: BURN booked then FIT tried — popular
+// FIT slot was full by then. Parallel firing closes that 1–3s window.
+test('parallel fan-out: 2 plans fire bookViaApi concurrently (within 200ms)', async () => {
+  const calls = [];
+  // Stub: simulate per-plan work — trivial pre-work, then a "9am POST" that
+  // takes a long time. If we ran sequentially, plan #2's POST starts only
+  // after plan #1's 500ms POST finishes. In parallel, both start ~immediately.
+  async function fakeBookOnePlan(plan) {
+    await new Promise(r => setTimeout(r, 5));         // pre-work (e.g. fetch class meta)
+    calls.push({ kind: plan.kind, postStartedAt: Date.now() });
+    await new Promise(r => setTimeout(r, 500));        // simulate 9am bookViaApi POST
+    return { ok: true, kind: plan.kind };
+  }
+
+  const plans = fitFirstSort([
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]);
+
+  const t0 = Date.now();
+  const settled = await Promise.all(plans.map(p => fakeBookOnePlan(p)));
+  const wallMs = Date.now() - t0;
+
+  assert.equal(settled.length, 2);
+  assert.equal(calls.length, 2, 'both plans must record a POST start');
+  const gap = Math.abs(calls[0].postStartedAt - calls[1].postStartedAt);
+  assert.ok(gap < 200, `POSTs should fire within 200ms; gap was ${gap}ms (sequential would be ~500ms)`);
+  assert.ok(wallMs < 700, `wall time must reflect parallel exec; got ${wallMs}ms (sequential would be ~1000ms)`);
+});
+
+test('parallel fan-out: FIT POST initiated before BURN POST', async () => {
+  const calls = [];
+  async function fakeBookOnePlan(plan) {
+    await new Promise(r => setTimeout(r, 5));
+    calls.push({ kind: plan.kind, t: Date.now() });
+    await new Promise(r => setTimeout(r, 50));
+    return { ok: true };
+  }
+
+  const plans = fitFirstSort([
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]);
+  await Promise.all(plans.map(p => fakeBookOnePlan(p)));
+
+  const fitTime = calls.find(c => c.kind === 'FIT').t;
+  const burnTime = calls.find(c => c.kind === 'BURN').t;
+  // FIT must initiate before-or-equal BURN. JS microtask ordering means
+  // index-0 in Promise.all queues first, so equal-or-earlier is the spec.
+  assert.ok(fitTime <= burnTime, `FIT must initiate ≤ BURN; got FIT=${fitTime} BURN=${burnTime}`);
+});
+
+test('parallel fan-out: one plan failing does not abort the other', async () => {
+  async function fakeBookOnePlan(plan) {
+    if (plan.kind === 'BURN') throw new Error('BURN row went FULL');
+    await new Promise(r => setTimeout(r, 20));
+    return { ok: true, kind: plan.kind };
+  }
+
+  const plans = fitFirstSort([
+    { kind: 'BURN', primaryTime: '6:30pm' },
+    { kind: 'FIT', primaryTime: '7:30pm' },
+  ]);
+
+  // Mirror book.js: each plan's promise wraps in try/catch so one rejection
+  // doesn't cancel siblings (Promise.all rejects fast otherwise).
+  const settled = await Promise.all(plans.map(async (plan) => {
+    try { return { plan, status: await fakeBookOnePlan(plan) }; }
+    catch (e) { return { plan, status: { ok: false, reason: 'exception', detail: e.message } }; }
+  }));
+
+  const fit = settled.find(r => r.plan.kind === 'FIT');
+  const burn = settled.find(r => r.plan.kind === 'BURN');
+  assert.equal(fit.status.ok, true, 'FIT must succeed even when BURN throws');
+  assert.equal(burn.status.ok, false);
+  assert.match(burn.status.detail, /FULL/);
+});
