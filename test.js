@@ -1199,3 +1199,110 @@ test('parallel fan-out: one plan failing does not abort the other', async () => 
   assert.equal(burn.status.ok, false);
   assert.match(burn.status.detail, /FULL/);
 });
+
+
+// ─── Keychain-backed credential storage (2026-05-10 migration) ─────────────
+//
+// Mindbody passwords moved from plaintext users.json into a custom macOS
+// keychain (~/Library/Keychains/gym-booker.keychain-db). These tests pin
+// the contract:
+//   - keychain.js round-trips set/get/delete
+//   - users.getCreds() reads keychain first, falls back to plaintext, throws
+//     when neither has a value
+//   - real users (Dani, Mer) resolve cleanly via keychain — proves tomorrow's
+//     09:00 booking pipeline can still pick up creds.
+
+const keychain = require('./keychain');
+const users = require('./users');
+
+const SMOKE_CHAT_ID = '__test_chat_777__';
+
+test('keychain: set / get / delete round-trip', () => {
+  // Idempotent cleanup before
+  keychain.deleteCred(SMOKE_CHAT_ID, 'email');
+  keychain.deleteCred(SMOKE_CHAT_ID, 'password');
+
+  assert.equal(keychain.hasCred(SMOKE_CHAT_ID, 'email'), false);
+
+  keychain.setCred(SMOKE_CHAT_ID, 'email', 'unit-test@example.com');
+  keychain.setCred(SMOKE_CHAT_ID, 'password', 'unit-test-pw-1234');
+  assert.equal(keychain.getCred(SMOKE_CHAT_ID, 'email'), 'unit-test@example.com');
+  assert.equal(keychain.getCred(SMOKE_CHAT_ID, 'password'), 'unit-test-pw-1234');
+
+  // Update overwrites
+  keychain.setCred(SMOKE_CHAT_ID, 'email', 'updated@example.com');
+  assert.equal(keychain.getCred(SMOKE_CHAT_ID, 'email'), 'updated@example.com');
+
+  // Delete returns true once, false on idempotent re-delete
+  assert.equal(keychain.deleteCred(SMOKE_CHAT_ID, 'email'), true);
+  assert.equal(keychain.deleteCred(SMOKE_CHAT_ID, 'email'), false);
+  assert.equal(keychain.hasCred(SMOKE_CHAT_ID, 'email'), false);
+
+  // Cleanup
+  keychain.deleteCred(SMOKE_CHAT_ID, 'password');
+});
+
+test('keychain: refuses empty value (defense vs. silent overwrite)', () => {
+  assert.throws(
+    () => keychain.setCred(SMOKE_CHAT_ID, 'email', ''),
+    /refusing to store empty/i,
+  );
+});
+
+test('keychain: missing chatId or field rejected', () => {
+  assert.throws(() => keychain.getCred(undefined, 'email'), /chatId required/i);
+  assert.throws(() => keychain.getCred('x', ''), /field required/i);
+});
+
+test('users.getCreds: prefers keychain over plaintext', () => {
+  const KC_CHAT = '__test_chat_888__';
+  // Stash both keychain and plaintext for the same user; keychain should win.
+  keychain.setCred(KC_CHAT, 'email', 'kc-email@example.com');
+  keychain.setCred(KC_CHAT, 'password', 'kc-pw');
+  const fakeUser = {
+    id: 'kctest',
+    telegramChatId: KC_CHAT,
+    email: 'plain-email@example.com',
+    password: 'plain-pw',
+  };
+  const c = users.getCreds(fakeUser);
+  assert.equal(c.email, 'kc-email@example.com', 'keychain email must win over plaintext');
+  assert.equal(c.password, 'kc-pw', 'keychain password must win over plaintext');
+
+  keychain.deleteCred(KC_CHAT, 'email');
+  keychain.deleteCred(KC_CHAT, 'password');
+});
+
+test('users.getCreds: falls back to plaintext when keychain is empty', () => {
+  const fakeUser = {
+    id: 'plaintest',
+    telegramChatId: '__test_chat_999__',
+    email: 'plain@example.com',
+    password: 'plain-fallback',
+  };
+  const c = users.getCreds(fakeUser);
+  assert.equal(c.email, 'plain@example.com');
+  assert.equal(c.password, 'plain-fallback');
+});
+
+test('users.getCreds: throws when neither keychain nor plaintext has creds', () => {
+  const fakeUser = {
+    id: 'emptytest',
+    telegramChatId: '__test_chat_aaa__',
+  };
+  assert.throws(() => users.getCreds(fakeUser), /no creds/i);
+});
+
+test('users.getCreds: real registered users (Dani, Mer) resolve cleanly', () => {
+  // Regression guard for tomorrow's 09:00 booking. Both users were migrated
+  // to keychain on 2026-05-10. Pin that the resolution still works so a
+  // future refactor doesn't silently break booking.
+  const all = users.loadUsers();
+  const live = all.filter(u => u.telegramChatId);
+  assert.ok(live.length >= 2, `expected >=2 registered users with chatId, got ${live.length}`);
+  for (const u of live) {
+    const c = users.getCreds(u);
+    assert.ok(c.email && c.email.length > 3, `${u.id}: empty email`);
+    assert.ok(c.password && c.password.length > 3, `${u.id}: empty password`);
+  }
+});

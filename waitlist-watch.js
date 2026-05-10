@@ -144,14 +144,19 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
   const useAuth = !process.env.WAITLIST_NO_AUTH;
 
   // Pull MB credentials for reactive login. WAITLIST_USER overrides .env from users.json.
+  // Creds resolved via getCreds() — keychain first, plaintext fallback during migration.
   let mbEmail = process.env.MINDBODY_EMAIL;
   let mbPassword = process.env.MINDBODY_PASSWORD;
   if (watchUser) {
     try {
-      const users = JSON.parse(fs.readFileSync(path.join(__dirname, 'users.json'), 'utf8')).users;
-      const u = users.find(x => x.id === watchUser);
-      if (u) { mbEmail = u.email; mbPassword = u.password; }
-    } catch {}
+      const { getUser, getCreds } = require('./users');
+      const u = getUser(watchUser);
+      const c = getCreds(u);
+      mbEmail = c.email;
+      mbPassword = c.password;
+    } catch (e) {
+      console.error(`[waitlist-watch] cred lookup for user "${watchUser}" failed: ${e.message}`);
+    }
   }
 
   const browser = await chromium.launch({ headless: true });

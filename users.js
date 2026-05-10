@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const keychain = require('./keychain');
 
 const USERS_FILE = path.join(__dirname, 'users.json');
 const AUTH_DIR = path.join(__dirname, 'users-auth');
@@ -18,11 +19,38 @@ function getUser(id) {
   return u;
 }
 
+// Resolve Mindbody creds for a user. As of 2026-05-10, creds live in the
+// gym-booker custom keychain (see ./keychain.js). Plaintext fields on the
+// user object are accepted as fallback during the migration window only —
+// new users should never have them.
+//
+// Resolution order:
+//   1. Keychain (service=gym-booker-mindbody, account=<chatId>-{email,password})
+//   2. Plaintext user.email / user.password (deprecated; warns to stderr)
+//   3. Throw — booking can't proceed without creds.
 function getCreds(user) {
-  if (!user.email || !user.password) {
-    throw new Error(`user "${user.id}" missing email/password in users.json`);
+  const chatId = user.telegramChatId;
+  if (chatId) {
+    const kEmail = keychain.getCred(chatId, 'email');
+    const kPassword = keychain.getCred(chatId, 'password');
+    if (kEmail && kPassword) {
+      return { email: kEmail, password: kPassword };
+    }
   }
-  return { email: user.email, password: user.password };
+
+  if (user.email && user.password) {
+    process.stderr.write(
+      `[users.getCreds] WARNING: user "${user.id}" still has plaintext email/password ` +
+      `in users.json. Run \`node migrate-creds-to-keychain.js\` to migrate.\n`
+    );
+    return { email: user.email, password: user.password };
+  }
+
+  throw new Error(
+    `user "${user.id}" has no creds: keychain miss for chatId=${chatId}, ` +
+    `no plaintext fallback. Run \`node migrate-creds-to-keychain.js\` or have ` +
+    `Lawrence onboard this user.`
+  );
 }
 
 function getAuthPath(user) {
