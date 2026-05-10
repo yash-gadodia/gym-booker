@@ -1293,16 +1293,46 @@ test('users.getCreds: throws when neither keychain nor plaintext has creds', () 
   assert.throws(() => users.getCreds(fakeUser), /no creds/i);
 });
 
-test('users.getCreds: real registered users (Dani, Mer) resolve cleanly', () => {
-  // Regression guard for tomorrow's 09:00 booking. Both users were migrated
-  // to keychain on 2026-05-10. Pin that the resolution still works so a
-  // future refactor doesn't silently break booking.
+test('users.getCreds: every registered user resolves cleanly via keychain', () => {
+  // Regression guard for the daily 09:00 booking pipeline. Yash, Dani, Mer,
+  // and Cheryl were all migrated to keychain on 2026-05-10 — Yash via the
+  // .env-scrub follow-up later that evening. Pin that resolution still
+  // works for everyone (incl. users still in onboarding — creds may be
+  // saved before schedule).
   const all = users.loadUsers();
   const live = all.filter(u => u.telegramChatId);
-  assert.ok(live.length >= 2, `expected >=2 registered users with chatId, got ${live.length}`);
+  assert.ok(live.length >= 4, `expected >=4 registered users with chatId, got ${live.length}`);
   for (const u of live) {
     const c = users.getCreds(u);
     assert.ok(c.email && c.email.length > 3, `${u.id}: empty email`);
     assert.ok(c.password && c.password.length > 3, `${u.id}: empty password`);
   }
+});
+
+test('users.getCreds: Yash (chat 166637821) resolves via keychain', () => {
+  // Specific guard for the 2026-05-10 evening migration that brought Yash
+  // off the legacy .env path into the keychain alongside everyone else.
+  const yash = users.loadUsers().find(u => u.telegramChatId === 166637821);
+  assert.ok(yash, 'Yash should be in users.json with telegramChatId 166637821');
+  assert.equal(yash.id, 'yash');
+  const c = users.getCreds(yash);
+  assert.ok(c.email && c.email.includes('@'), 'Yash email malformed or empty');
+  assert.ok(c.password && c.password.length >= 6, 'Yash password missing or too short');
+});
+
+test('book-all roster: every entry passes --user (no legacy no-user branch)', () => {
+  // The legacy "Yash uses no --user" branch in book-all.js was removed on
+  // 2026-05-10 when Yash joined the keychain. Re-introducing it would
+  // bypass getCreds() and re-create the .env plaintext dependency.
+  const src = fs.readFileSync(path.join(__dirname, 'book-all.js'), 'utf8');
+  // The legacy literal we don't want back
+  assert.ok(
+    !src.includes("[{ id: 'yash', label: 'Yash', bookArgs: [] }]"),
+    'book-all.js still has the legacy hardcoded yash-without-user roster entry',
+  );
+  // The replacement: every user gets --user via the loop
+  assert.ok(
+    src.includes("bookArgs: ['--user', u.id]"),
+    'book-all.js should map every users.json entry to bookArgs with --user',
+  );
 });

@@ -2,6 +2,12 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
+const { getUser, getCreds } = require('./users');
+
+// Recon defaults to Yash (super-admin, only one allowed for ad-hoc debug).
+// Override via RECON_USER=<id> for a different user.
+const reconUser = getUser(process.env.RECON_USER || 'yash');
+const reconCreds = getCreds(reconUser);
 
 const SHOTS = path.join(__dirname, 'screenshots');
 fs.mkdirSync(SHOTS, { recursive: true });
@@ -106,7 +112,7 @@ async function snap(page, name) {
     // Email input on this page has label "Email" but isn't type="email"; use first visible input
     const emailInput = page.locator('input:visible').first();
     await emailInput.waitFor({ state: 'visible', timeout: 15000 });
-    await emailInput.fill(process.env.MINDBODY_EMAIL);
+    await emailInput.fill(reconCreds.email);
     await snap(page, '04-email-filled');
     // Two-step: click Continue
     await page.click('button:has-text("Continue"), button:has-text("Next"), button[type="submit"]');
@@ -116,7 +122,7 @@ async function snap(page, name) {
     await snap(page, '05a-password-page');
 
     log('STEP 3b: enter password');
-    await page.fill('input[type="password"]', process.env.MINDBODY_PASSWORD);
+    await page.fill('input[type="password"]', reconCreds.password);
     await snap(page, '05b-password-filled');
     // Submit
     await Promise.all([

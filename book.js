@@ -115,7 +115,10 @@ async function clickVisible(page, selector) {
   return { ok: false };
 }
 
-// Resolve creds once. Yash uses env, other users use their users.json record.
+// Resolve creds once. As of 2026-05-10, every user (including Yash) lives in
+// users.json with creds in the keychain — pass `--user <id>` to look up.
+// The .env fallback path is retained for one-off ad-hoc test runs only and
+// will be empty in normal operation since MINDBODY_* was scrubbed.
 const creds = user
   ? usersLib.getCreds(user)
   : { email: process.env.MINDBODY_EMAIL, password: process.env.MINDBODY_PASSWORD };
@@ -124,7 +127,9 @@ async function loginAndSave(page, ctx, authPath) {
   log('AUTH: re-login starting');
   if (!creds.email || !creds.password) {
     throw new Error('auth expired but creds not available' +
-      (user ? ` for user "${user.id}" in users.json` : ' (MINDBODY_EMAIL/PASSWORD not set in .env)'));
+      (user
+        ? ` for user "${user.id}" — keychain miss, run \`node migrate-creds-to-keychain.js --apply\``
+        : ' — pass `--user <id>` to look up creds via the keychain (MINDBODY_* env path is deprecated)'));
   }
   let clicked = await clickVisible(page, 'button[data-name="NavigationBar.Login.Button"]');
   if (clicked.ok) log(`AUTH: clicked Login button (${clicked.rect.width}x${clicked.rect.height}) via data-name`);

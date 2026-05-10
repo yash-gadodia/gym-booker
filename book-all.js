@@ -44,9 +44,11 @@ function stripFlag(args, name) {
 
   const users = loadUsers();
 
-  // Roster: yash (legacy, no --user) + each user from users.json.
-  const roster = [{ id: 'yash', label: 'Yash', bookArgs: [] }];
-  for (const u of users) roster.push({ id: u.id, label: u.label || u.id, bookArgs: ['--user', u.id] });
+  // Roster: every user in users.json gets --user <id>. As of 2026-05-10,
+  // Yash is also a regular entry in users.json (creds in keychain), so the
+  // old "legacy no --user" branch is gone — all paths read keychain via
+  // getCreds(). Drop --skip yash on the CLI to leave him out for a run.
+  const roster = users.map(u => ({ id: u.id, label: u.label || u.id, bookArgs: ['--user', u.id] }));
 
   const filtered = roster.filter(r => {
     if (onlyList && !onlyList.includes(r.id)) return false;
