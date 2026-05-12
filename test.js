@@ -9,6 +9,8 @@ const {
   classifyCheckoutButton, classifyButtonStates, parseBookingCard,
   timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
+  LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
+  probeLoginButton, buildSetupFailureAlert,
 } = require('./lib');
 const { getTelegramTarget } = require('./users');
 const personality = require('./personality');
@@ -1334,5 +1336,277 @@ test('book-all roster: every entry passes --user (no legacy no-user branch)', ()
   assert.ok(
     src.includes("bookArgs: ['--user', u.id]"),
     'book-all.js should map every users.json entry to bookArgs with --user',
+  );
+});
+
+// ── Login-button protection (2026-05-12 incident regression suite) ──────────
+// These tests guard the fix for the cookie-banner-overlay race that broke 4/5
+// bookings on 2026-05-12. The probe logic and alert format live in lib.js so
+// they can be exercised here without Playwright; the same source runs in
+// production via page.evaluate (probeLoginButtonInBrowser).
+
+// Minimal fake DOM. Each node has tagName/id/className, a rect, and a parent
+// chain so contains() can walk it. enough to exercise probeLoginButton without
+// pulling in jsdom (kept zero-dep on purpose).
+function makeNode({ tagName = 'BUTTON', id = '', className = '', rect = null, parent = null } = {}) {
+  const node = {
+    tagName: tagName.toUpperCase(),
+    id,
+    className,
+    getBoundingClientRect: () => rect || { left: 0, top: 0, width: 100, height: 40 },
+    __parent: parent,
+    contains(other) {
+      if (other === this) return true;
+      let p = other && other.__parent;
+      while (p) { if (p === this) return true; p = p.__parent; }
+      return false;
+    },
+  };
+  return node;
+}
+
+function makeDoc({ button = null, topmost = null } = {}) {
+  return {
+    querySelector: () => button,
+    elementFromPoint: () => topmost,
+  };
+}
+
+test('probeLoginButton: no-button when selector matches nothing', () => {
+  const r = probeLoginButton(makeDoc({ button: null }), LOGIN_BUTTON_SEL);
+  assert.deepEqual(r, { state: 'no-button' });
+});
+
+test('probeLoginButton: invisible when button rect is 0x0', () => {
+  const btn = makeNode({ rect: { left: 0, top: 0, width: 0, height: 0 } });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: btn }), LOGIN_BUTTON_SEL);
+  assert.deepEqual(r, { state: 'invisible' });
+});
+
+test('probeLoginButton: invisible when only width is 0', () => {
+  const btn = makeNode({ rect: { left: 0, top: 0, width: 0, height: 40 } });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: btn }), LOGIN_BUTTON_SEL);
+  assert.equal(r.state, 'invisible');
+});
+
+test('probeLoginButton: invisible when only height is 0', () => {
+  const btn = makeNode({ rect: { left: 0, top: 0, width: 80, height: 0 } });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: btn }), LOGIN_BUTTON_SEL);
+  assert.equal(r.state, 'invisible');
+});
+
+test('probeLoginButton: no-topmost when elementFromPoint returns null', () => {
+  const btn = makeNode({});
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: null }), LOGIN_BUTTON_SEL);
+  assert.deepEqual(r, { state: 'no-topmost' });
+});
+
+test('probeLoginButton: clear when topmost IS the button', () => {
+  const btn = makeNode({});
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: btn }), LOGIN_BUTTON_SEL);
+  assert.deepEqual(r, { state: 'clear' });
+});
+
+test('probeLoginButton: clear when topmost is a descendant of the button', () => {
+  const btn = makeNode({ tagName: 'BUTTON' });
+  const inner = makeNode({ tagName: 'SPAN', parent: btn });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: inner }), LOGIN_BUTTON_SEL);
+  assert.deepEqual(r, { state: 'clear' });
+});
+
+test('probeLoginButton: clear when topmost is an ancestor of the button', () => {
+  const wrap = makeNode({ tagName: 'DIV' });
+  const btn = makeNode({ tagName: 'BUTTON', parent: wrap });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: wrap }), LOGIN_BUTTON_SEL);
+  assert.deepEqual(r, { state: 'clear' });
+});
+
+test('probeLoginButton: covered when topmost is unrelated', () => {
+  const btn = makeNode({ tagName: 'BUTTON' });
+  const overlay = makeNode({ tagName: 'DIV', id: 'onetrust-banner', className: 'banner-sdk' });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: overlay }), LOGIN_BUTTON_SEL);
+  assert.equal(r.state, 'covered');
+  assert.ok(r.blocker.includes('div'), `expected tag in blocker: ${r.blocker}`);
+  assert.ok(r.blocker.includes('#onetrust-banner'), `expected id in blocker: ${r.blocker}`);
+  assert.ok(r.blocker.includes('.banner-sdk'), `expected class in blocker: ${r.blocker}`);
+});
+
+test('probeLoginButton: blocker descriptor caps multi-class to first 2', () => {
+  const btn = makeNode({ tagName: 'BUTTON' });
+  const overlay = makeNode({ tagName: 'DIV', className: 'a b c d e f' });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: overlay }), LOGIN_BUTTON_SEL);
+  assert.equal(r.state, 'covered');
+  // First 2 classes only — keeps descriptor compact
+  assert.ok(r.blocker.includes('.a'));
+  assert.ok(r.blocker.includes('.b'));
+  assert.ok(!r.blocker.includes('.c'), `should not include 3rd class: ${r.blocker}`);
+});
+
+test('probeLoginButton: blocker descriptor capped at 80 chars', () => {
+  const btn = makeNode({ tagName: 'BUTTON' });
+  // Long class name to push over 80
+  const overlay = makeNode({ tagName: 'DIV', id: 'x'.repeat(50), className: 'y'.repeat(50) });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: overlay }), LOGIN_BUTTON_SEL);
+  assert.equal(r.state, 'covered');
+  assert.ok(r.blocker.length <= 80, `blocker length ${r.blocker.length} > 80: ${r.blocker}`);
+});
+
+test('probeLoginButton: covered descriptor handles missing id/class', () => {
+  const btn = makeNode({ tagName: 'BUTTON' });
+  const overlay = makeNode({ tagName: 'IFRAME', id: '', className: '' });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: overlay }), LOGIN_BUTTON_SEL);
+  assert.deepEqual(r, { state: 'covered', blocker: 'iframe' });
+});
+
+test('probeLoginButton: restores globalThis.document after running', () => {
+  const sentinel = { __sentinel: true };
+  globalThis.document = sentinel;
+  try {
+    const btn = makeNode({});
+    probeLoginButton(makeDoc({ button: btn, topmost: btn }), LOGIN_BUTTON_SEL);
+    assert.equal(globalThis.document, sentinel, 'document should be restored');
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('probeLoginButton: restores globalThis.document even when probe throws', () => {
+  const sentinel = { __sentinel: true };
+  globalThis.document = sentinel;
+  // Force probe to throw by passing a doc whose querySelector throws
+  const explodingDoc = {
+    querySelector: () => { throw new Error('boom'); },
+    elementFromPoint: () => null,
+  };
+  try {
+    assert.throws(() => probeLoginButton(explodingDoc, LOGIN_BUTTON_SEL), /boom/);
+    assert.equal(globalThis.document, sentinel, 'document should be restored even after throw');
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('LOGIN_BUTTON_SEL targets Mindbody nav button by data-name', () => {
+  assert.equal(LOGIN_BUTTON_SEL, 'button[data-name="NavigationBar.Login.Button"]');
+});
+
+test('OVERLAY_DISMISS_SELS includes the OneTrust cookie banner button text', () => {
+  assert.ok(Array.isArray(OVERLAY_DISMISS_SELS));
+  assert.ok(OVERLAY_DISMISS_SELS.length >= 5, 'expected several dismiss patterns');
+  // The exact selector that worked May 1-11 — losing this would regress the
+  // happy path even if every other selector is still valid.
+  assert.ok(
+    OVERLAY_DISMISS_SELS.includes('button:has-text("AGREE AND PROCEED")'),
+    'OneTrust canonical "AGREE AND PROCEED" must remain in the dismiss list',
+  );
+  assert.ok(
+    OVERLAY_DISMISS_SELS.includes('#onetrust-accept-btn-handler'),
+    'OneTrust id selector must remain (text-based may break on rename)',
+  );
+});
+
+test('OVERLAY_DISMISS_SELS entries are all non-empty strings', () => {
+  for (const s of OVERLAY_DISMISS_SELS) {
+    assert.equal(typeof s, 'string');
+    assert.ok(s.length > 0, `empty selector in dismiss list`);
+  }
+});
+
+test('YASH_ALERT_CHAT_ID is Yash personal Telegram chat (regression guard)', () => {
+  // The alert is the ONLY oncall channel for setup failures. Pointing it
+  // anywhere else (e.g. a group, another user) would silently drop pages.
+  assert.equal(YASH_ALERT_CHAT_ID, 166637821);
+});
+
+test('buildSetupFailureAlert: header and core fields present', () => {
+  const out = buildSetupFailureAlert({
+    userLabel: 'Melissa',
+    planLine: 'BURN @ 6:30pm + FIT @ 7:30pm',
+    dayLabel: 'Thu 2026-05-14',
+    errorMessage: 'auth expired and no visible Login button found',
+    runId: '2026-05-12T00-57-01',
+    msToNine: 3 * 60 * 1000, // 3 minutes
+  });
+  assert.ok(out.startsWith('🚨 BOOKER SETUP FAILED\n'));
+  assert.ok(out.includes('user: Melissa'));
+  assert.ok(out.includes('target: BURN @ 6:30pm + FIT @ 7:30pm on Thu 2026-05-14'));
+  assert.ok(out.includes('error: auth expired and no visible Login button found'));
+  assert.ok(out.includes('run: 2026-05-12T00-57-01'));
+  assert.ok(out.includes('3min until 9am SGT'));
+});
+
+test('buildSetupFailureAlert: post-9am branch when msToNine <= 0', () => {
+  const past = buildSetupFailureAlert({
+    userLabel: 'Yash', planLine: 'FIT @ 6:30am', dayLabel: 'Wed 2026-05-13',
+    errorMessage: 'X', runId: 'R', msToNine: -90 * 60 * 1000,
+  });
+  assert.ok(past.includes('9am window already open — book manually NOW'));
+  assert.ok(!past.includes('min until 9am'));
+
+  const exact = buildSetupFailureAlert({
+    userLabel: 'Yash', planLine: 'FIT @ 6:30am', dayLabel: 'Wed 2026-05-13',
+    errorMessage: 'X', runId: 'R', msToNine: 0,
+  });
+  assert.ok(exact.includes('9am window already open'));
+});
+
+test('buildSetupFailureAlert: pre-9am branch rounds minutes correctly', () => {
+  const out = buildSetupFailureAlert({
+    userLabel: 'Dani', planLine: 'FIT @ 6:30am', dayLabel: 'Thu 2026-05-14',
+    errorMessage: 'X', runId: 'R',
+    msToNine: 2 * 60 * 1000 + 40 * 1000, // 2m40s → rounds to 3
+  });
+  assert.ok(out.includes('3min until 9am SGT'));
+});
+
+test('buildSetupFailureAlert: truncates error messages over 240 chars', () => {
+  const long = 'A'.repeat(500);
+  const out = buildSetupFailureAlert({
+    userLabel: 'Yash', planLine: 'FIT @ 6:30am', dayLabel: 'X',
+    errorMessage: long, runId: 'R', msToNine: 60000,
+  });
+  // Count A's between "error: " and the next newline
+  const m = out.match(/error: (A+)\n/);
+  assert.ok(m, 'error line should be A-only after slicing');
+  assert.equal(m[1].length, 240, `error truncated to 240 chars, got ${m[1].length}`);
+});
+
+test('buildSetupFailureAlert: handles missing/empty error message', () => {
+  const out = buildSetupFailureAlert({
+    userLabel: 'Yash', planLine: 'FIT @ 6:30am', dayLabel: 'X',
+    errorMessage: '', runId: 'R', msToNine: 60000,
+  });
+  assert.ok(out.includes('error: \n'));
+  const out2 = buildSetupFailureAlert({
+    userLabel: 'Yash', planLine: 'FIT @ 6:30am', dayLabel: 'X',
+    errorMessage: undefined, runId: 'R', msToNine: 60000,
+  });
+  assert.ok(out2.includes('error: \n'));
+});
+
+test('buildSetupFailureAlert: missing msToNine treated as past-9am', () => {
+  const out = buildSetupFailureAlert({
+    userLabel: 'Yash', planLine: 'FIT @ 6:30am', dayLabel: 'X',
+    errorMessage: 'X', runId: 'R',
+    // msToNine omitted
+  });
+  assert.ok(out.includes('9am window already open'));
+});
+
+test('book.js uses lib helpers for login-overlay handling (no inline drift)', () => {
+  // Guard: re-introducing an inline copy of the probe or the chat ID in book.js
+  // would defeat the test suite. Pin against literal markers that would only
+  // appear if someone hardcoded the same logic.
+  const src = fs.readFileSync(path.join(__dirname, 'book.js'), 'utf8');
+  // book.js MUST reference the shared constants/helpers from lib
+  assert.ok(src.includes('LOGIN_BUTTON_SEL'), 'book.js should import LOGIN_BUTTON_SEL');
+  assert.ok(src.includes('OVERLAY_DISMISS_SELS'), 'book.js should import OVERLAY_DISMISS_SELS');
+  assert.ok(src.includes('probeLoginButtonInBrowser'), 'book.js should import probeLoginButtonInBrowser');
+  assert.ok(src.includes('buildSetupFailureAlert'), 'book.js should import buildSetupFailureAlert');
+  assert.ok(src.includes('YASH_ALERT_CHAT_ID'), 'book.js should import YASH_ALERT_CHAT_ID');
+  // And NOT inline the chat ID — pointing the pager at the wrong chat would be silent
+  assert.ok(
+    !/const\s+YASH_ALERT_CHAT_ID\s*=\s*\d+/.test(src),
+    'book.js must not redefine YASH_ALERT_CHAT_ID inline (drift risk)',
   );
 });

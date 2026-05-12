@@ -7,6 +7,8 @@ const {
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
+  LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
+  probeLoginButtonInBrowser, buildSetupFailureAlert,
 } = require('./lib');
 const {
   captureBearerToken, fetchScheduleClasses, findClass,
@@ -98,9 +100,8 @@ async function tg(text) {
 }
 
 // Setup-failure alert to Yash personally. Bypasses suppressTg (must fire even
-// in --dry-run/--now modes) and ignores per-user tgTarget. Hardcoded chat ID
-// because this is THE oncall channel for the booker — never another user's DM.
-const YASH_ALERT_CHAT_ID = 166637821;
+// in --dry-run/--now modes) and ignores per-user tgTarget. Chat ID + message
+// format live in lib.js so test.js can pin them without launching a browser.
 async function tgYashAlert(text) {
   if (!process.env.TELEGRAM_BOT_TOKEN) { log('alert: no bot token'); return; }
   const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -145,56 +146,24 @@ const creds = user
   ? usersLib.getCreds(user)
   : { email: process.env.MINDBODY_EMAIL, password: process.env.MINDBODY_PASSWORD };
 
-// Generic z-stack probe: confirm the Login button is at the top of the click
-// surface, not covered by an overlay. Uses document.elementFromPoint at the
-// button's center. If covered, tries to dismiss any known overlay (cookie
-// banner variants + generic modal-close buttons), then re-probes. Repeats
-// until clear or the budget expires.
+// Generic z-stack guard: poll until the Login button is at the top of the
+// click surface (not covered by any overlay). On each iteration, the inner
+// probe (probeLoginButtonInBrowser from lib.js) runs in browser context via
+// page.evaluate and returns {state, blocker?}. If covered, walks
+// OVERLAY_DISMISS_SELS, clicks the first that exists, re-probes.
 //
-// Why this exists: 2026-05-12 incident — OneTrust cookie banner arrived late
-// and overlaid the navbar. Single-shot dismissCookieBanner missed it; the
-// downstream Login click then hung 5s × 2 attempts. A targeted-by-text-content
-// dismiss is one Mindbody rename away from regressing the same way. This
-// helper treats the symptom generically: "button covered → try every dismiss
-// pattern we know → re-probe → repeat". Adding a new overlay pattern is one
-// line; no need to redesign the auth flow.
+// Why this is generic, not OneTrust-specific: 2026-05-12 incident showed that
+// a targeted-by-text dismiss is one Mindbody rename away from regressing. By
+// asking "is the button clickable?" instead of "is the cookie banner here?",
+// we handle ANY overlay — cookie banner, newsletter modal, GDPR variant,
+// future surprises. Adding a new dismiss pattern is one line in lib.js.
 async function ensureLoginUnblocked(page, { maxWaitMs = 8000 } = {}) {
-  const LOGIN_SEL = 'button[data-name="NavigationBar.Login.Button"]';
-  const DISMISS_SELS = [
-    // OneTrust cookie banner variants
-    'button:has-text("AGREE AND PROCEED")',
-    'button:has-text("Accept all")',
-    'button:has-text("Accept")',
-    'button:has-text("I Agree")',
-    '#onetrust-accept-btn-handler',
-    // Generic modal close buttons (newsletter / promo / GDPR variants)
-    'button[aria-label="Close"]',
-    'button[aria-label="close"]',
-    '[role="dialog"] button:has-text("Got it")',
-    '[role="dialog"] button:has-text("Dismiss")',
-    '[role="dialog"] button:has-text("Close")',
-    '[role="dialog"] button:has-text("OK")',
-  ];
   const start = Date.now();
   let attempts = 0;
   let lastBlocker = null;
   while (Date.now() - start < maxWaitMs) {
     attempts++;
-    const probe = await page.evaluate((sel) => {
-      const btn = document.querySelector(sel);
-      if (!btn) return { state: 'no-button' };
-      const r = btn.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) return { state: 'invisible' };
-      const cx = r.left + r.width / 2;
-      const cy = r.top + r.height / 2;
-      const top = document.elementFromPoint(cx, cy);
-      if (!top) return { state: 'no-topmost' };
-      if (top === btn || btn.contains(top) || top.contains(btn)) return { state: 'clear' };
-      const tag = top.tagName.toLowerCase();
-      const id = top.id ? `#${top.id}` : '';
-      const cls = (top.className || '').toString().trim().split(/\s+/).slice(0, 2).map(c => `.${c}`).join('');
-      return { state: 'covered', blocker: `${tag}${id}${cls}`.slice(0, 80) };
-    }, LOGIN_SEL);
+    const probe = await page.evaluate(probeLoginButtonInBrowser, LOGIN_BUTTON_SEL);
 
     if (probe.state === 'clear') {
       if (attempts > 1) log(`AUTH: Login unblocked after ${attempts} probes (${Date.now() - start}ms)`);
@@ -203,9 +172,9 @@ async function ensureLoginUnblocked(page, { maxWaitMs = 8000 } = {}) {
     if (probe.state === 'no-button') return { ok: true, reason: 'no-login-button' };
     lastBlocker = probe.state === 'covered' ? probe.blocker : probe.state;
 
-    // Try every dismiss selector. Silent on miss — banner may not exist yet.
+    // Try every dismiss selector. Silent on miss — overlay may not exist yet.
     let dismissed = false;
-    for (const sel of DISMISS_SELS) {
+    for (const sel of OVERLAY_DISMISS_SELS) {
       const el = await page.$(sel);
       if (!el) continue;
       try {
@@ -1184,21 +1153,14 @@ async function attemptFallbackBooking(page, plan, target) {
     // Fires regardless of suppressTg so synthetic tests still alert. Sends
     // even if the failed user IS Yash; the alert format is materially different
     // from the friendly per-user vibe message and is worth the duplicate ping.
-    const userLabel = user ? (user.label || user.id) : 'yash (default)';
-    const planLine = plans.map(p => `${p.kind} @ ${p.primaryTime}${p.fallback ? ` (fb ${p.fallback})` : ''}`).join(' + ');
-    const dayLabel = `${DAY_SHORT[target.getDay()]} ${ymd(target)}`;
-    const msToNine = t9.getTime() - Date.now();
-    const minsToNine = Math.max(0, Math.round(msToNine / 60000));
-    await tgYashAlert(
-      `🚨 BOOKER SETUP FAILED\n` +
-      `user: ${userLabel}\n` +
-      `target: ${planLine} on ${dayLabel}\n` +
-      `error: ${setupError.message.slice(0, 240)}\n` +
-      `run: ${RUN_ID}\n` +
-      (minsToNine > 0
-        ? `${minsToNine}min until 9am SGT — manual override possible`
-        : `9am window already open — book manually NOW`)
-    );
+    await tgYashAlert(buildSetupFailureAlert({
+      userLabel: user ? (user.label || user.id) : 'yash (default)',
+      planLine: plans.map(p => `${p.kind} @ ${p.primaryTime}${p.fallback ? ` (fb ${p.fallback})` : ''}`).join(' + '),
+      dayLabel: `${DAY_SHORT[target.getDay()]} ${ymd(target)}`,
+      errorMessage: setupError.message,
+      runId: RUN_ID,
+      msToNine: t9.getTime() - Date.now(),
+    }));
     // Login or pre-flight failed → mark every plan as exception, no per-plan attempt.
     for (const plan of plans) {
       results.push({ plan, status: { ok: false, reason: 'exception', detail: setupError.message, time: null } });

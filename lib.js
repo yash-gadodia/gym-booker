@@ -316,3 +316,95 @@ module.exports = {
   resolveBookingForDate,
   resolveBookingsForDate,
 };
+
+// ── Login-button protection (2026-05-12 incident) ───────────────────────────
+// Constants and pure helpers used by book.js's ensureLoginUnblocked and
+// tgYashAlert. Exported here so test.js can exercise them against a fake DOM
+// and a synthetic context without spinning up Playwright.
+
+const LOGIN_BUTTON_SEL = 'button[data-name="NavigationBar.Login.Button"]';
+
+// Ordered list of dismiss selectors. Tries each per probe iteration. Adding a
+// new overlay pattern (newsletter modal, GDPR variant, promo banner) is one
+// line. Specific cookie-banner texts FIRST so we don't miss-click a generic
+// "OK" before the real banner has loaded.
+const OVERLAY_DISMISS_SELS = [
+  'button:has-text("AGREE AND PROCEED")',
+  'button:has-text("Accept all")',
+  'button:has-text("Accept")',
+  'button:has-text("I Agree")',
+  '#onetrust-accept-btn-handler',
+  'button[aria-label="Close"]',
+  'button[aria-label="close"]',
+  '[role="dialog"] button:has-text("Got it")',
+  '[role="dialog"] button:has-text("Dismiss")',
+  '[role="dialog"] button:has-text("Close")',
+  '[role="dialog"] button:has-text("OK")',
+];
+
+const YASH_ALERT_CHAT_ID = 166637821;
+
+// Z-stack probe. References `document` as a global so the SAME function runs:
+//   - in the browser via Playwright page.evaluate (document = real DOM)
+//   - in Node tests via probeLoginButton (doc is shimmed onto globalThis)
+// State semantics:
+//   no-button  — selector matched nothing (probably already logged in)
+//   invisible  — element exists, 0×0 box (still rendering or display:none)
+//   no-topmost — elementFromPoint returned null (off-screen or torn down)
+//   covered    — something is on top of the button, blocker descriptor returned
+//   clear      — button (or its ancestor/descendant) is on top → safe to click
+function probeLoginButtonInBrowser(selector) {
+  const btn = document.querySelector(selector);
+  if (!btn) return { state: 'no-button' };
+  const r = btn.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return { state: 'invisible' };
+  const cx = r.left + r.width / 2;
+  const cy = r.top + r.height / 2;
+  const top = document.elementFromPoint(cx, cy);
+  if (!top) return { state: 'no-topmost' };
+  if (top === btn || btn.contains(top) || top.contains(btn)) return { state: 'clear' };
+  const tag = top.tagName.toLowerCase();
+  const id = top.id ? '#' + top.id : '';
+  const cls = (top.className || '').toString().trim().split(/\s+/).slice(0, 2).filter(Boolean).map(c => '.' + c).join('');
+  return { state: 'covered', blocker: (tag + id + cls).slice(0, 80) };
+}
+
+// Node wrapper: shims `globalThis.document` so probeLoginButtonInBrowser can
+// run unmodified in Node tests. Restores the previous value in finally so
+// concurrent tests don't leak.
+function probeLoginButton(doc, selector) {
+  const saved = globalThis.document;
+  globalThis.document = doc;
+  try {
+    return probeLoginButtonInBrowser(selector);
+  } finally {
+    globalThis.document = saved;
+  }
+}
+
+// Build the high-priority Yash alert text on setup failure. Pure string
+// builder so test.js can pin every branch. msToNine is signed: positive means
+// 9am SGT hasn't hit yet (booker still has time for manual override);
+// negative means we're past 9am (urgent).
+function buildSetupFailureAlert({ userLabel, planLine, dayLabel, errorMessage, runId, msToNine }) {
+  const minsToNine = Math.max(0, Math.round((msToNine || 0) / 60000));
+  return (
+    '🚨 BOOKER SETUP FAILED\n' +
+    `user: ${userLabel}\n` +
+    `target: ${planLine} on ${dayLabel}\n` +
+    `error: ${(errorMessage || '').slice(0, 240)}\n` +
+    `run: ${runId}\n` +
+    (minsToNine > 0
+      ? `${minsToNine}min until 9am SGT — manual override possible`
+      : '9am window already open — book manually NOW')
+  );
+}
+
+Object.assign(module.exports, {
+  LOGIN_BUTTON_SEL,
+  OVERLAY_DISMISS_SELS,
+  YASH_ALERT_CHAT_ID,
+  probeLoginButtonInBrowser,
+  probeLoginButton,
+  buildSetupFailureAlert,
+});
