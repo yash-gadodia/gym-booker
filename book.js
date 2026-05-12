@@ -8,7 +8,7 @@ const {
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
-  probeLoginButtonInBrowser, buildSetupFailureAlert,
+  probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
 } = require('./lib');
 const {
   captureBearerToken, fetchScheduleClasses, findClass,
@@ -99,21 +99,12 @@ async function tg(text) {
   } catch (e) { log('tg ERR', e.message); }
 }
 
-// Setup-failure alert to Yash personally. Bypasses suppressTg (must fire even
-// in --dry-run/--now modes) and ignores per-user tgTarget. Chat ID + message
-// format live in lib.js so test.js can pin them without launching a browser.
+// Setup-failure alert wrapper — routes through lib.sendYashAlert so the HTTP
+// path lives in one place. Always fires regardless of suppressTg (dry-run/now
+// tests still page Yash by design).
 async function tgYashAlert(text) {
-  if (!process.env.TELEGRAM_BOT_TOKEN) { log('alert: no bot token'); return; }
-  const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  try {
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: YASH_ALERT_CHAT_ID, text, disable_web_page_preview: true }),
-    });
-    if (r.ok) log('alert: sent to Yash');
-    else log('alert: FAIL', r.status, await r.text());
-  } catch (e) { log('alert: ERR', e.message); }
+  const ok = await sendYashAlert(text, { logger: (m) => log('alert:', m) });
+  log(ok ? 'alert: sent to Yash' : 'alert: FAILED (see prior line)');
 }
 
 async function isLoggedOut(page) {
@@ -1198,6 +1189,32 @@ async function attemptFallbackBooking(page, plan, target) {
     return personality.outcome(user, status, { planLine, dayLabel, runId: RUN_ID, didRelogin });
   });
   await tg(messages.join('\n\n'));
+
+  // Drop a structured result file for book-all.js to roll up into the daily
+  // summary. Only written when explicitly asked (env set); standalone book.js
+  // runs (manual smoke tests, ad-hoc) don't touch disk here.
+  if (process.env.BOOKER_RESULT_FILE) {
+    try {
+      const payload = {
+        user: user ? { id: user.id, label: user.label || user.id } : { id: 'yash', label: 'Yash' },
+        results: results.map(r => ({
+          plan: { kind: r.plan.kind, primaryTime: r.plan.primaryTime, fallback: r.plan.fallback || null },
+          status: {
+            ok: !!r.status.ok,
+            reason: r.status.reason || 'unknown',
+            detail: r.status.detail || '',
+            time: r.status.time || null,
+          },
+        })),
+        setupErrored: !!setupError,
+        dayLabel,
+        runId: RUN_ID,
+        targetYmd: ymd(target),
+      };
+      fs.writeFileSync(process.env.BOOKER_RESULT_FILE, JSON.stringify(payload));
+    } catch (e) { log(`result-file write failed: ${e.message}`); }
+  }
+
   flushLog();
   const allOk = results.every(r => r.status.ok);
   process.exit(allOk ? 0 : 1);

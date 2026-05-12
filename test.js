@@ -10,7 +10,7 @@ const {
   timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
-  probeLoginButton, buildSetupFailureAlert,
+  probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
 } = require('./lib');
 const { getTelegramTarget } = require('./users');
 const personality = require('./personality');
@@ -1609,4 +1609,256 @@ test('book.js uses lib helpers for login-overlay handling (no inline drift)', ()
     !/const\s+YASH_ALERT_CHAT_ID\s*=\s*\d+/.test(src),
     'book.js must not redefine YASH_ALERT_CHAT_ID inline (drift risk)',
   );
+});
+
+// ── Daily summary + result-file pipeline ────────────────────────────────────
+// buildDailySummary is the cross-user roll-up sent to Yash after book-all.js
+// finishes. Pure builder so we can pin every branch (all-ok, all-fail, partial,
+// setup-errored, mixed reasons, already-booked skip).
+
+const fakeRun = (id, label, plans, opts = {}) => ({
+  user: { id, label },
+  setupErrored: !!opts.setupErrored,
+  results: plans,
+});
+const okPlan = (kind, time, reason = 'booked') => ({
+  plan: { kind, primaryTime: time, fallback: null },
+  status: { ok: true, reason, time, detail: '' },
+});
+const failPlan = (kind, time, reason, detail = '') => ({
+  plan: { kind, primaryTime: time, fallback: null },
+  status: { ok: false, reason, time, detail },
+});
+
+test('buildDailySummary: all-ok header + per-user line', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [okPlan('FIT', '6:30am')]),
+      fakeRun('dani', 'Dani', [okPlan('FIT', '6:30am')]),
+    ],
+    runId: 'R1',
+    dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.startsWith('✅ BOOKER DAILY — all bookings landed\n'));
+  assert.ok(out.includes('day: Thu 2026-05-14'));
+  assert.ok(out.includes('users: 2'));
+  assert.ok(out.includes('✅ Yash (1/1)'));
+  assert.ok(out.includes('✅ Dani (1/1)'));
+  assert.ok(out.includes('run: R1'));
+});
+
+test('buildDailySummary: all-failed header when every plan fails', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [failPlan('FIT', '6:30am', 'exception', 'timeout')], { setupErrored: true }),
+      fakeRun('dani', 'Dani', [failPlan('FIT', '6:30am', 'exception', 'timeout')], { setupErrored: true }),
+    ],
+    runId: 'R2', dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.startsWith('🚨 BOOKER DAILY — every user failed\n'));
+  assert.ok(out.includes('🚨 Yash — setup failed (alerted)'));
+  assert.ok(out.includes('🚨 Dani — setup failed (alerted)'));
+  assert.ok(out.includes('❌ FIT @ 6:30am — exception'));
+});
+
+test('buildDailySummary: partial header when some succeed and some fail', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [okPlan('FIT', '6:30am')]),
+      fakeRun('dani', 'Dani', [failPlan('FIT', '6:30am', 'unverified')]),
+    ],
+    runId: 'R3', dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.startsWith('⚠️ BOOKER DAILY — partial\n'));
+  assert.ok(out.includes('✅ Yash (1/1)'));
+  assert.ok(out.includes('❌ Dani (0/1)'));
+});
+
+test('buildDailySummary: mixed per-user (one plan booked, one failed)', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('melissa', 'Melissa', [
+        okPlan('BURN', '6:30pm'),
+        failPlan('FIT', '7:30pm', 'unverified', 'row went FULL'),
+      ]),
+    ],
+    runId: 'R4', dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.includes('⚠️ Melissa (1/2)'));
+  assert.ok(out.includes('✅ BURN @ 6:30pm'));
+  assert.ok(out.includes('❌ FIT @ 7:30pm — unverified: row went FULL'));
+});
+
+test('buildDailySummary: already_booked plans render with ↪ marker', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('geraldine', 'Geraldine', [okPlan('FIT', '7:30am', 'already_booked')]),
+    ],
+    runId: 'R5', dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.includes('↪ FIT @ 7:30am (already booked)'));
+});
+
+test('buildDailySummary: setupErrored user gets 🚨 marker even with 0 failures shown', () => {
+  // Edge case: setupErrored true but results array is what book.js synthesizes
+  // (all plans as exception).
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('cheryl', 'Cheryl Lee', [
+        failPlan('BURN', '7:00am', 'exception', 'auth expired'),
+      ], { setupErrored: true }),
+    ],
+    runId: 'R6', dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.includes('🚨 Cheryl Lee — setup failed (alerted)'));
+});
+
+test('buildDailySummary: trims very long detail strings to 80 chars', () => {
+  const longDetail = 'A'.repeat(200);
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [failPlan('FIT', '6:30am', 'unverified', longDetail)]),
+    ],
+    runId: 'R7', dayLabel: 'Thu 2026-05-14',
+  });
+  const m = out.match(/❌ FIT @ 6:30am — unverified: (A+)/);
+  assert.ok(m, 'detail line should be captured');
+  assert.equal(m[1].length, 80, `detail truncated to 80 chars, got ${m[1].length}`);
+});
+
+test('buildDailySummary: shows missing-result synthesis from book-all crash path', () => {
+  // book-all.js synthesizes this when a child exits without writing its
+  // result file. Verify the summary surfaces it loudly.
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('dani', 'Dani', [
+        { plan: { kind: '?', primaryTime: '?', fallback: null },
+          status: { ok: false, reason: 'no-result-file', detail: 'child exited 1 without writing result file' } },
+      ], { setupErrored: true }),
+    ],
+    runId: 'R8', dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.includes('🚨 Dani — setup failed (alerted)'));
+  assert.ok(out.includes('no-result-file'));
+});
+
+test('sendYashAlert: posts to telegram with correct chat and body', async () => {
+  let calledUrl = null;
+  let calledBody = null;
+  const fakeFetch = async (url, opts) => {
+    calledUrl = url;
+    calledBody = JSON.parse(opts.body);
+    return { ok: true, status: 200 };
+  };
+  const ok = await sendYashAlert('hello', {
+    fetchImpl: fakeFetch,
+    env: { TELEGRAM_BOT_TOKEN: 'TEST_TOKEN_123' },
+    logger: () => {},
+  });
+  assert.equal(ok, true);
+  assert.equal(calledUrl, 'https://api.telegram.org/botTEST_TOKEN_123/sendMessage');
+  assert.equal(calledBody.chat_id, YASH_ALERT_CHAT_ID);
+  assert.equal(calledBody.text, 'hello');
+  assert.equal(calledBody.disable_web_page_preview, true);
+});
+
+test('sendYashAlert: returns false (no throw) when token missing', async () => {
+  const ok = await sendYashAlert('hello', {
+    fetchImpl: () => { throw new Error('should not call fetch'); },
+    env: {},
+    logger: () => {},
+  });
+  assert.equal(ok, false);
+});
+
+test('sendYashAlert: returns false (no throw) on non-2xx response', async () => {
+  const fakeFetch = async () => ({ ok: false, status: 500, text: async () => 'server boom' });
+  const ok = await sendYashAlert('hello', {
+    fetchImpl: fakeFetch,
+    env: { TELEGRAM_BOT_TOKEN: 'X' },
+    logger: () => {},
+  });
+  assert.equal(ok, false);
+});
+
+test('sendYashAlert: returns false (no throw) when fetch itself throws', async () => {
+  const fakeFetch = async () => { throw new Error('network down'); };
+  const ok = await sendYashAlert('hello', {
+    fetchImpl: fakeFetch,
+    env: { TELEGRAM_BOT_TOKEN: 'X' },
+    logger: () => {},
+  });
+  assert.equal(ok, false);
+});
+
+test('book.js writes BOOKER_RESULT_FILE on synthetic setup failure', async () => {
+  // End-to-end check: spawn book.js with --simulate-setup-fail + BOOKER_RESULT_FILE
+  // and verify the JSON payload has the shape book-all.js expects.
+  const { spawnSync } = require('node:child_process');
+  const tmp = path.join(os.tmpdir(), `booker-result-test-${process.pid}-${Date.now()}.json`);
+  try {
+    const res = spawnSync(process.execPath, [
+      path.join(__dirname, 'book.js'),
+      '--user', 'yash',
+      '--simulate-setup-fail',
+      '--now',
+    ], {
+      env: { ...process.env, BOOKER_RESULT_FILE: tmp, GYM_TEST_NO_TG: '1' },
+      timeout: 30000,
+    });
+    assert.ok(fs.existsSync(tmp), `result file not written: stderr=${res.stderr}`);
+    const parsed = JSON.parse(fs.readFileSync(tmp, 'utf8'));
+    assert.equal(parsed.user.id, 'yash');
+    assert.equal(parsed.user.label, 'Yash');
+    assert.equal(parsed.setupErrored, true, 'setupErrored should be true on synthetic fail');
+    assert.ok(Array.isArray(parsed.results), 'results should be an array');
+    assert.ok(parsed.results.length >= 1, 'at least one plan should be in results');
+    for (const r of parsed.results) {
+      assert.equal(r.status.ok, false, 'all plans should be marked failed');
+      assert.equal(r.status.reason, 'exception');
+      assert.ok(r.status.detail.includes('synthetic'), `detail should mention synthetic, got: ${r.status.detail}`);
+    }
+    assert.ok(parsed.dayLabel, 'dayLabel should be set');
+    assert.ok(parsed.runId, 'runId should be set');
+    assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(parsed.targetYmd), 'targetYmd should be YYYY-MM-DD');
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+});
+
+test('book-all.js wires BOOKER_RESULT_FILE env and rolls up summary', () => {
+  // Static guard: book-all.js must (a) pass BOOKER_RESULT_FILE to each spawn,
+  // (b) call buildDailySummary, (c) call sendYashAlert. Removing any of these
+  // would silently drop the daily DM.
+  const src = fs.readFileSync(path.join(__dirname, 'book-all.js'), 'utf8');
+  assert.ok(src.includes('BOOKER_RESULT_FILE'), 'book-all.js must set BOOKER_RESULT_FILE per child');
+  assert.ok(src.includes('buildDailySummary'), 'book-all.js must call buildDailySummary');
+  assert.ok(src.includes('sendYashAlert'), 'book-all.js must call sendYashAlert');
+  // And synthesize a missing-result entry so silent gaps still page Yash
+  assert.ok(src.includes('no-result-file'), 'book-all.js must synthesize a "no-result-file" entry on missing result');
+});
+
+test('book-all.js end-to-end: synthetic setup failure produces well-formed daily summary', () => {
+  // Spawns book-all.js with --only yash --simulate-setup-fail. Sets
+  // GYM_TEST_PRINT_SUMMARY=1 so the orchestrator prints the summary to stdout
+  // instead of POSTing to Telegram. This is the highest-fidelity test we have
+  // for the daily-summary pipeline short of an actual booking day.
+  const { spawnSync } = require('node:child_process');
+  const res = spawnSync(process.execPath, [
+    path.join(__dirname, 'book-all.js'),
+    '--only', 'yash',
+    '--simulate-setup-fail',
+    '--now',
+  ], {
+    env: { ...process.env, GYM_TEST_PRINT_SUMMARY: '1' },
+    timeout: 60000,
+  });
+  const out = res.stdout.toString();
+  // The orchestrator's TEST SUMMARY block must be present
+  assert.ok(out.includes('--- TEST DAILY SUMMARY ---'), `missing TEST SUMMARY block:\n${out}`);
+  assert.ok(out.includes('--- END TEST DAILY SUMMARY ---'));
+  // And the summary itself should reflect: 1 user, setup-errored, no successes
+  assert.ok(out.includes('🚨 BOOKER DAILY — every user failed'), `wrong header:\n${out}`);
+  assert.ok(out.includes('🚨 Yash — setup failed (alerted)'), `missing Yash setup-failed line:\n${out}`);
+  assert.ok(out.includes('synthetic'), 'detail should mention synthetic failure');
 });

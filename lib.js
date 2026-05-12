@@ -400,6 +400,76 @@ function buildSetupFailureAlert({ userLabel, planLine, dayLabel, errorMessage, r
   );
 }
 
+// Daily roll-up sent to Yash after book-all.js finishes all parallel runs.
+// One message per day, every day — successes AND failures so Yash has a
+// single ground-truth source on the day's bookings. Setup-failure alerts
+// still fire IMMEDIATELY (pre-9am, actionable); this summary lands a couple
+// minutes later with the full picture.
+//
+// `runs` is an array of { user, results, setupErrored, dayLabel } where:
+//   user: { id, label }
+//   results: [{ plan, status }] (status.ok bool, status.reason/detail/time)
+//   setupErrored: bool — true if setup blew up (already alerted on)
+//   dayLabel: 'Thu 2026-05-14' (target booking day)
+function buildDailySummary({ runs, runId, dayLabel }) {
+  const allFailed = runs.every(r => r.results.every(p => !p.status.ok));
+  const allOk = runs.every(r => r.results.every(p => p.status.ok));
+  let header;
+  if (allOk) header = '✅ BOOKER DAILY — all bookings landed';
+  else if (allFailed) header = '🚨 BOOKER DAILY — every user failed';
+  else header = '⚠️ BOOKER DAILY — partial';
+
+  const lines = [header, `day: ${dayLabel}`, `users: ${runs.length}`, ''];
+
+  const fmtPlanLine = (r) => {
+    const time = r.status.time || r.plan.primaryTime;
+    if (r.status.ok) {
+      if (r.status.reason === 'already_booked') return `   ↪ ${r.plan.kind} @ ${time} (already booked)`;
+      return `   ✅ ${r.plan.kind} @ ${time}`;
+    }
+    const reason = (r.status.reason || 'unknown').slice(0, 40);
+    const detail = (r.status.detail || '').replace(/\s+/g, ' ').slice(0, 80);
+    return `   ❌ ${r.plan.kind} @ ${time} — ${reason}${detail ? `: ${detail}` : ''}`;
+  };
+
+  for (const run of runs) {
+    const label = run.user.label || run.user.id;
+    const okCount = run.results.filter(p => p.status.ok).length;
+    const total = run.results.length;
+    let userHeader;
+    if (run.setupErrored) userHeader = `🚨 ${label} — setup failed (alerted)`;
+    else if (okCount === total) userHeader = `✅ ${label} (${okCount}/${total})`;
+    else if (okCount === 0)     userHeader = `❌ ${label} (0/${total})`;
+    else                        userHeader = `⚠️ ${label} (${okCount}/${total})`;
+    lines.push(userHeader);
+    for (const r of run.results) lines.push(fmtPlanLine(r));
+  }
+
+  lines.push('', `run: ${runId}`);
+  return lines.join('\n');
+}
+
+// Single HTTP send-path to Yash's personal Telegram chat. Used by both
+// book.js (setup-failure alert, per-child) and book-all.js (daily summary,
+// orchestrator). Returns true on 200, false on any failure — failures log to
+// stderr but never throw, so a Telegram outage can't take down the booker.
+async function sendYashAlert(text, { fetchImpl = (typeof fetch !== 'undefined' ? fetch : null), env = process.env, logger = (m) => process.stderr.write(`alert: ${m}\n`) } = {}) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  if (!token) { logger('no TELEGRAM_BOT_TOKEN — alert dropped'); return false; }
+  if (!fetchImpl) { logger('no fetch impl — alert dropped'); return false; }
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  try {
+    const r = await fetchImpl(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: YASH_ALERT_CHAT_ID, text, disable_web_page_preview: true }),
+    });
+    if (r.ok) return true;
+    logger(`HTTP ${r.status}: ${typeof r.text === 'function' ? await r.text() : ''}`);
+    return false;
+  } catch (e) { logger(`ERR ${e.message}`); return false; }
+}
+
 Object.assign(module.exports, {
   LOGIN_BUTTON_SEL,
   OVERLAY_DISMISS_SELS,
@@ -407,4 +477,6 @@ Object.assign(module.exports, {
   probeLoginButtonInBrowser,
   probeLoginButton,
   buildSetupFailureAlert,
+  buildDailySummary,
+  sendYashAlert,
 });
