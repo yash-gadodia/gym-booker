@@ -131,6 +131,11 @@ async function loginAndSave(page, ctx, authPath) {
         ? ` for user "${user.id}" — keychain miss, run \`node migrate-creds-to-keychain.js --apply\``
         : ' — pass `--user <id>` to look up creds via the keychain (MINDBODY_* env path is deprecated)'));
   }
+  // Cookie banner may have arrived late (after the 2.5s post-goto wait). If it
+  // overlays the navbar, Playwright will hang 5s per click attempt waiting for
+  // the Login button to receive pointer events. Try to dismiss with a budget
+  // before we hit clickVisible.
+  await dismissCookieBanner(page, { maxWaitMs: 5000 });
   let clicked = await clickVisible(page, 'button[data-name="NavigationBar.Login.Button"]');
   if (clicked.ok) log(`AUTH: clicked Login button (${clicked.rect.width}x${clicked.rect.height}) via data-name`);
   if (!clicked.ok) {
@@ -160,16 +165,33 @@ async function loginAndSave(page, ctx, authPath) {
   log('AUTH: login complete, auth.json refreshed');
 }
 
-async function dismissCookieBanner(page) {
-  for (const sel of [
+// Cookie banner appears asynchronously via OneTrust JS. On slow page loads it
+// can arrive AFTER the initial 2.5s settle, then overlay the navbar and block
+// Login clicks (caused the 2026-05-12 incident where 4/5 bookings failed). Pass
+// maxWaitMs to poll until the banner shows up or the budget expires.
+async function dismissCookieBanner(page, { maxWaitMs = 0 } = {}) {
+  const selectors = [
     'button:has-text("AGREE AND PROCEED")',
     'button:has-text("Accept")',
     'button:has-text("I Agree")',
     '#onetrust-accept-btn-handler',
-  ]) {
-    const el = await page.$(sel);
-    if (el) { try { await el.click({ timeout: 3000 }); log(`cookie dismissed: ${sel}`); await page.waitForTimeout(600); return; } catch {} }
-  }
+  ];
+  const start = Date.now();
+  do {
+    for (const sel of selectors) {
+      const el = await page.$(sel);
+      if (el) {
+        try {
+          await el.click({ timeout: 3000 });
+          log(`cookie dismissed: ${sel}${maxWaitMs ? ` (after ${Date.now() - start}ms)` : ''}`);
+          await page.waitForTimeout(600);
+          return true;
+        } catch {}
+      }
+    }
+    if (maxWaitMs > 0) await page.waitForTimeout(250);
+  } while (Date.now() - start < maxWaitMs);
+  return false;
 }
 
 async function clickClassesTab(page) {
