@@ -1794,6 +1794,13 @@ test('sendYashAlert: returns false (no throw) when fetch itself throws', async (
 test('book.js writes BOOKER_RESULT_FILE on synthetic setup failure', async () => {
   // End-to-end check: spawn book.js with --simulate-setup-fail + BOOKER_RESULT_FILE
   // and verify the JSON payload has the shape book-all.js expects.
+  //
+  // CRITICAL: book.js calls dotenv.config() on startup which RE-LOADS env vars
+  // from .env even if the parent env didn't set them. Deleting TELEGRAM_BOT_TOKEN
+  // from the spawn env is therefore not enough — dotenv would re-set it and the
+  // test would ping Yash's real chat. Setting it to a bogus value works because
+  // dotenv only fills missing vars by default. The bogus token routes the alert
+  // through Telegram's API which 404s on an invalid bot (no DM sent).
   const { spawnSync } = require('node:child_process');
   const tmp = path.join(os.tmpdir(), `booker-result-test-${process.pid}-${Date.now()}.json`);
   try {
@@ -1803,7 +1810,7 @@ test('book.js writes BOOKER_RESULT_FILE on synthetic setup failure', async () =>
       '--simulate-setup-fail',
       '--now',
     ], {
-      env: { ...process.env, BOOKER_RESULT_FILE: tmp, GYM_TEST_NO_TG: '1' },
+      env: { ...process.env, BOOKER_RESULT_FILE: tmp, TELEGRAM_BOT_TOKEN: 'TEST_TOKEN_INVALID_DO_NOT_SEND' },
       timeout: 30000,
     });
     assert.ok(fs.existsSync(tmp), `result file not written: stderr=${res.stderr}`);
@@ -1841,8 +1848,10 @@ test('book-all.js wires BOOKER_RESULT_FILE env and rolls up summary', () => {
 test('book-all.js end-to-end: synthetic setup failure produces well-formed daily summary', () => {
   // Spawns book-all.js with --only yash --simulate-setup-fail. Sets
   // GYM_TEST_PRINT_SUMMARY=1 so the orchestrator prints the summary to stdout
-  // instead of POSTing to Telegram. This is the highest-fidelity test we have
-  // for the daily-summary pipeline short of an actual booking day.
+  // instead of POSTing to Telegram. The spawned book.js child also fires its
+  // setup-failure tgYashAlert — invalidate TELEGRAM_BOT_TOKEN so that child's
+  // alert no-ops too (404 from Telegram API, no DM to Yash). See the
+  // BOOKER_RESULT_FILE test for why deleting the env var isn't enough.
   const { spawnSync } = require('node:child_process');
   const res = spawnSync(process.execPath, [
     path.join(__dirname, 'book-all.js'),
@@ -1850,7 +1859,7 @@ test('book-all.js end-to-end: synthetic setup failure produces well-formed daily
     '--simulate-setup-fail',
     '--now',
   ], {
-    env: { ...process.env, GYM_TEST_PRINT_SUMMARY: '1' },
+    env: { ...process.env, GYM_TEST_PRINT_SUMMARY: '1', TELEGRAM_BOT_TOKEN: 'TEST_TOKEN_INVALID_DO_NOT_SEND' },
     timeout: 60000,
   });
   const out = res.stdout.toString();
