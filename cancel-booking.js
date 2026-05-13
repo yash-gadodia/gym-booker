@@ -5,6 +5,29 @@ const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 
+// Card-match decision. Pure function so unit tests can verify the
+// require-ALL-three rule that blocks the cross-day false positive uncovered
+// 2026-05-13 (Yash had FIT 6:30am on May 14 AND May 15; the old timeMatch &&
+// (dayMatch || kindMatch) logic grabbed the wrong card).
+function matchCancelCard(flat, { dayOfMonth, kindArg, timeArg }) {
+  const dayMatch = new RegExp(`\\b${dayOfMonth}\\b`).test(flat);
+  // Word-boundary kindMatch: `/FIT/i` would falsely match the FIT inside
+  // "CROSSFIT®". `/\bFIT\b/i` only hits the standalone class label.
+  // Escape any regex meta chars in kindArg first (e.g. "Open Gym" has space).
+  const kindEsc = kindArg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const kindMatch = new RegExp(`\\b${kindEsc}\\b`, 'i').test(flat);
+  const timeRe = new RegExp(timeArg.replace(':', '\\:'), 'i');
+  const timeMatch = timeRe.test(flat);
+  return { dayMatch, kindMatch, timeMatch, match: dayMatch && kindMatch && timeMatch };
+}
+
+// Export FIRST so test.js can `require('./cancel-booking')` without triggering
+// argv parsing or the Playwright IIFE. Bail before any CLI side-effects.
+if (require.main !== module) {
+  module.exports = { matchCancelCard };
+  return;
+}
+
 const args = process.argv.slice(2);
 const opt = name => { const i = args.indexOf(`--${name}`); return i >= 0 && args[i+1] && !args[i+1].startsWith('--') ? args[i+1] : null; };
 const userArg = opt('user');
@@ -59,7 +82,6 @@ function emit(payload) {
   const cancelBtns = await page.locator('button:has-text("Cancel"), a:has-text("Cancel")').all();
   log(`found ${cancelBtns.length} Cancel buttons on page`);
 
-  const timeRe = new RegExp(timeArg.replace(':', '\\:'), 'i');
   let target = null;
   for (let i = 0; i < cancelBtns.length; i++) {
     // Walk up until we find the smallest ancestor that still contains exactly
@@ -80,11 +102,9 @@ function emit(payload) {
       return best;
     }).catch(() => '');
     const flat = cardText.replace(/\s+/g, ' ');
-    const dayMatch = new RegExp(`\\b${dayOfMonth}\\b`).test(flat);
-    const kindMatch = new RegExp(kindArg, 'i').test(flat);
-    const timeMatch = timeRe.test(flat);
-    log(`  card ${i} (day=${dayMatch} kind=${kindMatch} time=${timeMatch}): ${flat.slice(0, 250)}`);
-    if (timeMatch && (dayMatch || kindMatch)) {
+    const m = matchCancelCard(flat, { dayOfMonth, kindArg, timeArg });
+    log(`  card ${i} (day=${m.dayMatch} kind=${m.kindMatch} time=${m.timeMatch}): ${flat.slice(0, 250)}`);
+    if (m.match) {
       target = { btn: cancelBtns[i], card: flat };
       log(`  → MATCH`);
       break;

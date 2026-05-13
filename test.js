@@ -1860,6 +1860,49 @@ test('book-all.js loads .env so launchd-spawned summary alert has TELEGRAM_BOT_T
   assert.ok(dotenvIdx < libIdx, 'dotenv.config() must run BEFORE require("./lib") so TELEGRAM_BOT_TOKEN is set before sendYashAlert is loaded');
 });
 
+test('cancel-booking matchCancelCard requires day+kind+time ALL three to match', () => {
+  // Regression for 2026-05-13 bug: when a user has the same kind+time on
+  // multiple upcoming dates (cron books two consecutive days), the old
+  // `time && (day || kind)` logic latched onto the wrong card. Real example:
+  // Yash had FIT 6:30am on May 14 AND May 15; reschedule for May 15 dry-run
+  // grabbed the May 14 card. Fix requires all three to match.
+  const { matchCancelCard } = require('./cancel-booking');
+
+  // Exact match — same card we want
+  const targetCard = '15 Friday May, 2026 CROSSFIT® FIT RagTag Training w/ Annie Set 6:30am (60 min) Cancel +CALENDAR';
+  const r1 = matchCancelCard(targetCard, { dayOfMonth: '15', kindArg: 'FIT', timeArg: '6:30am' });
+  assert.equal(r1.match, true, `target card should match: ${JSON.stringify(r1)}`);
+
+  // The neighbouring May 14 card: kind+time match but day doesn't.
+  // Old buggy logic: time(true) && (day(false) || kind(true)) = true → WRONG MATCH
+  // New strict logic: time && day && kind = false → correctly rejected
+  const wrongDayCard = '14 Thursday May, 2026 CROSSFIT® FIT RagTag Training w/ Annie Set 6:30am (60 min) Cancel +CALENDAR';
+  const r2 = matchCancelCard(wrongDayCard, { dayOfMonth: '15', kindArg: 'FIT', timeArg: '6:30am' });
+  assert.equal(r2.dayMatch, false);
+  assert.equal(r2.match, false, `wrong-day card must NOT match: ${JSON.stringify(r2)}`);
+
+  // Different time but same day+kind: rightly rejected.
+  const wrongTimeCard = '15 Friday May, 2026 CROSSFIT® FIT 7:30am (60 min) Cancel';
+  const r3 = matchCancelCard(wrongTimeCard, { dayOfMonth: '15', kindArg: 'FIT', timeArg: '6:30am' });
+  assert.equal(r3.match, false);
+
+  // Different kind but same day+time: rightly rejected.
+  const wrongKindCard = '15 Friday May, 2026 CROSSFIT® Gymnastics 6:30am (60 min) Cancel';
+  const r4 = matchCancelCard(wrongKindCard, { dayOfMonth: '15', kindArg: 'FIT', timeArg: '6:30am' });
+  assert.equal(r4.match, false);
+});
+
+test('cancel-booking matchCancelCard day boundary: 5 must not match 15 or 25', () => {
+  // `\b5\b` should match "5" as a standalone token but NOT "15" or "25" or "55".
+  const { matchCancelCard } = require('./cancel-booking');
+  const card15 = '15 Friday May, 2026 CROSSFIT® FIT 6:30am Cancel';
+  const card25 = '25 Monday May, 2026 CROSSFIT® FIT 6:30am Cancel';
+  const card5  = '5 Tuesday May, 2026 CROSSFIT® FIT 6:30am Cancel';
+  assert.equal(matchCancelCard(card15, { dayOfMonth: '5', kindArg: 'FIT', timeArg: '6:30am' }).match, false);
+  assert.equal(matchCancelCard(card25, { dayOfMonth: '5', kindArg: 'FIT', timeArg: '6:30am' }).match, false);
+  assert.equal(matchCancelCard(card5,  { dayOfMonth: '5', kindArg: 'FIT', timeArg: '6:30am' }).match, true);
+});
+
 test('book-all.js: dotenv loads TELEGRAM_BOT_TOKEN from .env (cwd-relative)', () => {
   // Sanity that dotenv's default cwd-relative .env discovery works from the
   // gym-booker dir. book-all.js's first executable line is dotenv.config(),
