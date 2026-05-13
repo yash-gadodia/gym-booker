@@ -14,6 +14,7 @@
 //   node book-all.js --skip yash         # everyone except Yash
 //
 // Exit code: 0 only if every child exited 0; non-zero if any failed.
+require('dotenv').config();
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');

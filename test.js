@@ -1845,6 +1845,32 @@ test('book-all.js wires BOOKER_RESULT_FILE env and rolls up summary', () => {
   assert.ok(src.includes('no-result-file'), 'book-all.js must synthesize a "no-result-file" entry on missing result');
 });
 
+test('book-all.js loads .env so launchd-spawned summary alert has TELEGRAM_BOT_TOKEN', () => {
+  // Regression guard for 2026-05-13 incident: launchd plist exports PATH/HOME/TZ
+  // but not TELEGRAM_BOT_TOKEN. Per-child book.js processes call dotenv.config()
+  // so their own tg-sends work, but book-all.js (the orchestrator) was missing
+  // it — every daily summary logged `alert: no TELEGRAM_BOT_TOKEN — alert dropped`
+  // and the run-level summary DM never reached Yash. Must run BEFORE require('./lib')
+  // so the env var is set when sendYashAlert runs at end of run.
+  const src = fs.readFileSync(path.join(__dirname, 'book-all.js'), 'utf8');
+  const dotenvIdx = src.indexOf("require('dotenv').config()");
+  const libIdx = src.indexOf("require('./lib')");
+  assert.ok(dotenvIdx >= 0, 'book-all.js must call dotenv.config()');
+  assert.ok(libIdx >= 0, 'book-all.js must require ./lib');
+  assert.ok(dotenvIdx < libIdx, 'dotenv.config() must run BEFORE require("./lib") so TELEGRAM_BOT_TOKEN is set before sendYashAlert is loaded');
+});
+
+test('book-all.js: dotenv loads TELEGRAM_BOT_TOKEN from .env (cwd-relative)', () => {
+  // Sanity that dotenv's default cwd-relative .env discovery works from the
+  // gym-booker dir. book-all.js's first executable line is dotenv.config(),
+  // and run-daily.sh cd's into $HOME/gym-booker before invoking it — so this
+  // probe mirrors the actual launchd invocation.
+  const { spawnSync } = require('node:child_process');
+  const probe = "delete process.env.TELEGRAM_BOT_TOKEN; require('dotenv').config(); console.log('TOKEN=' + (process.env.TELEGRAM_BOT_TOKEN ? 'set' : 'unset'));";
+  const res = spawnSync(process.execPath, ['-e', probe], { cwd: __dirname, timeout: 5000 });
+  assert.ok(res.stdout.toString().includes('TOKEN=set'), `dotenv must populate TELEGRAM_BOT_TOKEN from ${__dirname}/.env when cwd=that dir. Got: ${res.stdout}`);
+});
+
 test('book-all.js end-to-end: synthetic setup failure produces well-formed daily summary', () => {
   // Spawns book-all.js with --only yash --simulate-setup-fail. Sets
   // GYM_TEST_PRINT_SUMMARY=1 so the orchestrator prints the summary to stdout
