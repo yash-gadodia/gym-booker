@@ -836,41 +836,50 @@ async function attemptFallbackBooking(page, plan, target) {
   const authPath = user
     ? usersLib.getAuthPath(user)
     : path.join(__dirname, 'auth.json');
-  const msToNine = t9.getTime() - Date.now();
-  const forceLogin = !noWait && msToNine > 90000;
-  log(`auth: ${forceLogin ? `FORCE fresh login (${msToNine}ms to 9am, >90s safety margin)` : 'using cached auth.json if available'}`);
 
-  const browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1440, height: 900 }, locale: 'en-SG', timezoneId: SGT_TZ,
-    storageState: (!forceLogin && fs.existsSync(authPath)) ? authPath : undefined,
-  });
-  const page = await ctx.newPage();
+  let browser = null, ctx = null, page = null;
   let didRelogin = false;
   let myBookings = [];           // pre-flight, shared across plans
   let setupError = null;          // login or pre-flight failure → all plans fail
   const results = [];             // per-plan { plan, status }
 
-  try {
+  // Setup is retried once on failure (e.g. Chromium child process crash mid-auth
+  // — see 2026-05-14 incident: Dani's run died at snap(landed) → next page.evaluate
+  // hit "Target page, context or browser has been closed"). Retry relaunches a
+  // fresh browser only when we have >75s headroom to 9am SGT (fresh login ~50s
+  // + book ~3s + buffer). noWait mode (testing) skips the headroom check.
+  async function attemptSetup() {
+    const msToNineNow = t9.getTime() - Date.now();
+    const forceLogin = !noWait && msToNineNow > 90000;
+    log(`auth: ${forceLogin ? `FORCE fresh login (${msToNineNow}ms to 9am, >90s safety margin)` : 'using cached auth.json if available'}`);
+    const localBrowser = await chromium.launch({ headless: true });
+    const localCtx = await localBrowser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      viewport: { width: 1440, height: 900 }, locale: 'en-SG', timezoneId: SGT_TZ,
+      storageState: (!forceLogin && fs.existsSync(authPath)) ? authPath : undefined,
+    });
+    const localPage = await localCtx.newPage();
+    let localDidRelogin = false;
+    let localMyBookings = [];
+
     if (simulateSetupFail) throw new Error('synthetic setup failure for alert testing (--simulate-setup-fail)');
     log('navigating to ragtag');
-    await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2500);
-    await dismissCookieBanner(page);
-    await snap(page, 'landed');
+    await localPage.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await localPage.waitForTimeout(2500);
+    await dismissCookieBanner(localPage);
+    await snap(localPage, 'landed');
 
-    if (await isLoggedOut(page)) {
+    if (await isLoggedOut(localPage)) {
       log(`AUTH: detected logged-out state — ${forceLogin ? 'proactive' : 'reactive'} login`);
-      didRelogin = true;
-      await snap(page, 'logged-out');
-      await loginAndSave(page, ctx, authPath);
+      localDidRelogin = true;
+      await snap(localPage, 'logged-out');
+      await loginAndSave(localPage, localCtx, authPath);
       log('AUTH: re-navigating to ragtag after login');
-      await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(2500);
-      await dismissCookieBanner(page);
-      await snap(page, 'post-relogin');
-      if (await isLoggedOut(page)) throw new Error('still logged out after re-login attempt');
+      await localPage.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await localPage.waitForTimeout(2500);
+      await dismissCookieBanner(localPage);
+      await snap(localPage, 'post-relogin');
+      if (await isLoggedOut(localPage)) throw new Error('still logged out after re-login attempt');
       await tg(personality.loggedIn(user));
     }
 
@@ -881,21 +890,50 @@ async function attemptFallbackBooking(page, plan, target) {
     // days we fetch this ONCE and dup-check each plan against the same list.
     if (!allowDuplicate) {
       try {
-        myBookings = await fetchMyUpcomingBookings(page);
-        log(`my-schedule: ${myBookings.length} upcoming bookings`);
-        for (const b of myBookings) log(`  ${b.ymd} ${b.kind} @ ${b.time}`);
+        localMyBookings = await fetchMyUpcomingBookings(localPage);
+        log(`my-schedule: ${localMyBookings.length} upcoming bookings`);
+        for (const b of localMyBookings) log(`  ${b.ymd} ${b.kind} @ ${b.time}`);
       } catch (e) {
         log(`my-schedule pre-flight failed (${e.message.slice(0,120)}) — continuing without guard`);
       }
       // Re-land on ragtag for the rest of the flow.
-      await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(2000);
-      await dismissCookieBanner(page);
+      await localPage.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await localPage.waitForTimeout(2000);
+      await dismissCookieBanner(localPage);
     }
-  } catch (e) {
-    log('ERROR (setup)', e.message);
-    try { await snap(page, 'error-setup'); } catch {}
-    setupError = e;
+
+    return { browser: localBrowser, ctx: localCtx, page: localPage, didRelogin: localDidRelogin, myBookings: localMyBookings };
+  }
+
+  const MAX_SETUP_ATTEMPTS = 2;
+  for (let attempt = 1; attempt <= MAX_SETUP_ATTEMPTS; attempt++) {
+    let attemptBrowser = null, attemptPage = null;
+    try {
+      const r = await attemptSetup();
+      browser = r.browser; ctx = r.ctx; page = r.page;
+      didRelogin = r.didRelogin; myBookings = r.myBookings;
+      setupError = null;
+      if (attempt > 1) log(`SETUP RECOVERED on attempt ${attempt}`);
+      break;
+    } catch (e) {
+      // Capture whatever browser/page exists so we can snap + close cleanly.
+      attemptBrowser = browser; attemptPage = page;
+      log(`ERROR (setup attempt ${attempt}/${MAX_SETUP_ATTEMPTS})`, e.message);
+      try { if (attemptPage) await snap(attemptPage, `error-setup-${attempt}`); } catch {}
+      try { if (attemptBrowser) await attemptBrowser.close(); } catch {}
+      browser = null; ctx = null; page = null;
+      setupError = e;
+      const msRemaining = t9.getTime() - Date.now();
+      const canRetry = attempt < MAX_SETUP_ATTEMPTS && (noWait || msRemaining > 75000);
+      if (canRetry) {
+        log(`SETUP RETRY: ${msRemaining}ms to 9am, relaunching fresh browser (attempt ${attempt + 1}/${MAX_SETUP_ATTEMPTS})`);
+        continue;
+      }
+      if (attempt < MAX_SETUP_ATTEMPTS) {
+        log(`SETUP RETRY skipped: only ${msRemaining}ms to 9am, below 75s safety margin — failing fast so Yash gets alerted`);
+      }
+      break;
+    }
   }
 
   // Per-plan booking flow. Shares browser/ctx (so login + cookies are reused)
@@ -1177,8 +1215,8 @@ async function attemptFallbackBooking(page, plan, target) {
     results.push(...settled);
   }
 
-  try { await ctx.storageState({ path: authPath }); } catch {}
-  await browser.close();
+  try { if (ctx) await ctx.storageState({ path: authPath }); } catch {}
+  try { if (browser) await browser.close(); } catch {}
 
   // Build aggregated Telegram message. For single-plan days this is identical
   // to the legacy single-message output. For back-to-back days each plan gets
