@@ -12,6 +12,7 @@ function classPlan(targetDate) {
   const dow = targetDate.getDay();
   if (dow === 0) return { kind: 'Gymnastics', primaryTime: '1:00pm',  fallback: null };
   if (dow === 6) return { kind: 'Gymnastics', primaryTime: '12:30pm', fallback: null };
+  if (dow === 5) return { kind: 'FIT', primaryTime: '7:30am', fallback: null };
   return { kind: 'FIT', primaryTime: '6:30am', fallback: '7:30am' };
 }
 

@@ -52,12 +52,24 @@ test('classPlan: all seven days', () => {
     ['2026-04-28', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }],
     ['2026-04-29', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }],
     ['2026-04-30', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }],
-    ['2026-05-01', { kind: 'FIT',        primaryTime: '6:30am',  fallback: '7:30am' }],
+    ['2026-05-01', { kind: 'FIT',        primaryTime: '7:30am',  fallback: null      }],
     ['2026-04-25', { kind: 'Gymnastics', primaryTime: '12:30pm', fallback: null }],
   ];
   for (const [date, expected] of cases) {
     const got = classPlan(new Date(date));
     assert.deepEqual(got, expected, `${date} (${DAY_SHORT[new Date(date).getDay()]})`);
+  }
+});
+
+test('classPlan: Fridays book FIT 7:30am with no fallback (regression — was 6:30am fb 7:30am)', () => {
+  // Yash + Dani changed their Friday default to 7:30am on 2026-05-15. Other
+  // users already have explicit Fri 7:30am in users.json, so this only affects
+  // schedule:null users (Yash, Dani). Pin three consecutive Fridays so a future
+  // edit that re-introduces the 6:30am branch fails loudly.
+  for (const date of ['2026-05-01', '2026-05-08', '2026-05-15', '2026-05-22']) {
+    const got = classPlan(new Date(date));
+    assert.equal(DAY_SHORT[new Date(date).getDay()], 'Fri', `${date} must be Fri`);
+    assert.deepEqual(got, { kind: 'FIT', primaryTime: '7:30am', fallback: null }, `${date}`);
   }
 });
 
