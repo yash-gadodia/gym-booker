@@ -412,10 +412,17 @@ function buildSetupFailureAlert({ userLabel, planLine, dayLabel, errorMessage, r
 //   setupErrored: bool — true if setup blew up (already alerted on)
 //   dayLabel: 'Thu 2026-05-14' (target booking day)
 function buildDailySummary({ runs, runId, dayLabel }) {
-  const allFailed = runs.every(r => r.results.every(p => !p.status.ok));
-  const allOk = runs.every(r => r.results.every(p => p.status.ok));
+  // A "skipped" run is an intentional opt-out (no DOW class, date_skip, or paused).
+  // It carries skipReason + empty results, and should NOT count as a failure
+  // toward the overall header — Melissa/Geraldine/Cheryl on Sun is success, not 🚨.
+  const isSkipped = (r) => !!r.skipReason && !r.setupErrored;
+  const activeRuns = runs.filter(r => !isSkipped(r));
+  const allOk = activeRuns.every(r => !r.setupErrored && r.results.every(p => p.status.ok));
+  const allFailed = activeRuns.length > 0
+    && activeRuns.every(r => r.setupErrored || r.results.every(p => !p.status.ok));
   let header;
-  if (allOk) header = '✅ BOOKER DAILY — all bookings landed';
+  if (activeRuns.length === 0) header = '✅ BOOKER DAILY — no bookings scheduled today';
+  else if (allOk) header = '✅ BOOKER DAILY — all bookings landed';
   else if (allFailed) header = '🚨 BOOKER DAILY — every user failed';
   else header = '⚠️ BOOKER DAILY — partial';
 
@@ -432,7 +439,17 @@ function buildDailySummary({ runs, runId, dayLabel }) {
     return `   ❌ ${r.plan.kind} @ ${time} — ${reason}${detail ? `: ${detail}` : ''}`;
   };
 
+  const fmtSkipLine = (run) => {
+    const label = run.user.label || run.user.id;
+    const detail = (run.skipDetail || '').replace(/\s+/g, ' ').slice(0, 80);
+    if (run.skipReason === 'opt_out_day') return `✅ ${label} — no class scheduled`;
+    if (run.skipReason === 'date_skip')   return `↪ ${label} — date skipped${detail ? ` (${detail})` : ''}`;
+    if (run.skipReason === 'paused')      return `⏸️ ${label} — ${detail || 'paused'}`;
+    return `↪ ${label} — ${run.skipReason}${detail ? ` (${detail})` : ''}`;
+  };
+
   for (const run of runs) {
+    if (isSkipped(run)) { lines.push(fmtSkipLine(run)); continue; }
     const label = run.user.label || run.user.id;
     const okCount = run.results.filter(p => p.status.ok).length;
     const total = run.results.length;

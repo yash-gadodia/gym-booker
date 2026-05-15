@@ -1726,6 +1726,86 @@ test('buildDailySummary: trims very long detail strings to 80 chars', () => {
   assert.equal(m[1].length, 80, `detail truncated to 80 chars, got ${m[1].length}`);
 });
 
+const skipRun = (id, label, skipReason, skipDetail = '') => ({
+  user: { id, label },
+  setupErrored: false,
+  results: [],
+  skipReason,
+  skipDetail,
+});
+
+test('buildDailySummary: opt_out_day renders as "no class scheduled" not setup-failed', () => {
+  // The Sun 2026-05-17 incident: Melissa/Geraldine/Cheryl had no Sun bookings,
+  // book.js exited 0 without a result file, and book-all synthesized a fake
+  // setupErrored entry rendering "🚨 setup failed (alerted)". Fix: book.js
+  // now writes a skip-result file and the summary renders ✅ here.
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [okPlan('Gymnastics', '1:00pm')]),
+      fakeRun('dani', 'Dani', [okPlan('Gymnastics', '1:00pm')]),
+      skipRun('melissa', 'Melissa', 'opt_out_day'),
+      skipRun('geraldine', 'Geraldine', 'opt_out_day'),
+      skipRun('cheryllee', 'Cheryl Lee', 'opt_out_day'),
+    ],
+    runId: 'R-sun', dayLabel: 'Sun 2026-05-17',
+  });
+  assert.ok(out.startsWith('✅ BOOKER DAILY — all bookings landed\n'), `header was: ${out.split('\n')[0]}`);
+  assert.ok(out.includes('users: 5'));
+  assert.ok(out.includes('✅ Yash (1/1)'));
+  assert.ok(out.includes('✅ Dani (1/1)'));
+  assert.ok(out.includes('✅ Melissa — no class scheduled'));
+  assert.ok(out.includes('✅ Geraldine — no class scheduled'));
+  assert.ok(out.includes('✅ Cheryl Lee — no class scheduled'));
+  assert.ok(!out.includes('setup failed'), 'must not render setup-failed for opt-out users');
+  assert.ok(!out.includes('no-result-file'), 'must not surface synthesized no-result-file reason');
+});
+
+test('buildDailySummary: all-skip day renders "no bookings scheduled today" header', () => {
+  const out = buildDailySummary({
+    runs: [
+      skipRun('melissa', 'Melissa', 'opt_out_day'),
+      skipRun('geraldine', 'Geraldine', 'opt_out_day'),
+    ],
+    runId: 'R-allskip', dayLabel: 'Sun 2026-05-17',
+  });
+  assert.ok(out.startsWith('✅ BOOKER DAILY — no bookings scheduled today\n'));
+});
+
+test('buildDailySummary: date_skip renders with ↪ marker and optional detail', () => {
+  const out = buildDailySummary({
+    runs: [
+      skipRun('dani', 'Dani', 'date_skip', 'cancelled by override'),
+    ],
+    runId: 'R-dateskip', dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.includes('↪ Dani — date skipped (cancelled by override)'));
+});
+
+test('buildDailySummary: paused renders with ⏸️ marker using detail', () => {
+  const out = buildDailySummary({
+    runs: [
+      skipRun('mer', 'Mer', 'paused', 'paused until 2026-05-20'),
+    ],
+    runId: 'R-paused', dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.includes('⏸️ Mer — paused until 2026-05-20'));
+});
+
+test('buildDailySummary: setup-failed user among skippers still triggers partial header', () => {
+  // Skipped users shouldn't shield a real setup failure: if Yash's auth blows
+  // up while Melissa is opted out, header must still flag the problem.
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [failPlan('FIT', '6:30am', 'exception', 'auth')], { setupErrored: true }),
+      skipRun('melissa', 'Melissa', 'opt_out_day'),
+    ],
+    runId: 'R-mixed', dayLabel: 'Thu 2026-05-14',
+  });
+  assert.ok(out.startsWith('🚨 BOOKER DAILY — every user failed\n'), `header was: ${out.split('\n')[0]}`);
+  assert.ok(out.includes('🚨 Yash — setup failed (alerted)'));
+  assert.ok(out.includes('✅ Melissa — no class scheduled'));
+});
+
 test('buildDailySummary: shows missing-result synthesis from book-all crash path', () => {
   // book-all.js synthesizes this when a child exits without writing its
   // result file. Verify the summary surfaces it loudly.
@@ -1828,6 +1908,36 @@ test('book.js writes BOOKER_RESULT_FILE on synthetic setup failure', async () =>
     assert.ok(parsed.dayLabel, 'dayLabel should be set');
     assert.ok(parsed.runId, 'runId should be set');
     assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(parsed.targetYmd), 'targetYmd should be YYYY-MM-DD');
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+});
+
+test('book.js writes BOOKER_RESULT_FILE with skipReason on opt_out_day', async () => {
+  // Locks the contract that fixes the Sun 2026-05-17 false-alarm: when a user
+  // has no class on the target DOW, book.js must still drop a result file
+  // (empty results + skipReason) so book-all.js does NOT synthesize a fake
+  // "no-result-file" setupErrored entry. Melissa's schedule has Mon/Tue/Thu/Fri
+  // → 2026-05-17 (Sun) is an opt_out_day.
+  const { spawnSync } = require('node:child_process');
+  const tmp = path.join(os.tmpdir(), `booker-skip-test-${process.pid}-${Date.now()}.json`);
+  try {
+    const res = spawnSync(process.execPath, [
+      path.join(__dirname, 'book.js'),
+      '--user', 'melissa',
+      '2026-05-17',
+    ], {
+      env: { ...process.env, BOOKER_RESULT_FILE: tmp, TELEGRAM_BOT_TOKEN: 'TEST_TOKEN_INVALID_DO_NOT_SEND' },
+      timeout: 30000,
+    });
+    assert.equal(res.status, 0, `book.js should exit 0 on opt-out, got ${res.status}; stderr=${res.stderr}`);
+    assert.ok(fs.existsSync(tmp), `result file not written: stderr=${res.stderr}`);
+    const parsed = JSON.parse(fs.readFileSync(tmp, 'utf8'));
+    assert.equal(parsed.user.id, 'melissa');
+    assert.equal(parsed.setupErrored, false, 'opt-out is not a setup failure');
+    assert.equal(parsed.skipReason, 'opt_out_day');
+    assert.deepEqual(parsed.results, [], 'opt-out has no plans to book');
+    assert.equal(parsed.targetYmd, '2026-05-17');
   } finally {
     try { fs.unlinkSync(tmp); } catch {}
   }

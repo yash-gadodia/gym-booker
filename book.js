@@ -789,6 +789,25 @@ async function attemptFallbackBooking(page, plan, target) {
     await tg(personality.outcome(user,
       { ok: true, reason: decision.skip, detail: decision.detail },
       { dayLabel: dayLabelForMsg, planLine: '', runId: RUN_ID }));
+    // Without this, book-all.js sees exit 0 + no result file and synthesizes a
+    // "setup failed" entry in the daily summary (false alarm). Empty results
+    // array + skipReason tells the orchestrator the user is intentionally
+    // sitting out.
+    if (process.env.BOOKER_RESULT_FILE) {
+      try {
+        const payload = {
+          user: user ? { id: user.id, label: user.label || user.id } : { id: 'yash', label: 'Yash' },
+          results: [],
+          setupErrored: false,
+          skipReason: decision.skip,
+          skipDetail: decision.detail || '',
+          dayLabel: dayLabelForMsg,
+          runId: RUN_ID,
+          targetYmd: ymd(target),
+        };
+        fs.writeFileSync(process.env.BOOKER_RESULT_FILE, JSON.stringify(payload));
+      } catch (e) { log(`result-file write failed: ${e.message}`); }
+    }
     flushLog();
     process.exit(0);
   }

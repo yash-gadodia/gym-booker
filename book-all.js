@@ -124,6 +124,8 @@ function stripFlag(args, name) {
         user: parsed.user,
         results: parsed.results,
         setupErrored: parsed.setupErrored,
+        skipReason: parsed.skipReason || null,
+        skipDetail: parsed.skipDetail || '',
       });
       if (parsed.dayLabel) dayLabel = parsed.dayLabel;
       if (parsed.runId) runId = parsed.runId;
