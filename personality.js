@@ -1,7 +1,7 @@
 // Lawrence's voice. Active vibe per user is set in users.json `vibe` field
 // (or VIBES_BY_ID by user id, or DEFAULT_VIBE as final fallback). The pools
 // `chaotic` (giga-chad / Free Guy) and `wholesome` (warm hype-coach) are
-// retained as dormant fallbacks; the canonical voice is `gymbro` — Sir
+// retained as dormant fallbacks; the canonical voice is `gymbro`, Sir
 // Lawrence, British gym bro: posh + gym register, "right then, on it, old
 // sport", "bloody clean rep", "we eating tonight". Same voice for every user
 // per workspace-lawrence/SOUL.md.
@@ -51,7 +51,7 @@ const STARTED = {
     ({ planLine, dayLabel }) => `🚀 *Wake-up call.* ${dayLabel} = ${planLine} day. Lawrence handling logistics.`,
   ],
   wholesome: [
-    ({ planLine, dayLabel, ceilSecs }) => `🌅 *Good morning!* Going for ${planLine} on ${dayLabel} for you — back in ${ceilSecs} min ☀️`,
+    ({ planLine, dayLabel, ceilSecs }) => `🌅 *Good morning!* Going for ${planLine} on ${dayLabel} for you, back in ${ceilSecs} min ☀️`,
     ({ planLine, dayLabel }) => `☀️ *Lawrence here!* Today's mission: lock in ${planLine} on ${dayLabel}`,
     ({ first, planLine, dayLabel }) => `💪 *Hey ${first}!* Gym squad activated. Targeting ${planLine} on ${dayLabel}`,
     ({ planLine, dayLabel }) => `🔋 *On it!* Booking ${planLine} for ${dayLabel}. Give me a sec`,
@@ -64,7 +64,7 @@ const STARTED = {
     ({ planLine, dayLabel }) => `🚀 *Lawrence reporting.* Today's mission: ${planLine} on ${dayLabel}. Anti-FULL countermeasures armed.`,
     ({ planLine, dayLabel }) => `🚀 *Engines warm.* Targeting ${planLine} on ${dayLabel}. Singapore's gym goblins haven't a prayer.`,
     ({ planLine, dayLabel, secs }) => `🚀 *Suit up.* ${planLine} on ${dayLabel}. ${secs}s on the clock. We don't miss reps.`,
-    ({ planLine, dayLabel }) => `🚀 *Showing up so you needn't.* ${planLine} on ${dayLabel} — incoming.`,
+    ({ planLine, dayLabel }) => `🚀 *Showing up so you needn't.* ${planLine} on ${dayLabel}, incoming.`,
     ({ planLine, dayLabel }) => `🚀 *Spotter on duty.* ${dayLabel} = ${planLine} day. Logistics handled.`,
     ({ planLine, dayLabel, first }) => `🚀 *Off we go, ${first}.* ${planLine} on ${dayLabel}. Cracking rep incoming.`,
   ],
@@ -116,7 +116,7 @@ const STANDBY_UI = {
     ({ planLine, secs }) => `⏸️ *On the clock.* ${planLine}. ${secs}s. The race begins.`,
   ],
   wholesome: [
-    ({ planLine, secs }) => `⏸️ *Almost there!* ${planLine} — booking opens in ${secs}s ⏰`,
+    ({ planLine, secs }) => `⏸️ *Almost there!* ${planLine}, booking opens in ${secs}s ⏰`,
     ({ planLine, secs }) => `⏸️ Ready to go ${planLine} in ${secs}s 🎯`,
     ({ planLine, secs }) => `⏸️ All queued up, just waiting on the clock... ${secs}s ⏳`,
   ],
@@ -135,7 +135,7 @@ const STANDBY_API = {
     ({ planLine, secs }) => `⏸️ *6-call pipeline cocked and locked.* ${planLine}. ${secs}s.`,
   ],
   wholesome: [
-    ({ planLine, secs }) => `⏸️ *All set!* ${planLine} pre-warmed via fast-path API — booking in ${secs}s ⚡`,
+    ({ planLine, secs }) => `⏸️ *All set!* ${planLine} pre-warmed via fast-path API, booking in ${secs}s ⚡`,
     ({ planLine, secs }) => `⏸️ Locked and ready. ${planLine} in ${secs}s ⏰`,
     ({ planLine, secs }) => `⏸️ Pre-warmed the express lane. ${planLine}, opens in ${secs}s 🚀`,
   ],
@@ -161,10 +161,10 @@ function standby(user, ctx) {
 //   ok=false reasons: not booked, unverified, exception, FULL-ish
 
 const OUTCOME = {
-  // Fastest happy path — api-direct booked. Includes timing in ms.
+  // Fastest happy path, api-direct booked. Includes timing in ms.
   bookedFast: {
     chaotic: [
-      ({ planLine, dayLabel, ms }) => `🔒 *LOCKED IN.* ${planLine} on ${dayLabel} is yours. Smashed Mindbody in ${ms}ms — they didn't even see it coming.`,
+      ({ planLine, dayLabel, ms }) => `🔒 *LOCKED IN.* ${planLine} on ${dayLabel} is yours. Smashed Mindbody in ${ms}ms, they didn't even see it coming.`,
       ({ planLine, dayLabel, ms, first }) => `✨ *DONE.* ${planLine} on ${dayLabel}. ${ms}ms. Go be insufferably fit, ${first}.`,
       ({ planLine, dayLabel, ms }) => `🥇 *Gold medal performance.* ${planLine} on ${dayLabel} secured in ${ms}ms. The other gym bros are reading this and crying.`,
       ({ planLine, dayLabel, ms }) => `💥 *BOOM.* ${planLine} on ${dayLabel}. ${ms}ms. Mindbody's lawyers want to talk.`,
@@ -172,10 +172,10 @@ const OUTCOME = {
       ({ planLine, dayLabel, ms }) => `🚀 *Annihilated.* ${planLine} on ${dayLabel} secured in ${ms}ms. The fastest booking in the East.`,
     ],
     wholesome: [
-      ({ planLine, dayLabel, ms }) => `✅ *All booked!* ${planLine} on ${dayLabel} — see you there 💪 (took ${ms}ms ⚡)`,
+      ({ planLine, dayLabel, ms }) => `✅ *All booked!* ${planLine} on ${dayLabel}, see you there 💪 (took ${ms}ms ⚡)`,
       ({ planLine, dayLabel, ms, first }) => `🎉 *Booking secured!* ${planLine} on ${dayLabel} for you, ${first}. Crushed it in ${ms}ms 🔥`,
       ({ planLine, dayLabel, first }) => `✨ *Yes!* ${planLine} on ${dayLabel} is locked in for you, ${first} 🌟`,
-      ({ planLine, dayLabel, ms }) => `💪 *${planLine} on ${dayLabel}* — booked in ${ms}ms. You got this 🔥`,
+      ({ planLine, dayLabel, ms }) => `💪 *${planLine} on ${dayLabel}*, booked in ${ms}ms. You got this 🔥`,
       ({ planLine, dayLabel }) => `🌟 *Locked in!* ${planLine} on ${dayLabel}. Have an amazing class 💪`,
     ],
     gymbro: [
@@ -196,7 +196,7 @@ const OUTCOME = {
       ({ planLine, dayLabel }) => `✅ *Locked in.* ${planLine} on ${dayLabel}. Manual mode but mission accomplished.`,
     ],
     wholesome: [
-      ({ planLine, dayLabel }) => `✅ *All booked!* ${planLine} on ${dayLabel} — see you there 💪`,
+      ({ planLine, dayLabel }) => `✅ *All booked!* ${planLine} on ${dayLabel}, see you there 💪`,
       ({ planLine, dayLabel, first }) => `🎉 *Booking secured!* ${planLine} on ${dayLabel} for you, ${first} 🌟`,
     ],
     gymbro: [
@@ -205,10 +205,10 @@ const OUTCOME = {
       ({ planLine, dayLabel, first }) => `✅ *Done, ${first}.* ${planLine} on ${dayLabel}. The React UI behaved itself for once.`,
     ],
   },
-  // Pre-flight detected an existing booking — idempotent rerun.
+  // Pre-flight detected an existing booking, idempotent rerun.
   alreadyBooked: {
     chaotic: [
-      ({ planLine, dayLabel }) => `✅ *Already booked.* ${planLine} on ${dayLabel}. Lawrence stands down — past-you already won this round.`,
+      ({ planLine, dayLabel }) => `✅ *Already booked.* ${planLine} on ${dayLabel}. Lawrence stands down, past-you already won this round.`,
       ({ planLine, dayLabel }) => `✅ *Past-you was on top of things.* ${planLine} on ${dayLabel} already locked in.`,
       ({ planLine, dayLabel }) => `✅ *Nothing to do.* ${planLine} on ${dayLabel} was already in your schedule. Go drink water.`,
     ],
@@ -222,13 +222,13 @@ const OUTCOME = {
       ({ planLine, dayLabel, first }) => `💪 *${first} woke up ahead of schedule.* ${planLine} on ${dayLabel} already on the books. Bloody marvellous.`,
     ],
   },
-  // Dry-run mode — no booking attempted.
+  // Dry-run mode, no booking attempted.
   dryRun: {
     chaotic: [
       ({ planLine, dayLabel }) => `🧪 *Dry run.* Would have booked ${planLine} on ${dayLabel}. No ammo spent.`,
     ],
     wholesome: [
-      ({ planLine, dayLabel }) => `🧪 Dry-run only — would have booked ${planLine} on ${dayLabel}`,
+      ({ planLine, dayLabel }) => `🧪 Dry-run only, would have booked ${planLine} on ${dayLabel}`,
     ],
     gymbro: [
       ({ planLine, dayLabel }) => `🧪 *Dry run, no gains.* Would have booked ${planLine} on ${dayLabel}. No protein wasted.`,
@@ -243,8 +243,8 @@ const OUTCOME = {
     ],
     wholesome: [
       ({ dayLabel }) => `🛌 Rest day for ${dayLabel}! Enjoy the lie-in 😴`,
-      ({ dayLabel }) => `🕊️ No class on ${dayLabel} — relax and recharge ✨`,
-      ({ dayLabel }) => `🥗 ${dayLabel} is a rest day — hydrate, stretch, snack 💚`,
+      ({ dayLabel }) => `🕊️ No class on ${dayLabel}, relax and recharge ✨`,
+      ({ dayLabel }) => `🥗 ${dayLabel} is a rest day, hydrate, stretch, snack 💚`,
     ],
     gymbro: [
       ({ dayLabel, first }) => `🛌 *Rest day, ${first}.* No class on ${dayLabel}. Recovery IS the gain.`,
@@ -258,22 +258,22 @@ const OUTCOME = {
     chaotic: [
       ({ dayLabel, detail }) => `⏸️ *Bookings paused.* ${dayLabel}: standing down (${detail || 'pause active'}). Resume on your word, captain.`,
       ({ dayLabel }) => `⏸️ *On ice.* ${dayLabel} is inside your pause window. Lawrence stays in his lane.`,
-      ({ dayLabel, detail }) => `🛑 *Paused.* No booking for ${dayLabel} — ${detail || 'on leave'}. DM me to un-pause anytime.`,
+      ({ dayLabel, detail }) => `🛑 *Paused.* No booking for ${dayLabel}, ${detail || 'on leave'}. DM me to un-pause anytime.`,
     ],
     wholesome: [
-      ({ dayLabel, detail }) => `⏸️ Bookings paused for ${dayLabel} — ${detail || 'on leave'}. Lmk when you're back! 💛`,
-      ({ dayLabel }) => `🛑 You're on a break — no booking for ${dayLabel}. Enjoy the time off ✨`,
+      ({ dayLabel, detail }) => `⏸️ Bookings paused for ${dayLabel}, ${detail || 'on leave'}. Lmk when you're back! 💛`,
+      ({ dayLabel }) => `🛑 You're on a break, no booking for ${dayLabel}. Enjoy the time off ✨`,
     ],
     gymbro: [
       ({ dayLabel, detail }) => `⏸️ *On a deload.* ${dayLabel}: standing down (${detail || 'pause active'}). Resume on your word, captain.`,
-      ({ dayLabel, detail }) => `🛑 *Bookings paused.* ${dayLabel} — ${detail || 'on leave'}. DM me to un-pause anytime.`,
+      ({ dayLabel, detail }) => `🛑 *Bookings paused.* ${dayLabel}, ${detail || 'on leave'}. DM me to un-pause anytime.`,
       ({ dayLabel }) => `⏸️ *On ice.* ${dayLabel} sits inside your pause window. Lawrence stays in his lane.`,
     ],
   },
   // User explicitly skipped this single date.
   dateSkip: {
     chaotic: [
-      ({ dayLabel }) => `⏭️ *Skipped on request.* ${dayLabel} — you said no, Lawrence said cool.`,
+      ({ dayLabel }) => `⏭️ *Skipped on request.* ${dayLabel}, you said no, Lawrence said cool.`,
       ({ dayLabel }) => `❎ *${dayLabel}: cancelled by you.* Honoring the override. Tomorrow's still on.`,
     ],
     wholesome: [
@@ -281,11 +281,11 @@ const OUTCOME = {
       ({ dayLabel }) => `⏭️ ${dayLabel} skipped per your request. See you next class! 🌟`,
     ],
     gymbro: [
-      ({ dayLabel }) => `⏭️ *Skipped per request.* ${dayLabel} — you said no, the bar said cool.`,
+      ({ dayLabel }) => `⏭️ *Skipped per request.* ${dayLabel}, you said no, the bar said cool.`,
       ({ dayLabel }) => `❎ *${dayLabel}: cancelled by you.* Honoring the override. Tomorrow's still leg day.`,
     ],
   },
-  // Race lost — class went FULL before we could BUY.
+  // Race lost, class went FULL before we could BUY.
   full: {
     chaotic: [
       ({ planLine, dayLabel, first }) => `💀 *BRUTAL.* ${planLine} on ${dayLabel} went FULL before I could blink. Sorry ${first}, Singapore is built different on ${dayLabel}s.`,
@@ -296,7 +296,7 @@ const OUTCOME = {
     wholesome: [
       ({ planLine, dayLabel, first }) => `😢 *So sorry ${first}!* ${planLine} on ${dayLabel} went full before I could grab it. Check the waitlist?`,
       ({ planLine, dayLabel }) => `🥲 *Missed it!* ${planLine} on ${dayLabel} filled up too fast. There's always tomorrow 💛`,
-      ({ planLine, dayLabel }) => `❌ ${planLine} on ${dayLabel} sold out 😢 — try the Mindbody app for the waitlist!`,
+      ({ planLine, dayLabel }) => `❌ ${planLine} on ${dayLabel} sold out 😢, try the Mindbody app for the waitlist!`,
     ],
     gymbro: [
       ({ planLine, dayLabel }) => `💀 *Brutal, I'm afraid.* ${planLine} on ${dayLabel} went FULL before I could rerack. Singapore's built different.`,
@@ -305,31 +305,31 @@ const OUTCOME = {
       ({ planLine, dayLabel, first }) => `❌ *Cooked, ${first}.* ${planLine} on ${dayLabel} FULL. Manual recon required.`,
     ],
   },
-  // Ambiguous — BUY didn't settle cleanly AND verify isn't BOOKED.
+  // Ambiguous, BUY didn't settle cleanly AND verify isn't BOOKED.
   unverified: {
     chaotic: [
-      ({ planLine, dayLabel, detail }) => `⚠️ *Ambiguous.* ${planLine} on ${dayLabel} — BUY didn't settle clean and the schedule's not confirming. Check Mindbody manually. (${detail})`,
+      ({ planLine, dayLabel, detail }) => `⚠️ *Ambiguous.* ${planLine} on ${dayLabel}, BUY didn't settle clean and the schedule's not confirming. Check Mindbody manually. (${detail})`,
     ],
     wholesome: [
       ({ planLine, dayLabel }) => `⚠️ Hmm, not 100% sure if ${planLine} on ${dayLabel} went through. Can you check Mindbody?`,
     ],
     gymbro: [
-      ({ planLine, dayLabel, detail }) => `⚠️ *Sketchy rep.* ${planLine} on ${dayLabel} — BUY didn't settle clean and the schedule's not confirming. Best check Mindbody by hand. (${detail})`,
+      ({ planLine, dayLabel, detail }) => `⚠️ *Sketchy rep.* ${planLine} on ${dayLabel}, BUY didn't settle clean and the schedule's not confirming. Best check Mindbody by hand. (${detail})`,
     ],
   },
   // Definitive failure: BUY was clicked but row stayed BOOK_NOW.
   notBooked: {
     chaotic: [
-      ({ planLine, dayLabel, detail }) => `❌ *Not booked.* ${planLine} on ${dayLabel} — BUY went out, row stayed BOOK NOW. Manual retry recommended. (${detail})`,
+      ({ planLine, dayLabel, detail }) => `❌ *Not booked.* ${planLine} on ${dayLabel}, BUY went out, row stayed BOOK NOW. Manual retry recommended. (${detail})`,
     ],
     wholesome: [
       ({ planLine, dayLabel }) => `❌ Booking didn't go through for ${planLine} on ${dayLabel}. Can you try manually?`,
     ],
     gymbro: [
-      ({ planLine, dayLabel, detail }) => `❌ *No-rep, I'm afraid.* ${planLine} on ${dayLabel} — BUY went out, row stayed BOOK NOW. Manual retry, old sport. (${detail})`,
+      ({ planLine, dayLabel, detail }) => `❌ *No-rep, I'm afraid.* ${planLine} on ${dayLabel}, BUY went out, row stayed BOOK NOW. Manual retry, old sport. (${detail})`,
     ],
   },
-  // Caught an exception — usually auth or selector drift.
+  // Caught an exception, usually auth or selector drift.
   exception: {
     chaotic: [
       ({ detail, first }) => `💥 *Lawrence had a moment.* ${detail}. Yash will look into it, ${first}.`,
