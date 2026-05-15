@@ -721,6 +721,67 @@ test('outcome: every gymbro variant in every bucket renders without crash', () =
   }
 });
 
+test('personality.js source: zero em-dashes (Yash voice rule, set 2026-05-15)', () => {
+  // Universal rule across every AI on Yash's behalf: em-dashes (U+2014) read
+  // as AI-tell and break the human-voice feel. Pin the source file as
+  // em-dash-free so a future edit that re-introduces one fails loudly.
+  // Hyphen (-, U+002D) and en-dash (–, U+2013) are fine and unaffected.
+  const src = fs.readFileSync(path.join(__dirname, 'personality.js'), 'utf8');
+  const matches = [...src.matchAll(/—/g)];
+  assert.equal(matches.length, 0,
+    `personality.js must contain zero em-dashes; found ${matches.length}. Replace with commas, periods, or rewrite.`);
+});
+
+test('personality: every rendered variant across every vibe is em-dash-free', () => {
+  // Defense-in-depth on top of the static-source guard: even if an em-dash
+  // sneaks in via a future interpolation path or context value, the Lawrence
+  // DM that lands in a user's phone must never carry one. Walks every public
+  // render entry point × every vibe × every variant.
+  const user = { id: 'melissa', label: 'Melissa', vibe: 'gymbro' };
+  const userByVibe = { chaotic: YASH_LIKE, wholesome: DANI_LIKE, gymbro: user };
+  const ctx = { planLine: 'FIT @ 6:30am', dayLabel: 'Mon 2026-05-04', secs: 60, ceilSecs: 1, runId: 'rTEST', didRelogin: false };
+  const buckets = ['bookedFast', 'bookedSlow', 'alreadyBooked', 'dryRun', 'optOut',
+                   'paused', 'dateSkip', 'full', 'unverified', 'notBooked', 'exception'];
+  const statusByBucket = {
+    bookedFast:    { ok: true, reason: 'booked (api-direct)', via: 'api', timing: { total: 1873 } },
+    bookedSlow:    { ok: true, reason: 'booked' },
+    alreadyBooked: { ok: true, reason: 'already_booked' },
+    dryRun:        { ok: true, reason: 'dry_run' },
+    optOut:        { ok: true, reason: 'opt_out_day' },
+    paused:        { ok: true, reason: 'paused', detail: 'on leave' },
+    dateSkip:      { ok: true, reason: 'date_skip' },
+    full:          { ok: false, reason: 'class is FULL' },
+    unverified:    { ok: false, reason: 'unverified', detail: 'BUY ambiguous' },
+    notBooked:     { ok: false, reason: 'not booked', detail: 'row stayed BOOK NOW' },
+    exception:     { ok: false, reason: 'exception', detail: 'auth-flow-broke' },
+  };
+  const noEmDash = (msg, where) =>
+    assert.ok(!msg.includes('—'), `${where}: rendered output contains em-dash: ${msg}`);
+
+  for (const vibe of ['chaotic', 'wholesome', 'gymbro']) {
+    const u = userByVibe[vibe];
+    for (let i = 0; i < personality.STARTED[vibe].length; i++) {
+      withRng((i + 0.5) / personality.STARTED[vibe].length, () => noEmDash(personality.started(u, ctx), `started/${vibe}/${i}`));
+    }
+    for (let i = 0; i < personality.LOGGED_IN[vibe].length; i++) {
+      withRng((i + 0.5) / personality.LOGGED_IN[vibe].length, () => noEmDash(personality.loggedIn(u), `loggedIn/${vibe}/${i}`));
+    }
+    for (let i = 0; i < personality.STANDBY_UI[vibe].length; i++) {
+      withRng((i + 0.5) / personality.STANDBY_UI[vibe].length, () => noEmDash(personality.standby(u, { ...ctx, mode: 'ui' }), `standbyUI/${vibe}/${i}`));
+    }
+    for (let i = 0; i < personality.STANDBY_API[vibe].length; i++) {
+      withRng((i + 0.5) / personality.STANDBY_API[vibe].length, () => noEmDash(personality.standby(u, { ...ctx, mode: 'api' }), `standbyAPI/${vibe}/${i}`));
+    }
+    for (const bucket of buckets) {
+      const pool = personality.OUTCOME[bucket] && personality.OUTCOME[bucket][vibe];
+      if (!pool) continue;
+      for (let i = 0; i < pool.length; i++) {
+        withRng((i + 0.5) / pool.length, () => noEmDash(personality.outcome(u, statusByBucket[bucket], ctx), `outcome/${bucket}/${vibe}/${i}`));
+      }
+    }
+  }
+});
+
 test('outcome bucket selection: api-direct success → bookedFast', () => {
   const status = {
     ok: true, reason: 'booked (api-direct)',
