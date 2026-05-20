@@ -5,8 +5,19 @@
 const keychain = require('./keychain.js');
 
 const SERVICE = 'gym-booker-wodup';
-const WODUP_EMAIL = 'pirsquare.yash@gmail.com';
-const WODUP_PASSWORD = '***REDACTED***';
+
+// Creds come from env or argv. Plaintext password MUST NOT be committed.
+//   WODUP_EMAIL=foo@bar WODUP_PASSWORD='...' node set-wodup-creds.js
+// or
+//   node set-wodup-creds.js foo@bar '...'
+const WODUP_EMAIL = process.env.WODUP_EMAIL || process.argv[2];
+const WODUP_PASSWORD = process.env.WODUP_PASSWORD || process.argv[3];
+
+if (!WODUP_EMAIL || !WODUP_PASSWORD) {
+  console.error('Usage: WODUP_EMAIL=... WODUP_PASSWORD=... node set-wodup-creds.js');
+  console.error('   or: node set-wodup-creds.js <email> <password>');
+  process.exit(2);
+}
 
 // Note: keychain.js uses a hardcoded account format "chatId-field"
 // For Wodup (no per-user), we'll use a sentinel chatId like "wodup-default"

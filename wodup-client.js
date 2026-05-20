@@ -116,63 +116,56 @@ async function fetchWorkouts(dateYmd) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
     await page.waitForTimeout(1500);
     
+    // Click "Show full workout" to expand full content
+    const fullWorkoutButtons = await page.$$('text=Show full workout');
+    for (const btn of fullWorkoutButtons) {
+      await btn.click();
+      await page.waitForTimeout(500);
+    }
+
     // Extract workouts by kind
     const workouts = await page.evaluate(() => {
       const workoutMap = {};
       const allText = document.body.innerText;
       const lines = allText.split('\n');
-      
-      // Find indices of "Log Result" (marks start of workout content)
-      const workoutStarts = [];
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].trim() === 'Log Result') {
-          workoutStarts.push(i);
+
+      const kinds = ['FIT', 'BURN', 'LIFT', 'STEAM', 'GYMNASTICS', 'RUN', 'CONDITIONING'];
+
+      for (const kind of kinds) {
+        let kindStart = -1;
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].trim() === kind) {
+            kindStart = i;
+            break;
+          }
+        }
+
+        if (kindStart >= 0) {
+          let kindEnd = lines.length;
+          for (let i = kindStart + 1; i < lines.length; i++) {
+            if (kinds.includes(lines[i].trim())) {
+              kindEnd = i;
+              break;
+            }
+            if (lines[i].trim().includes('Choose which programs')) {
+              kindEnd = i;
+              break;
+            }
+          }
+
+          const workoutLines = [];
+          for (let i = kindStart + 1; i < kindEnd; i++) {
+            const line = lines[i].trim();
+            if (line === 'Log Result' || line === 'Leaderboard' || line === '') continue;
+            workoutLines.push(line);
+          }
+
+          if (workoutLines.length > 0) {
+            workoutMap[kind] = workoutLines.join('\n');
+          }
         }
       }
-      
-      workoutStarts.forEach(startIdx => {
-        // Work backwards to find the kind
-        let kind = '';
-        for (let i = startIdx - 1; i >= Math.max(0, startIdx - 5); i--) {
-          const line = lines[i].trim().toUpperCase();
-          if (['FIT', 'BURN', 'LIFT', 'STEAM', 'GYMNASTICS', 'RUN', 'CONDITIONING'].includes(line)) {
-            kind = line;
-            break;
-          }
-        }
-        
-        if (!kind) return;
-        
-        // Work forwards to find where this workout ends
-        let endIdx = startIdx + 1;
-        for (let i = startIdx + 1; i < lines.length; i++) {
-          const line = lines[i].trim();
-          const isNextKind = ['FIT', 'BURN', 'LIFT', 'STEAM', 'GYMNASTICS', 'RUN', 'CONDITIONING'].includes(line.toUpperCase());
-          if (isNextKind && i > startIdx + 5) {
-            endIdx = i;
-            break;
-          }
-          if (line.startsWith('Choose which programs')) {
-            endIdx = i;
-            break;
-          }
-        }
-        
-        // Extract workout lines
-        const workoutLines = [];
-        for (let i = startIdx + 1; i < endIdx; i++) {
-          const line = lines[i].trim();
-          if (line === 'Leaderboard') continue;
-          if (line === 'Show full workout') break;
-          if (line === '') continue;
-          workoutLines.push(line);
-        }
-        
-        if (workoutLines.length > 1) {
-          workoutMap[kind] = workoutLines.join('\n');
-        }
-      });
-      
+
       return workoutMap;
     });
     

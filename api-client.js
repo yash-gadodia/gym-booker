@@ -223,6 +223,59 @@ async function generateRecaptchaToken(page, { action = 'process_order', timeoutM
   }, { action, timeoutMs });
 }
 
+// Join a waitlist for a class. Similar to bookViaApi but uses inventory_category
+// 'class_time_waitlist' and completes in 2-3 steps instead of 6.
+async function joinWaitlistViaApi(bearer, { classMeta }) {
+  const t0 = Date.now();
+  const timing = {};
+  console.log(`[DEBUG] joinWaitlistViaApi called with bearer: ${bearer.substring(0, 30)}...`);
+  const headers = { ...MB_HEADERS_BASE, authorization: bearer };
+  const post = async (label, urlPath, body) => {
+    const t = Date.now();
+    const r = await fetch(`${MB_HOST}${urlPath}`, { method: 'POST', headers, body: JSON.stringify(body) });
+    timing[label] = Date.now() - t;
+    const txt = await r.text();
+    let json = null; try { json = JSON.parse(txt); } catch {}
+    return { ok: r.ok || r.status === 201 || r.status === 202, status: r.status, json, txt };
+  };
+
+  // 1. Create order.
+  const r1 = await post('orders', '/v1/orders', { locationRefJson: LOCATION_REF });
+  if (!r1.ok || !(r1.json && r1.json.data && r1.json.data.id)) {
+    return { ok: false, step: 'orders', status: r1.status, body: r1.txt.slice(0, 400), timing };
+  }
+  const orderId = r1.json.data.id;
+
+  // 2. Add waitlist booking item (using waitlist_items endpoint instead of booking_items).
+  const r2 = await post('waitlist_items', `/v1/orders/${orderId}/waitlist_items`, {
+    inventoryItemRefJson: JSON.stringify({
+      mb_class_id: classMeta.mb_class_id,
+      mb_class_schedule_id: classMeta.mb_class_schedule_id,
+      mb_class_description_id: classMeta.mb_class_description_id,
+      ...RAGTAG,
+    }),
+  });
+  if (!r2.ok) return { ok: false, step: 'booking_items', status: r2.status, body: r2.txt.slice(0, 1200), orderId, timing };
+  const bookingItemUuid = r2.json && r2.json.data && r2.json.data.relationships && r2.json.data.relationships.bookingItems && r2.json.data.relationships.bookingItems.data && r2.json.data.relationships.bookingItems.data[0] && r2.json.data.relationships.bookingItems.data[0].id;
+  if (!bookingItemUuid) return { ok: false, step: 'booking_items', status: r2.status, body: 'no bookingItemUuid', orderId, timing };
+
+  // 3. Process — commit the waitlist join. No payment required.
+  const r3 = await post('process', `/v1/orders/${orderId}/process`, {
+    challengeRedirectUrl: 'https://www.mindbodyonline.com/explore/checkout/sca/success',
+    recaptcha_token: '',
+  });
+  timing.total = Date.now() - t0;
+  if (!r3.ok) return { ok: false, step: 'process', status: r3.status, body: r3.txt.slice(0, 400), orderId, timing };
+
+  const status = r3.json && r3.json.data && r3.json.data.attributes && r3.json.data.attributes.status;
+  return {
+    ok: true, step: 'process', httpStatus: r3.status,
+    statusCode: status && status.code,
+    statusTitle: status && status.title,
+    orderId, bookingItemUuid, timing,
+  };
+}
+
 module.exports = {
   RAGTAG,
   LOCATION_REF,
@@ -231,5 +284,6 @@ module.exports = {
   findClass,
   fetchPaymentPassUuid,
   bookViaApi,
+  joinWaitlistViaApi,
   generateRecaptchaToken,
 };

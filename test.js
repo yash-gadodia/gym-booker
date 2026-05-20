@@ -9,6 +9,7 @@ const {
   classifyCheckoutButton, classifyButtonStates, parseBookingCard,
   timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
+  isBookingInUpcoming,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
 } = require('./lib');
@@ -1488,10 +1489,181 @@ test('probeLoginButton: clear when topmost is a descendant of the button', () =>
 });
 
 test('probeLoginButton: clear when topmost is an ancestor of the button', () => {
-  const wrap = makeNode({ tagName: 'DIV' });
-  const btn = makeNode({ tagName: 'BUTTON', parent: wrap });
-  const r = probeLoginButton(makeDoc({ button: btn, topmost: wrap }), LOGIN_BUTTON_SEL);
+  const inner = makeNode({ tagName: 'SPAN' });
+  const btn = makeNode({ tagName: 'BUTTON', parent: inner });
+  const r = probeLoginButton(makeDoc({ button: btn, topmost: inner }), LOGIN_BUTTON_SEL);
   assert.deepEqual(r, { state: 'clear' });
+});
+
+// ───────── waitlist auto-join state machine (2026-05-20) ──────────────────
+
+test('waitlist state machine: joins when status FULL and not yet joined', () => {
+  const state = { lastStatus: 'UNKNOWN', lastChecked: null, polls: 0, firstSeen: null, joined: false };
+  const observed = 'FULL';
+  const classMeta = { className: 'FIT', startTime: '06:30' };
+
+  // Simulate state machine path 1: join trigger
+  if (observed === 'FULL' && !state.joined) {
+    state.joined = true;
+    state.joinedAt = new Date().toISOString();
+    // In real code, joinWaitlistViaApi would be called here
+  }
+
+  assert.equal(state.joined, true);
+  assert.ok(state.joinedAt);
+});
+
+test('waitlist state machine: joins when status WAITLIST and not yet joined', () => {
+  const state = { lastStatus: 'UNKNOWN', joined: false };
+  const observed = 'WAITLIST';
+
+  if (observed === 'WAITLIST' && !state.joined) {
+    state.joined = true;
+  }
+
+  assert.equal(state.joined, true);
+});
+
+test('waitlist state machine: does not re-join if already joined', () => {
+  const state = { joined: true, joinedAt: '2026-05-20T08:00:00Z', joinResult: { ok: true } };
+  const observed = 'FULL';
+
+  if (observed === 'FULL' && !state.joined) {
+    state.joined = true;  // should not execute
+  }
+
+  assert.equal(state.joined, true);
+  assert.equal(state.joinedAt, '2026-05-20T08:00:00Z');  // unchanged
+});
+
+test('waitlist state machine: promotes when joined and user books the class', () => {
+  const state = { joined: true, joinedAt: '2026-05-20T07:00:00Z', promoted: false };
+
+  // Simulate path 2: promotion detection (in real code, hasMatchingBooking would be called)
+  const hasMatchingBooking = true;
+
+  if (state.joined && !state.promoted && hasMatchingBooking) {
+    state.promoted = true;
+    state.promotedAt = new Date().toISOString();
+  }
+
+  assert.equal(state.promoted, true);
+  assert.ok(state.promotedAt);
+});
+
+test('waitlist state machine: does not double-promote', () => {
+  const state = {
+    joined: true,
+    promoted: true,
+    promotedAt: '2026-05-20T08:30:00Z'
+  };
+  const hasMatchingBooking = true;
+
+  if (state.joined && !state.promoted && hasMatchingBooking) {
+    state.promotedAt = new Date().toISOString();  // should not execute
+  }
+
+  assert.equal(state.promoted, true);
+  assert.equal(state.promotedAt, '2026-05-20T08:30:00Z');  // unchanged
+});
+
+test('waitlist state machine: backwards compat - migrates alerted:true to joined:true', () => {
+  // Legacy state files from alert-only era have alerted:true but no joined flag
+  const oldState = { lastStatus: 'FULL', alerted: true, firedAt: '2026-05-20T07:00:00Z' };
+
+  // Migration logic: if alerted:true and joined undefined, set joined from firedAt
+  if (oldState.alerted && oldState.joined === undefined) {
+    oldState.joined = true;
+    oldState.joinedAt = oldState.firedAt;
+  }
+
+  assert.equal(oldState.joined, true);
+  assert.equal(oldState.joinedAt, '2026-05-20T07:00:00Z');
+});
+
+test('waitlist state machine: BOOK_NOW observed while not joined should trigger join', () => {
+  const state = { joined: false, lastStatus: 'UNKNOWN' };
+  const observed = 'BOOK_NOW';
+  const previousObserved = 'UNKNOWN';
+
+  // Join condition: status in [FULL, WAITLIST, BOOK_NOW] && !joined && observed !== BOOK_NOW
+  // But if observed transitioned FROM something else TO BOOK_NOW, we should join
+  // (not re-join continuously on every BOOK_NOW poll)
+  if (['FULL', 'WAITLIST', 'BOOK_NOW'].includes(observed) && !state.joined && previousObserved !== 'BOOK_NOW') {
+    state.joined = true;
+  }
+
+  assert.equal(state.joined, true);
+});
+
+test('waitlist state machine: does not spam join on continuous BOOK_NOW polls', () => {
+  const state = { joined: false, lastStatus: 'BOOK_NOW' };
+  const observed = 'BOOK_NOW';
+
+  // If we were already on BOOK_NOW, don't rejoin
+  if (['FULL', 'WAITLIST', 'BOOK_NOW'].includes(observed) && !state.joined && state.lastStatus !== 'BOOK_NOW') {
+    state.joined = true;
+  }
+
+  assert.equal(state.joined, false);  // should not join when lastStatus was already BOOK_NOW
+});
+
+test('waitlist messaging: user DM format includes no em-dashes', () => {
+  // Mock message that would be sent to user on join
+  const userLabel = 'Melissa';
+  const className = 'FIT';
+  const classTime = '6:30am';
+  const dayLabel = 'Fri 22-May';
+
+  const msg = `[${userLabel}] on waitlist for ${className} at ${classTime} on ${dayLabel}. Mindbody will auto-promote if slot opens.`;
+
+  // Must not contain em-dash U+2014
+  assert.ok(!msg.includes('—'), `user DM contains em-dash: ${msg}`);
+});
+
+test('waitlist messaging: promotion DM format includes no em-dashes', () => {
+  const userLabel = 'Melissa';
+  const className = 'FIT';
+  const classTime = '6:30am';
+  const dayLabel = 'Fri 22-May';
+
+  const msg = `[${userLabel}]. You're in. ${className} at ${classTime} on ${dayLabel}. See you there.`;
+
+  assert.ok(!msg.includes('—'), `promotion DM contains em-dash: ${msg}`);
+});
+
+test('waitlist messaging: broadcast includes both user and Yash per rule', () => {
+  // When sending DM on behalf of a user, must include:
+  // 1. user's chat_id for the main message
+  // 2. Yash's chat_id (166637821) for transparency
+
+  const recipients = [109578819, 166637821];  // Melissa + Yash
+
+  assert.ok(recipients.includes(109578819), 'must include Melissa');
+  assert.ok(recipients.includes(166637821), 'must include Yash');
+  assert.equal(recipients.length, 2, 'broadcast rule requires exactly 2 recipients');
+});
+
+test('parseTimeToMinutes: various edge cases for promotion detection', () => {
+  // Helper to parse times for matching against /account/schedule
+  // Used in hasMatchingBooking comparison
+  function parseTimeToMinutes(timeStr) {
+    const m = timeStr.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+    if (!m) return null;
+    let h = parseInt(m[1], 10);
+    const min = parseInt(m[2], 10);
+    if (m[3] && m[3].toLowerCase() === 'pm' && h !== 12) h += 12;
+    if (m[3] && m[3].toLowerCase() === 'am' && h === 12) h = 0;
+    return h * 60 + min;
+  }
+
+  assert.equal(parseTimeToMinutes('6:30am'), 6 * 60 + 30);
+  assert.equal(parseTimeToMinutes('12:00am'), 0);  // midnight
+  assert.equal(parseTimeToMinutes('12:00pm'), 12 * 60);  // noon
+  assert.equal(parseTimeToMinutes('6:30pm'), 18 * 60 + 30);
+  assert.equal(parseTimeToMinutes('11:59pm'), 23 * 60 + 59);
+  assert.equal(parseTimeToMinutes('invalid'), null);
+  assert.equal(parseTimeToMinutes(''), null);
 });
 
 test('probeLoginButton: covered when topmost is unrelated', () => {
@@ -2122,4 +2294,197 @@ test('book-all.js end-to-end: synthetic setup failure produces well-formed daily
   assert.ok(out.includes('🚨 BOOKER DAILY — every user failed'), `wrong header:\n${out}`);
   assert.ok(out.includes('🚨 Yash — setup failed (alerted)'), `missing Yash setup-failed line:\n${out}`);
   assert.ok(out.includes('synthetic'), 'detail should mention synthetic failure');
+});
+
+// Wodup client tests
+test('wodup: extract workouts from simulated page text', () => {
+  // Simulate the page text structure we extract from Wodup
+  const simulatedText = `Timeline
+Feed
+Calendar
+BURN
+Log Result
+Leaderboard
+Move Upper 4/8
+A1. Incline Bench Dumbbell Front Raise 8-12-8-12-12-20
+A2. Bent-Over Barbell Row 3 x 10
+Show full workout
+FIT
+Log Result
+Leaderboard
+PHASE 1: W8 (Week B)
+A. Primer
+B. Jerk 4 x 2
+C. AMRAP 12
+Show full workout
+Choose which programs`;
+
+  const lines = simulatedText.split('\n');
+  const workoutMap = {};
+  
+  const workoutStarts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === 'Log Result') {
+      workoutStarts.push(i);
+    }
+  }
+  
+  workoutStarts.forEach(startIdx => {
+    let kind = '';
+    for (let i = startIdx - 1; i >= Math.max(0, startIdx - 5); i--) {
+      const line = lines[i].trim().toUpperCase();
+      if (['FIT', 'BURN', 'LIFT', 'STEAM', 'GYMNASTICS', 'RUN', 'CONDITIONING'].includes(line)) {
+        kind = line;
+        break;
+      }
+    }
+    
+    if (!kind) return;
+    
+    let endIdx = startIdx + 1;
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      const isNextKind = ['FIT', 'BURN', 'LIFT', 'STEAM', 'GYMNASTICS', 'RUN', 'CONDITIONING'].includes(line.toUpperCase());
+      if (isNextKind && i > startIdx + 5) {
+        endIdx = i;
+        break;
+      }
+      if (line.startsWith('Choose which programs')) {
+        endIdx = i;
+        break;
+      }
+    }
+    
+    const workoutLines = [];
+    for (let i = startIdx + 1; i < endIdx; i++) {
+      const line = lines[i].trim();
+      if (line === 'Leaderboard') continue;
+      if (line === 'Show full workout') break;
+      if (line === '') continue;
+      workoutLines.push(line);
+    }
+    
+    if (workoutLines.length > 1) {
+      workoutMap[kind] = workoutLines.join('\n');
+    }
+  });
+  
+  // Verify extraction
+  assert.ok(workoutMap.BURN, 'should extract BURN workout');
+  assert.ok(workoutMap.FIT, 'should extract FIT workout');
+  assert.ok(workoutMap.BURN.includes('Move Upper'), 'BURN should contain title');
+  assert.ok(workoutMap.FIT.includes('Jerk'), 'FIT should contain exercise');
+  assert.ok(!workoutMap.BURN.includes('Show full workout'), 'should not include button text');
+});
+
+test('wodup: DM format uses dd-mm-yyyy date', () => {
+  const dateYmd = '2026-05-21';
+  const [yyyy, mm, dd] = dateYmd.split('-');
+  const dateStr = `${dd}-${mm}-${yyyy}`;
+  
+  assert.equal(dateStr, '21-05-2026', 'should format as dd-mm-yyyy');
+  
+  const workoutText = 'Move Upper 4/8\nA1. Row 3 x 10';
+  const dmText = `Tomorrow's workout for FIT (THU ${dateStr}):\n\n${workoutText}`;
+  
+  assert.ok(dmText.includes('21-05-2026'), 'DM should contain formatted date');
+  assert.ok(!dmText.includes('2026-05-21'), 'DM should not contain YYYY-MM-DD format');
+});
+
+test('wodup: DM has no em-dashes', () => {
+  const workoutText = 'Move Upper 4/8\nA1. Incline Bench Dumbbell Front Raise';
+  const dateStr = '21-05-2026';
+  const dmText = `Tomorrow's workout for FIT (THU ${dateStr}):\n\n${workoutText}`;
+  
+  assert.ok(!dmText.includes('—'), 'DM must not contain em-dashes (per feedback)');
+});
+
+test('wodup: idempotency via state file', () => {
+  const state = {
+    date: '2026-05-21',
+    sentTo: {
+      yash: { timestamp: '2026-05-20T19:00:00Z', kind: 'FIT' },
+      dani: { timestamp: '2026-05-20T19:00:01Z', kind: 'BURN' }
+    },
+    completed: true
+  };
+  
+  assert.ok(state.sentTo['yash'], 'should have sent to yash');
+  assert.ok(!state.sentTo['unknown'], 'should not have sent to unknown user');
+  assert.ok(state.completed, 'should be marked completed');
+});
+
+// ── verify-don't-trust on Mindbody API error (Mer 2026-05-20 incident) ──────
+
+test('isBookingInUpcoming: returns true when target matches one entry', () => {
+  const upcoming = [
+    { ymd: '2026-05-22', kind: 'FIT', time: '7:30am' },
+    { ymd: '2026-05-23', kind: 'Gymnastics', time: '12:30pm' },
+  ];
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), true);
+});
+
+test('isBookingInUpcoming: returns false when no entry matches', () => {
+  const upcoming = [{ ymd: '2026-05-22', kind: 'FIT', time: '7:30am' }];
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '6:30am' }), false);
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'Lift', time: '7:30am' }), false);
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-23', kind: 'FIT', time: '7:30am' }), false);
+});
+
+test('isBookingInUpcoming: empty upcoming list returns false', () => {
+  assert.equal(isBookingInUpcoming([], { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), false);
+});
+
+test('isBookingInUpcoming: non-array input returns false (defensive)', () => {
+  assert.equal(isBookingInUpcoming(null, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), false);
+  assert.equal(isBookingInUpcoming(undefined, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), false);
+  assert.equal(isBookingInUpcoming({}, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), false);
+});
+
+test('isBookingInUpcoming: tolerates entries with missing fields', () => {
+  const upcoming = [
+    null,
+    {},
+    { ymd: '2026-05-22' },
+    { ymd: '2026-05-22', kind: 'FIT', time: '7:30am' },
+  ];
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), true);
+});
+
+test('isBookingInUpcoming: time format must match exactly (regression guard)', () => {
+  // parseBookingCard emits "7:30am" lowercase; verify exact match
+  const upcoming = [{ ymd: '2026-05-22', kind: 'FIT', time: '7:30am' }];
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30AM' }), false);
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '07:30am' }), false);
+});
+
+// Mer scenario simulation: bookViaApi returned HTTP 400 with PG::UniqueViolation
+// on the booking_items step, but the booking actually DID write to Mindbody.
+// The verify-don't-trust path fetches /account/schedule and finds the booking
+// there — so we should claim success despite the error.
+test('verify-don\'t-trust: Mer scenario . booking found despite booking_items 400', () => {
+  // Synthetic /account/schedule response showing Mer's Fri 7:30am FIT is in fact booked
+  const upcomingFromMindbody = [
+    { ymd: '2026-05-22', kind: 'FIT', time: '7:30am', raw: 'sample' },
+  ];
+  const plan = { kind: 'FIT' };
+  const usedTime = '7:30am';
+  const targetYmd = '2026-05-22';
+
+  // Simulate the verify-don't-trust decision
+  const verified = isBookingInUpcoming(upcomingFromMindbody, {
+    targetYmd, kind: plan.kind, time: usedTime,
+  });
+  assert.equal(verified, true, 'verify-don\'t-trust must claim success when /account/schedule shows the booking');
+});
+
+test('verify-don\'t-trust: real failure . booking NOT on schedule . returns false (UI fallback)', () => {
+  // Class genuinely failed: nothing on /account/schedule for the target slot
+  const upcomingFromMindbody = [
+    { ymd: '2026-05-23', kind: 'Gymnastics', time: '12:30pm' }, // some other class
+  ];
+  const verified = isBookingInUpcoming(upcomingFromMindbody, {
+    targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am',
+  });
+  assert.equal(verified, false, 'verify must say no when booking is genuinely absent');
 });

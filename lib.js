@@ -295,6 +295,14 @@ function parseBookingCard(text) {
   return { date, ymd: ymd(date), kind, time: `${timeM[1]}${timeM[2].toLowerCase()}`, raw: flat };
 }
 
+// Check whether a target booking (date + kind + time) appears in an
+// /account/schedule "upcoming" list. Pure function so book.js's verify-don't-trust
+// path and the 5c processing_requested path share one tested matcher.
+function isBookingInUpcoming(upcoming, { targetYmd, kind, time }) {
+  if (!Array.isArray(upcoming)) return false;
+  return upcoming.some(b => b && b.ymd === targetYmd && b.kind === kind && b.time === time);
+}
+
 module.exports = {
   DAY_SHORT,
   addDays,
@@ -316,6 +324,7 @@ module.exports = {
   loadOverrides,
   resolveBookingForDate,
   resolveBookingsForDate,
+  isBookingInUpcoming,
 };
 
 // ── Login-button protection (2026-05-12 incident) ───────────────────────────

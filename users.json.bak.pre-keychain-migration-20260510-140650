@@ -1,0 +1,39 @@
+{
+  "users": [
+    {
+      "id": "dani",
+      "label": "Dani",
+      "email": "danielleona.p@gmail.com",
+      "password": "Th0masangster!",
+      "telegramChatId": 80151943,
+      "telegramHandle": "danielleee",
+      "schedule": null,
+      "vibe": "gymbro"
+    },
+    {
+      "id": "melissa",
+      "label": "Melissa",
+      "email": "mcwy2807@gmail.com",
+      "password": "Ilovekpop98!",
+      "telegramChatId": 109578819,
+      "telegramHandle": "melissachau",
+      "schedule": {
+        "Mon": [
+          { "kind": "BURN", "primaryTime": "6:30pm", "fallback": null },
+          { "kind": "FIT", "primaryTime": "7:30pm", "fallback": null }
+        ],
+        "Tue": [
+          { "kind": "BURN", "primaryTime": "6:30pm", "fallback": null },
+          { "kind": "FIT", "primaryTime": "7:30pm", "fallback": null }
+        ],
+        "Thu": [
+          { "kind": "BURN", "primaryTime": "6:30pm", "fallback": null },
+          { "kind": "FIT", "primaryTime": "7:30pm", "fallback": null }
+        ],
+        "Fri": { "kind": "FIT", "primaryTime": "7:30am", "fallback": null },
+        "Sat": { "kind": "FIT", "primaryTime": "10:30am", "fallback": null }
+      },
+      "vibe": "gymbro"
+    }
+  ]
+}

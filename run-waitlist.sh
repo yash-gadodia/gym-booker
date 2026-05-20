@@ -46,7 +46,8 @@ fi
 
 # Auto-unload after the class start time has passed (no point polling then)
 NOW_EPOCH=$(date +%s)
-TARGET_EPOCH=$(TZ=Asia/Singapore date -j -f "%Y-%m-%d %H:%M" "${WATCH_DATE} 06:30" +%s 2>/dev/null || echo "0")
+TIME_HHMM=$(node -e "const t='${WATCH_TIME}';const m=/^(\d{1,2}):(\d{2})\s*(am|pm)$/i.exec(t);let h=+m[1];const mins=+m[2];const ap=m[3].toLowerCase();if(ap==='pm'&&h!==12)h+=12;if(ap==='am'&&h===12)h=0;console.log(String(h).padStart(2,'0')+':'+String(mins).padStart(2,'0'));" 2>/dev/null || echo "06:30")
+TARGET_EPOCH=$(TZ=Asia/Singapore date -j -f "%Y-%m-%d %H:%M" "${WATCH_DATE} ${TIME_HHMM}" +%s 2>/dev/null || echo "0")
 if [ "$TARGET_EPOCH" != "0" ] && [ "$NOW_EPOCH" -ge "$TARGET_EPOCH" ]; then
   echo "[$(ts)] past class start — unloading LaunchAgent" >> "$LOG_FILE"
   launchctl unload "$PLIST" 2>>"$LOG_FILE" || true
