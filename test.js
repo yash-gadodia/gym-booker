@@ -9,6 +9,7 @@ const {
   classifyCheckoutButton, classifyButtonStates, parseBookingCard,
   timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
+  isBookingInUpcoming,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
 } = require('./lib');
@@ -2411,4 +2412,79 @@ test('wodup: idempotency via state file', () => {
   assert.ok(state.sentTo['yash'], 'should have sent to yash');
   assert.ok(!state.sentTo['unknown'], 'should not have sent to unknown user');
   assert.ok(state.completed, 'should be marked completed');
+});
+
+// ── verify-don't-trust on Mindbody API error (Mer 2026-05-20 incident) ──────
+
+test('isBookingInUpcoming: returns true when target matches one entry', () => {
+  const upcoming = [
+    { ymd: '2026-05-22', kind: 'FIT', time: '7:30am' },
+    { ymd: '2026-05-23', kind: 'Gymnastics', time: '12:30pm' },
+  ];
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), true);
+});
+
+test('isBookingInUpcoming: returns false when no entry matches', () => {
+  const upcoming = [{ ymd: '2026-05-22', kind: 'FIT', time: '7:30am' }];
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '6:30am' }), false);
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'Lift', time: '7:30am' }), false);
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-23', kind: 'FIT', time: '7:30am' }), false);
+});
+
+test('isBookingInUpcoming: empty upcoming list returns false', () => {
+  assert.equal(isBookingInUpcoming([], { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), false);
+});
+
+test('isBookingInUpcoming: non-array input returns false (defensive)', () => {
+  assert.equal(isBookingInUpcoming(null, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), false);
+  assert.equal(isBookingInUpcoming(undefined, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), false);
+  assert.equal(isBookingInUpcoming({}, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), false);
+});
+
+test('isBookingInUpcoming: tolerates entries with missing fields', () => {
+  const upcoming = [
+    null,
+    {},
+    { ymd: '2026-05-22' },
+    { ymd: '2026-05-22', kind: 'FIT', time: '7:30am' },
+  ];
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am' }), true);
+});
+
+test('isBookingInUpcoming: time format must match exactly (regression guard)', () => {
+  // parseBookingCard emits "7:30am" lowercase; verify exact match
+  const upcoming = [{ ymd: '2026-05-22', kind: 'FIT', time: '7:30am' }];
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '7:30AM' }), false);
+  assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '07:30am' }), false);
+});
+
+// Mer scenario simulation: bookViaApi returned HTTP 400 with PG::UniqueViolation
+// on the booking_items step, but the booking actually DID write to Mindbody.
+// The verify-don't-trust path fetches /account/schedule and finds the booking
+// there — so we should claim success despite the error.
+test('verify-don\'t-trust: Mer scenario . booking found despite booking_items 400', () => {
+  // Synthetic /account/schedule response showing Mer's Fri 7:30am FIT is in fact booked
+  const upcomingFromMindbody = [
+    { ymd: '2026-05-22', kind: 'FIT', time: '7:30am', raw: 'sample' },
+  ];
+  const plan = { kind: 'FIT' };
+  const usedTime = '7:30am';
+  const targetYmd = '2026-05-22';
+
+  // Simulate the verify-don't-trust decision
+  const verified = isBookingInUpcoming(upcomingFromMindbody, {
+    targetYmd, kind: plan.kind, time: usedTime,
+  });
+  assert.equal(verified, true, 'verify-don\'t-trust must claim success when /account/schedule shows the booking');
+});
+
+test('verify-don\'t-trust: real failure . booking NOT on schedule . returns false (UI fallback)', () => {
+  // Class genuinely failed: nothing on /account/schedule for the target slot
+  const upcomingFromMindbody = [
+    { ymd: '2026-05-23', kind: 'Gymnastics', time: '12:30pm' }, // some other class
+  ];
+  const verified = isBookingInUpcoming(upcomingFromMindbody, {
+    targetYmd: '2026-05-22', kind: 'FIT', time: '7:30am',
+  });
+  assert.equal(verified, false, 'verify must say no when booking is genuinely absent');
 });

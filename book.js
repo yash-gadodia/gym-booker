@@ -7,6 +7,7 @@ const {
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
+  isBookingInUpcoming,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
 } = require('./lib');
@@ -608,6 +609,47 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
   }
 
   if (!result.ok) {
+    // 5b1. VERIFY-DON'T-TRUST.
+    //
+    // 2026-05-20 incident (Mer's Fri 7:30am FIT booking): the booking_items
+    // leg returned HTTP 400 with `PG::UniqueViolation on
+    // index_inventory_item_references_on_source_reference for mb_class_id=...`.
+    // This is a Mindbody backend DB race: their unique index trips when
+    // multiple users hit the same class inside a tight window, but the row
+    // they refuse to insert duplicates one that actually IS there. In short:
+    // the booking often succeeded on the server, the response is lying.
+    //
+    // Before falling back to the UI flow (which costs 45s of BUY-button
+    // waiting and burns the slot by the time it loads), fetch
+    // /account/schedule and check whether the target booking is in fact on
+    // the user's upcoming list. If yes, claim success; if no, fall through
+    // to the existing failure path.
+    log(`api-direct: ${result.step} returned HTTP ${result.status} . verifying on /account/schedule before failing`);
+    const targetYmd = ymd(target);
+    try {
+      await new Promise(r => setTimeout(r, 1500));
+      const upcoming = await fetchMyUpcomingBookings(page);
+      if (isBookingInUpcoming(upcoming, { targetYmd, kind: plan.kind, time: usedTime })) {
+        log(`api-direct: BOOKED on /account/schedule despite HTTP ${result.status} at ${result.step} . claiming success (response was bogus)`);
+        try { await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+        return {
+          ok: true,
+          reason: 'booked (api-direct, verified after error)',
+          detail: `${plan.kind} @ ${usedTime} on ${DAY_SHORT[target.getDay()]} ${targetYmd} confirmed via /account/schedule (api returned HTTP ${result.status} at ${result.step} but booking went through)`,
+          time: usedTime,
+          timing: result.timing,
+          via: 'api',
+          verifiedAfterError: true,
+          apiErrorStep: result.step,
+          apiErrorStatus: result.status,
+        };
+      }
+      log(`api-direct: not on /account/schedule . falling through to UI fallback`);
+      try { await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+    } catch (e) {
+      log(`api-direct: schedule verify failed (${e.message.slice(0, 140)}) . falling through to UI fallback`);
+    }
+
     return {
       ok: false,
       reason: `api-${result.step}-failed`,
@@ -629,7 +671,7 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
       await new Promise(r => setTimeout(r, waitMs));
       try { upcoming = await fetchMyUpcomingBookings(page); }
       catch (e) { log(`api-direct: confirm fetch failed (${e.message.slice(0,140)})`); break; }
-      if (upcoming.some(b => b.ymd === targetYmd && b.kind === plan.kind && b.time === usedTime)) {
+      if (isBookingInUpcoming(upcoming, { targetYmd, kind: plan.kind, time: usedTime })) {
         log(`api-direct: confirmed ${plan.kind} @ ${usedTime} on ${targetYmd} in /account/schedule`);
         upcoming = 'confirmed';
         break;
