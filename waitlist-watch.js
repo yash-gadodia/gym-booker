@@ -14,9 +14,9 @@ const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 const {
-  DAY_SHORT, ymd, classPlan,
+  DAY_SHORT, ymd, classPlan, parseBookingCard,
 } = require('./lib');
-const { captureBearerToken, fetchScheduleClasses, findClass } = require('./api-client');
+const { captureBearerToken, fetchScheduleClasses, findClass, joinWaitlistViaApi } = require('./api-client');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
 
@@ -67,10 +67,51 @@ function timeToHHMM(timeArg) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
+// Fetch user's upcoming bookings from /account/schedule. Returns array of
+// {kind, date, time, instructor, ...}. Used to check if waitlist -> promoted.
+async function fetchMyUpcomingBookings(page) {
+  const acctUrl = 'https://www.mindbodyonline.com/explore/account/schedule';
+  await page.goto(acctUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(2000);
+
+  const cards = await page.evaluate(() => {
+    const cancelBtns = Array.from(document.querySelectorAll('button, a'))
+      .filter(e => /^Cancel$/i.test((e.innerText || '').trim()));
+    const out = [];
+    for (const btn of cancelBtns) {
+      let n = btn.parentElement;
+      let best = (btn.innerText || '').trim();
+      for (let j = 0; j < 15 && n; j++) {
+        const cancelCount = Array.from(n.querySelectorAll('button, a'))
+          .filter(e => /^Cancel$/i.test((e.innerText || '').trim())).length;
+        if (cancelCount > 1) break;
+        const t = (n.innerText || '').trim();
+        if (t.length > best.length && t.length < 600) best = t;
+        n = n.parentElement;
+      }
+      out.push(best.replace(/\s+/g, ' '));
+    }
+    return out;
+  });
+  return cards.map(parseBookingCard).filter(Boolean);
+}
+
+// Check if any booking matches the target date/kind/time.
+function hasMatchingBooking(bookings, { plan, dateArg, timeArg }) {
+  for (const b of bookings) {
+    const dateMatches = b.date === dateArg;
+    const kindMatches = (b.kind || '').includes(plan.kind);
+    const timeMatches = b.time === timeArg;
+    if (dateMatches && kindMatches && timeMatches) return true;
+  }
+  return false;
+}
+
 // Authoritative class status via Mindbody marketplace API. The public web
 // schedule shows "BOOK NOW" even when classes are at max capacity, so DOM
 // scraping produces false positives. The API returns bookable + statusText
 // (e.g. "Class is at Max Capacity") which the booker pipeline already trusts.
+// Also returns the bearer token and class metadata so callers can use the API.
 async function checkApiStatus(page, plan, dateArg, timeArg) {
   const bearer = await captureBearerToken(page, { timeoutMs: 20000 });
   const fromIso = new Date(`${dateArg}T00:00:00+08:00`).toISOString();
@@ -79,7 +120,7 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
   const cls = findClass(classes, {
     kindNeedle: plan.kind, sgtDate: dateArg, sgtHHMM: timeToHHMM(timeArg),
   });
-  if (!cls) return { observed: 'NOT_FOUND', observedText: '(class not in API schedule)' };
+  if (!cls) return { observed: 'NOT_FOUND', observedText: '(class not in API schedule)', bearer, classMeta: null };
   const txt = cls.statusText || '';
   let observed;
   if (cls.bookable) observed = 'BOOK_NOW';
@@ -89,6 +130,12 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
   return {
     observed,
     observedText: `bookable=${cls.bookable} status="${txt}" id=${cls.mb_class_id}/${cls.mb_class_schedule_id}`,
+    bearer,
+    classMeta: {
+      mb_class_id: cls.mb_class_id,
+      mb_class_schedule_id: cls.mb_class_schedule_id,
+      mb_class_description_id: cls.mb_class_description_id,
+    },
   };
 }
 
@@ -113,9 +160,29 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
     console.log(`[reset] removed ${stateFile}`);
   }
 
-  let state = { lastStatus: null, alerted: false, firstSeen: null, lastChecked: null, polls: 0 };
+  let state = {
+    lastStatus: null,
+    lastChecked: null,
+    polls: 0,
+    firstSeen: null,
+    joined: false,
+    joinedAt: null,
+    joinResult: null,
+    promoted: false,
+    promotedAt: null,
+    alerted: false,
+    firedAt: null,
+  };
   if (fs.existsSync(stateFile)) {
-    try { state = { ...state, ...JSON.parse(fs.readFileSync(stateFile, 'utf8')) }; } catch {}
+    try {
+      const loaded = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      state = { ...state, ...loaded };
+      // Backwards compat: treat alerted:true as joined:true
+      if (loaded.alerted && !loaded.joined) {
+        state.joined = true;
+        state.joinedAt = state.firedAt || new Date().toISOString();
+      }
+    } catch {}
   }
 
   // Auto-disarm: if class has already started, don't bother
@@ -124,9 +191,9 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
     console.log(`class already started (${new Date(classStartMs).toISOString()}) — exiting`);
     process.exit(0);
   }
-  // Already fired — idempotent silent exit
-  if (state.alerted) {
-    console.log(`already alerted on ${state.firedAt} — exiting`);
+  // Already promoted — idempotent silent exit
+  if (state.promoted) {
+    console.log(`already promoted on ${state.promotedAt} — exiting`);
     process.exit(0);
   }
 
@@ -167,6 +234,8 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
 
   let observed = 'ERROR';
   let observedText = '';
+  let bearer = null;
+  let classMeta = null;
   let didLogin = false;
   try {
     await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -202,12 +271,14 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
     const result = await checkApiStatus(page, plan, dateArg, timeArg);
     observed = result.observed;
     observedText = result.observedText;
+    bearer = result.bearer;
+    classMeta = result.classMeta;
   } catch (e) {
     observed = 'ERROR';
     observedText = e.message;
   } finally {
     if (useAuth) { try { await ctx.storageState({ path: authPath }); } catch {} }
-    await browser.close();
+    // Don't close browser yet if we still need to check for promotion
   }
 
   console.log(`observed: ${observed} — ${observedText.slice(0, 160)}`);
@@ -217,33 +288,75 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
   state.lastStatus = observed;
   if (!state.firstSeen) state.firstSeen = { at: state.lastChecked, status: observed };
 
-  // Alert condition: was-FULL/UNKNOWN, now anything actionable.
-  // BOOK_NOW = direct slot opened. WAITLIST = waitlist became available.
-  // Any other transition (DETAILS appearing, etc.) is also worth flagging once.
-  const actionable = ['BOOK_NOW', 'WAITLIST'];
-  const interesting = actionable.includes(observed);
+  // State machine:
+  // 1. Status is FULL/WAITLIST and not joined yet => join the waitlist
+  // 2. Joined && not promoted => check /account/schedule for promotion
+  // 3. BOOK_NOW (direct slot) => shortcut to promotion check
 
-  if (interesting && !state.alerted) {
-    const dayLabel = DAY_SHORT[target.getDay()];
-    const banner = observed === 'BOOK_NOW' ? '🟢 *SLOT OPEN*' : '🟡 *WAITLIST AVAILABLE*';
-    const verb = observed === 'BOOK_NOW' ? 'book it' : 'join waitlist';
-    const greeting = process.env.WAITLIST_NAME ? `Hey ${process.env.WAITLIST_NAME} — ` : '';
-    const msg =
-      `${greeting}${banner}\n` +
-      `${plan.kind} @ ${timeArg} — ${dayLabel} ${fmtDmy(dateArg)}\n` +
-      `→ open Mindbody and *${verb}* now\n` +
-      `https://www.mindbodyonline.com/explore/locations/ragtag`;
-    const ok = await tg(msg);
-    state.alerted = ok;
-    state.firedAt = new Date().toISOString();
-    state.firedStatus = observed;
-    console.log(`ALERT sent (tg=${ok}) — status=${observed}`);
-  } else if (interesting && state.alerted) {
-    console.log('already alerted — no re-send');
-  } else {
-    console.log(`no alert (status=${observed}, alerted=${state.alerted})`);
+  const actionable = ['BOOK_NOW', 'WAITLIST', 'FULL'];
+  const joinNeeded = actionable.includes(observed) && !state.joined;
+  const promotionCheckNeeded = state.joined && !state.promoted;
+
+  // Path 1: Join the waitlist
+  if (joinNeeded && observed !== 'BOOK_NOW') {
+    console.log('JOINING WAITLIST...');
+    try {
+      const result = await joinWaitlistViaApi(bearer, { classMeta });
+      state.joinResult = result;
+      if (result.ok) {
+        state.joined = true;
+        state.joinedAt = new Date().toISOString();
+        console.log(`JOINED waitlist: ${result.step} status=${result.httpStatus}`);
+
+        // Send notification to user and Yash
+        const dayLabel = DAY_SHORT[target.getDay()];
+        const greeting = process.env.WAITLIST_NAME ? `Hey ${process.env.WAITLIST_NAME}. ` : 'You.';
+        const msg = `${greeting}You.re on the waitlist for ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}. Mindbody will auto-promote if a slot opens.`;
+        await tg(msg);
+
+        // Also notify Yash
+        const yashMsg = `[${process.env.WAITLIST_NAME || 'user'}] joined waitlist: ${plan.kind} @ ${timeArg} on ${dateArg}`;
+        await tg(yashMsg);
+      } else {
+        console.log(`JOIN FAILED: ${result.step} status=${result.status} body=${result.body.slice(0, 100)}`);
+        // Continue anyway — don't block on join API failures
+      }
+    } catch (e) {
+      console.error(`join error: ${e.message}`);
+      // Continue — transient API error, next poll will retry
+    }
+  }
+
+  // Path 2: Check if promoted from waitlist
+  if (promotionCheckNeeded) {
+    console.log('CHECKING FOR PROMOTION...');
+    try {
+      const bookings = await fetchMyUpcomingBookings(page);
+      const isPromoted = hasMatchingBooking(bookings, { plan, dateArg, timeArg });
+      if (isPromoted) {
+        state.promoted = true;
+        state.promotedAt = new Date().toISOString();
+        console.log('PROMOTED from waitlist.');
+
+        // Send notifications
+        const dayLabel = DAY_SHORT[target.getDay()];
+        const greeting = process.env.WAITLIST_NAME ? `Hey ${process.env.WAITLIST_NAME}. ` : 'You.';
+        const msg = `${greeting}You.re in. ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}. See you there.`;
+        await tg(msg);
+
+        // Notify Yash
+        const yashMsg = `[${process.env.WAITLIST_NAME || 'user'}] promoted from waitlist: ${plan.kind} @ ${timeArg} on ${dateArg}`;
+        await tg(yashMsg);
+      } else {
+        console.log('not promoted yet (still on waitlist)');
+      }
+    } catch (e) {
+      console.error(`promotion check error: ${e.message}`);
+      // Continue — transient error, next poll will retry
+    }
   }
 
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  try { await browser.close(); } catch {}
   process.exit(0);
 })().catch(e => { console.error('FATAL', e.message); process.exit(1); });
