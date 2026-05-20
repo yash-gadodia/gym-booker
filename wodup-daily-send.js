@@ -6,6 +6,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { loadUsers } = require('./users');
+const { formatWorkoutDM } = require('./wodup-formatter');
 
 const dateYmd = process.argv[2];
 const stateFile = process.argv[3];
@@ -106,12 +107,8 @@ console.log(`State: ${JSON.stringify(state, null, 2)}`);
         continue;
       }
       
-      // Format DM — use date format dd-mm-yyyy per Yash feedback_date_format
-      const [yyyy, mm, dd] = dateYmd.split('-');
-      const dateStr = `${dd}-${mm}-${yyyy}`;
-      const dayOfWeek = new Date(`${dateYmd}T00:00:00Z`).toLocaleDateString('en-SG', { weekday: 'short' }).toUpperCase();
-      
-      const dmText = `Tomorrow's workout for ${workoutKind} (${dayOfWeek} ${dateStr}):\n\n${workoutText}`;
+      // Format DM with emojis and packing list
+      const dmText = formatWorkoutDM(workoutText, workoutKind, dateYmd);
       
       console.log(`Sending to ${user.label} (${user.telegramHandle})...`);
       const ok = await sendTgMessage(user.telegramChatId, dmText);
