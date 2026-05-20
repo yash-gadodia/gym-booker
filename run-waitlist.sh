@@ -34,11 +34,14 @@ echo "[$(ts)] === waitlist poll fire (${WATCH_DATE} ${WATCH_TIME}) ===" >> "$LOG
 # Run the watcher; capture exit
 node waitlist-watch.js "$WATCH_DATE" "$WATCH_TIME" >> "$LOG_FILE" 2>&1 || true
 
-# Self-unload if alert fired OR class start time has passed
+# Self-unload when user is booked (manually or via Mindbody auto-promote).
+# v3 (2026-05-20): no longer unloads on first alert. We DM every poll while
+# the slot is open and only stop when the user takes action (or the class
+# starts). State field is `userBooked`; legacy `promoted`/`alerted` honored.
 if [ -f "$STATE_FILE" ]; then
-  ALERTED=$(node -e "try { console.log(JSON.parse(require('fs').readFileSync('$STATE_FILE','utf8')).alerted ? '1' : '0'); } catch { console.log('0'); }")
-  if [ "$ALERTED" = "1" ]; then
-    echo "[$(ts)] alert fired — unloading LaunchAgent" >> "$LOG_FILE"
+  USER_BOOKED=$(node -e "try { const s = JSON.parse(require('fs').readFileSync('$STATE_FILE','utf8')); console.log((s.userBooked || s.promoted) ? '1' : '0'); } catch { console.log('0'); }")
+  if [ "$USER_BOOKED" = "1" ]; then
+    echo "[$(ts)] user booked . unloading LaunchAgent" >> "$LOG_FILE"
     launchctl unload "$PLIST" 2>>"$LOG_FILE" || true
     exit 0
   fi

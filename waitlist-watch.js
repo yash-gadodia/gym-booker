@@ -1,27 +1,44 @@
-// One-shot waitlist/cancellation watcher.
+// One-shot waitlist watcher . DM-every-poll variant.
 //
 // Usage: node waitlist-watch.js <YYYY-MM-DD> <time> [--reset]
-//   e.g. node waitlist-watch.js 2026-04-27 6:30am
+//   e.g. node waitlist-watch.js 2026-05-22 7:30am
 //
-// Polls the target row once. If the row's status has transitioned away from
-// FULL (to BOOK_NOW or WAITLIST), sends a Telegram alert and writes the state
-// file marking the watch as fired. Subsequent runs are no-ops once fired.
+// Behavior (designed for 60s LaunchAgent polling):
+//   1. If class already started . exit (LaunchAgent script unloads us).
+//   2. Fetch /account/schedule . if target booking IS there (Mindbody promoted
+//      the user, or they manually booked) . DM "you're in" once, mark booked,
+//      exit (LaunchAgent script unloads us).
+//   3. Probe class status via Mindbody marketplace API.
+//   4. If status is FULL / NOT_FOUND . quiet update, no DM.
+//   5. If status is actionable (BOOK_NOW or WAITLIST):
+//        . DM user + Yash with manual-join instructions, EVERY POLL it stays
+//          actionable. Rationale (Yash 2026-05-20): "DM the user on telegram
+//          every 1min that a waitlist spot has opened". Mindbody marketplace
+//          API doesn't expose a join-waitlist endpoint (403); user clicks
+//          JOIN WAITLIST or BOOK NOW manually in the app.
 //
-// Designed to be invoked every few minutes by a LaunchAgent.
+// State file (runs/waitlist-state-<watchId>.json):
+//   { lastStatus, lastChecked, polls, firstSeen,
+//     userBooked, userBookedAt, alertCount, lastAlertedAt }
+//
+// Env:
+//   WAITLIST_USER       . user.id key in users.json (auth + creds)
+//   WAITLIST_NAME       . display name in DM greeting
+//   TELEGRAM_CHAT_ID    . comma-separated chat ids to DM
+//   WAITLIST_NO_AUTH    . skip auth (read-only public probe)
 
 require('dotenv').config();
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 const {
-  DAY_SHORT, ymd, classPlan, parseBookingCard,
+  DAY_SHORT, ymd, classPlan, parseBookingCard, isBookingInUpcoming,
 } = require('./lib');
-const { captureBearerToken, fetchScheduleClasses, findClass, joinWaitlistViaApi } = require('./api-client');
+const { captureBearerToken, fetchScheduleClasses, findClass } = require('./api-client');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
 
 function parseTimeToMinutes(t) {
-  // "6:30am" → 6*60+30; "1:00pm" → 13*60
   const m = /^(\d{1,2}):(\d{2})\s*(am|pm)$/i.exec(t);
   if (!m) throw new Error(`bad time: ${t}`);
   let h = parseInt(m[1], 10); const mins = parseInt(m[2], 10); const ap = m[3].toLowerCase();
@@ -35,6 +52,17 @@ function targetClassStartMs(dateYmd, timeStr) {
   const minutes = parseTimeToMinutes(timeStr);
   d.setHours(0, minutes, 0, 0);
   return d.getTime();
+}
+
+function timeToHHMM(timeArg) {
+  const minutes = parseTimeToMinutes(timeArg);
+  const h = Math.floor(minutes / 60), m = minutes % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+function fmtDmy(dateYmd) {
+  const [y, m, d] = dateYmd.split('-');
+  return `${d}-${m}-${y}`;
 }
 
 async function tg(text) {
@@ -56,24 +84,10 @@ async function tg(text) {
   return allOk;
 }
 
-function fmtDmy(dateYmd) {
-  const [y, m, d] = dateYmd.split('-');
-  return `${d}-${m}-${y}`;
-}
-
-function timeToHHMM(timeArg) {
-  const minutes = parseTimeToMinutes(timeArg);
-  const h = Math.floor(minutes / 60), m = minutes % 60;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-}
-
-// Fetch user's upcoming bookings from /account/schedule. Returns array of
-// {kind, date, time, instructor, ...}. Used to check if waitlist -> promoted.
 async function fetchMyUpcomingBookings(page) {
   const acctUrl = 'https://www.mindbodyonline.com/explore/account/schedule';
   await page.goto(acctUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(2000);
-
   const cards = await page.evaluate(() => {
     const cancelBtns = Array.from(document.querySelectorAll('button, a'))
       .filter(e => /^Cancel$/i.test((e.innerText || '').trim()));
@@ -96,22 +110,6 @@ async function fetchMyUpcomingBookings(page) {
   return cards.map(parseBookingCard).filter(Boolean);
 }
 
-// Check if any booking matches the target date/kind/time.
-function hasMatchingBooking(bookings, { plan, dateArg, timeArg }) {
-  for (const b of bookings) {
-    const dateMatches = b.date === dateArg;
-    const kindMatches = (b.kind || '').includes(plan.kind);
-    const timeMatches = b.time === timeArg;
-    if (dateMatches && kindMatches && timeMatches) return true;
-  }
-  return false;
-}
-
-// Authoritative class status via Mindbody marketplace API. The public web
-// schedule shows "BOOK NOW" even when classes are at max capacity, so DOM
-// scraping produces false positives. The API returns bookable + statusText
-// (e.g. "Class is at Max Capacity") which the booker pipeline already trusts.
-// Also returns the bearer token and class metadata so callers can use the API.
 async function checkApiStatus(page, plan, dateArg, timeArg) {
   const bearer = await captureBearerToken(page, { timeoutMs: 20000 });
   const fromIso = new Date(`${dateArg}T00:00:00+08:00`).toISOString();
@@ -120,7 +118,7 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
   const cls = findClass(classes, {
     kindNeedle: plan.kind, sgtDate: dateArg, sgtHHMM: timeToHHMM(timeArg),
   });
-  if (!cls) return { observed: 'NOT_FOUND', observedText: '(class not in API schedule)', bearer, classMeta: null };
+  if (!cls) return { observed: 'NOT_FOUND', observedText: '(class not in API schedule)' };
   const txt = cls.statusText || '';
   let observed;
   if (cls.bookable) observed = 'BOOK_NOW';
@@ -130,16 +128,33 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
   return {
     observed,
     observedText: `bookable=${cls.bookable} status="${txt}" id=${cls.mb_class_id}/${cls.mb_class_schedule_id}`,
-    bearer,
-    classMeta: {
-      mb_class_id: cls.mb_class_id,
-      mb_class_schedule_id: cls.mb_class_schedule_id,
-      mb_class_description_id: cls.mb_class_description_id,
-    },
   };
 }
 
-(async () => {
+// Build the alert text. Wording depends on whether the opening is a direct
+// slot (BOOK_NOW: someone canceled) or a waitlist queue (WAITLIST: Mindbody
+// is offering join-queue). Keep persona-clean (Lawrence British gym bro) and
+// em-dash-free per Yash voice rule.
+function buildAlertMessage({ observed, plan, timeArg, dateArg, target, name, alertCount }) {
+  const dayLabel = DAY_SHORT[target.getDay()];
+  const heading = observed === 'BOOK_NOW'
+    ? '🟢 *SLOT OPEN*'
+    : '🟡 *WAITLIST AVAILABLE*';
+  const action = observed === 'BOOK_NOW'
+    ? 'Someone just canceled. Open Mindbody and *BOOK NOW* before the next person grabs it.'
+    : 'Mindbody is letting you join the waitlist. Open the app and *JOIN WAITLIST*. You\'ll be auto-promoted when a slot opens.';
+  const greeting = name ? `${name}, ` : '';
+  const repeatHint = alertCount > 1 ? `_(reminder ${alertCount}, every minute while it stays open)_\n` : '';
+  return (
+    `${heading}\n` +
+    `${greeting}${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}.\n` +
+    `${action}\n` +
+    `${repeatHint}` +
+    `https://www.mindbodyonline.com/explore/locations/ragtag`
+  );
+}
+
+async function main() {
   const args = process.argv.slice(2);
   const dateArg = args.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a));
   const timeArg = args.find(a => /^\d{1,2}:\d{2}(am|pm)$/i.test(a));
@@ -165,53 +180,43 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
     lastChecked: null,
     polls: 0,
     firstSeen: null,
-    joined: false,
-    joinedAt: null,
-    joinResult: null,
-    promoted: false,
-    promotedAt: null,
-    alerted: false,
-    firedAt: null,
+    userBooked: false,
+    userBookedAt: null,
+    alertCount: 0,
+    lastAlertedAt: null,
   };
   if (fs.existsSync(stateFile)) {
     try {
       const loaded = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
       state = { ...state, ...loaded };
-      // Backwards compat: treat alerted:true as joined:true
-      if (loaded.alerted && !loaded.joined) {
-        state.joined = true;
-        state.joinedAt = state.firedAt || new Date().toISOString();
+      // Legacy migration: prior versions used joined/promoted/alerted fields.
+      // Treat any "promoted" state as terminal (userBooked).
+      if (loaded.promoted) {
+        state.userBooked = true;
+        state.userBookedAt = loaded.promotedAt || state.lastChecked || new Date().toISOString();
       }
     } catch {}
   }
 
-  // Auto-disarm: if class has already started, don't bother
   const classStartMs = targetClassStartMs(dateArg, timeArg);
   if (Date.now() >= classStartMs) {
-    console.log(`class already started (${new Date(classStartMs).toISOString()}) — exiting`);
+    console.log(`class already started (${new Date(classStartMs).toISOString()}) . exiting`);
     process.exit(0);
   }
-  // Already promoted — idempotent silent exit
-  if (state.promoted) {
-    console.log(`already promoted on ${state.promotedAt} — exiting`);
+  if (state.userBooked) {
+    console.log(`user already booked on ${state.userBookedAt} . exiting`);
     process.exit(0);
   }
 
   const ts = new Date().toISOString();
   console.log(`[${ts}] poll #${state.polls + 1}: ${plan.kind} @ ${timeArg} on ${DAY_SHORT[target.getDay()]} ${dateArg}`);
 
-  // Per-user auth: WAITLIST_USER=dani → users-auth/dani.json. The Mindbody
-  // marketplace API status is personalised — Yash's auth returns "Booked" for
-  // a class he's in, masking the public capacity state. Use the watch target's
-  // own auth so statusText reflects what *they* would see.
   const watchUser = process.env.WAITLIST_USER || null;
   const authPath = watchUser
     ? path.join(__dirname, 'users-auth', `${watchUser}.json`)
     : path.join(__dirname, 'auth.json');
   const useAuth = !process.env.WAITLIST_NO_AUTH;
 
-  // Pull MB credentials for reactive login via getCreds (keychain-backed).
-  // WAITLIST_USER selects which user record; defaults to 'yash'.
   let mbEmail, mbPassword;
   try {
     const { getUser, getCreds } = require('./users');
@@ -234,21 +239,18 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
 
   let observed = 'ERROR';
   let observedText = '';
-  let bearer = null;
-  let classMeta = null;
-  let didLogin = false;
+  let bookingDetected = false;
+
   try {
     await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(2000);
     for (const sel of ['button:has-text("AGREE AND PROCEED")', '#onetrust-accept-btn-handler']) {
       const el = await page.$(sel); if (el) try { await el.click({ timeout: 2000 }); } catch {}
     }
 
-    // Reactive login — only if logged out. We don't need a fresh session for read-only polling.
     const loggedOut = await page.locator('button[data-name="NavigationBar.Login.Button"]').count() > 0;
     if (loggedOut && useAuth && mbEmail && mbPassword) {
-      console.log(`logged out — re-login as ${mbEmail}`);
-      didLogin = true;
+      console.log(`logged out . re-login as ${mbEmail}`);
       await page.click('button[data-name="NavigationBar.Login.Button"]');
       await page.waitForTimeout(2000);
       const emailInput = page.locator('input:visible').first();
@@ -265,99 +267,74 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
       await page.waitForTimeout(3000);
       await ctx.storageState({ path: authPath });
       await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(2500);
+      await page.waitForTimeout(2000);
     }
 
-    const result = await checkApiStatus(page, plan, dateArg, timeArg);
-    observed = result.observed;
-    observedText = result.observedText;
-    bearer = result.bearer;
-    classMeta = result.classMeta;
-    if (bearer) console.log(`[DEBUG] captured bearer: ${bearer.substring(0, 30)}...${bearer.substring(bearer.length - 20)}`);
+    // 1. Did the user (manually or via Mindbody auto-promote) end up booked?
+    try {
+      const upcoming = await fetchMyUpcomingBookings(page);
+      if (isBookingInUpcoming(upcoming, { targetYmd: dateArg, kind: plan.kind, time: timeArg })) {
+        bookingDetected = true;
+      }
+    } catch (e) {
+      console.log(`schedule fetch failed (${e.message.slice(0, 140)})`);
+    }
+
+    if (bookingDetected) {
+      // Restore gym URL so the API probe below works
+      try { await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+    }
+
+    // 2. Public class status (only matters if user not yet booked)
+    if (!bookingDetected) {
+      const result = await checkApiStatus(page, plan, dateArg, timeArg);
+      observed = result.observed;
+      observedText = result.observedText;
+    }
   } catch (e) {
     observed = 'ERROR';
     observedText = e.message;
   } finally {
     if (useAuth) { try { await ctx.storageState({ path: authPath }); } catch {} }
-    // Don't close browser yet if we still need to check for promotion
   }
-
-  console.log(`observed: ${observed} — ${observedText.slice(0, 160)}`);
 
   state.polls += 1;
   state.lastChecked = new Date().toISOString();
-  state.lastStatus = observed;
-  if (!state.firstSeen) state.firstSeen = { at: state.lastChecked, status: observed };
+  state.lastStatus = bookingDetected ? 'BOOKED' : observed;
+  if (!state.firstSeen) state.firstSeen = { at: state.lastChecked, status: state.lastStatus };
 
-  // State machine:
-  // 1. Status is FULL/WAITLIST and not joined yet => join the waitlist
-  // 2. Joined && not promoted => check /account/schedule for promotion
-  // 3. BOOK_NOW (direct slot) => shortcut to promotion check
-
-  const actionable = ['BOOK_NOW', 'WAITLIST', 'FULL'];
-  const joinNeeded = actionable.includes(observed) && !state.joined;
-  const promotionCheckNeeded = state.joined && !state.promoted;
-
-  // Path 1: Join the waitlist
-  if (joinNeeded && observed !== 'BOOK_NOW') {
-    console.log('JOINING WAITLIST...');
-    try {
-      const result = await joinWaitlistViaApi(bearer, { classMeta });
-      state.joinResult = result;
-      if (result.ok) {
-        state.joined = true;
-        state.joinedAt = new Date().toISOString();
-        console.log(`JOINED waitlist: ${result.step} status=${result.httpStatus}`);
-
-        // Send notification to user and Yash
-        const dayLabel = DAY_SHORT[target.getDay()];
-        const greeting = process.env.WAITLIST_NAME ? `Hey ${process.env.WAITLIST_NAME}. ` : 'You.';
-        const msg = `${greeting}You.re on the waitlist for ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}. Mindbody will auto-promote if a slot opens.`;
-        await tg(msg);
-
-        // Also notify Yash
-        const yashMsg = `[${process.env.WAITLIST_NAME || 'user'}] joined waitlist: ${plan.kind} @ ${timeArg} on ${dateArg}`;
-        await tg(yashMsg);
-      } else {
-        console.log(`JOIN FAILED: ${result.step} status=${result.status} body=${result.body}`);
-        // Continue anyway — don't block on join API failures
-      }
-    } catch (e) {
-      console.error(`join error: ${e.message}`);
-      // Continue — transient API error, next poll will retry
-    }
-  }
-
-  // Path 2: Check if promoted from waitlist
-  if (promotionCheckNeeded) {
-    console.log('CHECKING FOR PROMOTION...');
-    try {
-      const bookings = await fetchMyUpcomingBookings(page);
-      const isPromoted = hasMatchingBooking(bookings, { plan, dateArg, timeArg });
-      if (isPromoted) {
-        state.promoted = true;
-        state.promotedAt = new Date().toISOString();
-        console.log('PROMOTED from waitlist.');
-
-        // Send notifications
-        const dayLabel = DAY_SHORT[target.getDay()];
-        const greeting = process.env.WAITLIST_NAME ? `Hey ${process.env.WAITLIST_NAME}. ` : 'You.';
-        const msg = `${greeting}You.re in. ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}. See you there.`;
-        await tg(msg);
-
-        // Notify Yash
-        const yashMsg = `[${process.env.WAITLIST_NAME || 'user'}] promoted from waitlist: ${plan.kind} @ ${timeArg} on ${dateArg}`;
-        await tg(yashMsg);
-      } else {
-        console.log('not promoted yet (still on waitlist)');
-      }
-    } catch (e) {
-      console.error(`promotion check error: ${e.message}`);
-      // Continue — transient error, next poll will retry
-    }
+  if (bookingDetected) {
+    state.userBooked = true;
+    state.userBookedAt = state.lastChecked;
+    const dayLabel = DAY_SHORT[target.getDay()];
+    const name = process.env.WAITLIST_NAME || 'You';
+    const msg =
+      `🎉 *${name}, you.re in!*\n` +
+      `${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}.\n` +
+      `See you there.`;
+    await tg(msg);
+    console.log('USER BOOKED . sent confirmation DM');
+  } else if (observed === 'BOOK_NOW' || observed === 'WAITLIST') {
+    state.alertCount += 1;
+    state.lastAlertedAt = state.lastChecked;
+    const msg = buildAlertMessage({
+      observed, plan, timeArg, dateArg, target,
+      name: process.env.WAITLIST_NAME || null,
+      alertCount: state.alertCount,
+    });
+    await tg(msg);
+    console.log(`ALERTED (count=${state.alertCount}) . status=${observed}`);
+  } else {
+    console.log(`no alert (status=${observed}, userBooked=${state.userBooked})`);
   }
 
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
   try { await browser.close(); } catch {}
   process.exit(0);
-})().catch(e => { console.error('FATAL', e.message); process.exit(1); });
+}
+
+if (require.main === module) {
+  main().catch(e => { console.error('FATAL', e.message); process.exit(1); });
+}
+
+module.exports = { buildAlertMessage };

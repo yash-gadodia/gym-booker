@@ -2488,3 +2488,90 @@ test('verify-don\'t-trust: real failure . booking NOT on schedule . returns fals
   });
   assert.equal(verified, false, 'verify must say no when booking is genuinely absent');
 });
+
+// ── waitlist watcher v3 (DM-every-1-min) ────────────────────────────────────
+// 2026-05-20: Mindbody marketplace API doesn't expose a public join-waitlist
+// endpoint (returns 403). Watcher switched from "auto-join via API" to
+// "DM every fire while the slot is open"; user manually clicks JOIN
+// WAITLIST / BOOK NOW in the Mindbody app.
+
+const { buildAlertMessage } = require('./waitlist-watch');
+
+test('waitlist v3 buildAlertMessage: BOOK_NOW heading + book-now action', () => {
+  const target = new Date('2026-05-22T00:00:00');
+  const msg = buildAlertMessage({
+    observed: 'BOOK_NOW',
+    plan: { kind: 'FIT' },
+    timeArg: '7:30am',
+    dateArg: '2026-05-22',
+    target,
+    name: 'Mer',
+    alertCount: 1,
+  });
+  assert.ok(msg.includes('🟢 *SLOT OPEN*'), 'should include SLOT OPEN heading');
+  assert.ok(msg.includes('BOOK NOW'), 'should tell user to BOOK NOW');
+  assert.ok(msg.includes('Mer, '), 'should personalize with name');
+  assert.ok(msg.includes('7:30am'), 'should include time');
+  assert.ok(msg.includes('22-05-2026'), 'should use dd-mm-yyyy date format');
+});
+
+test('waitlist v3 buildAlertMessage: WAITLIST heading + join-waitlist action', () => {
+  const target = new Date('2026-05-22T00:00:00');
+  const msg = buildAlertMessage({
+    observed: 'WAITLIST',
+    plan: { kind: 'FIT' },
+    timeArg: '7:30am',
+    dateArg: '2026-05-22',
+    target,
+    name: 'Mer',
+    alertCount: 1,
+  });
+  assert.ok(msg.includes('🟡 *WAITLIST AVAILABLE*'), 'should include WAITLIST heading');
+  assert.ok(msg.includes('JOIN WAITLIST'), 'should tell user to JOIN WAITLIST');
+});
+
+test('waitlist v3 buildAlertMessage: alertCount > 1 includes reminder hint', () => {
+  const target = new Date('2026-05-22T00:00:00');
+  const m1 = buildAlertMessage({
+    observed: 'BOOK_NOW', plan: { kind: 'FIT' }, timeArg: '7:30am',
+    dateArg: '2026-05-22', target, name: 'Mer', alertCount: 1,
+  });
+  const m4 = buildAlertMessage({
+    observed: 'BOOK_NOW', plan: { kind: 'FIT' }, timeArg: '7:30am',
+    dateArg: '2026-05-22', target, name: 'Mer', alertCount: 4,
+  });
+  assert.ok(!m1.includes('reminder'), 'first alert: no reminder hint');
+  assert.ok(m4.includes('reminder 4'), 'fourth alert: shows reminder count');
+});
+
+test('waitlist v3 buildAlertMessage: no em-dashes anywhere (Yash voice rule)', () => {
+  const target = new Date('2026-05-22T00:00:00');
+  for (const observed of ['BOOK_NOW', 'WAITLIST']) {
+    for (const alertCount of [1, 5]) {
+      const msg = buildAlertMessage({
+        observed, plan: { kind: 'FIT' }, timeArg: '7:30am',
+        dateArg: '2026-05-22', target, name: 'Mer', alertCount,
+      });
+      assert.equal(msg.includes('—'), false, `${observed} alert ${alertCount} must have no em-dash`);
+    }
+  }
+});
+
+test('waitlist v3 buildAlertMessage: works with null name (omits greeting)', () => {
+  const target = new Date('2026-05-22T00:00:00');
+  const msg = buildAlertMessage({
+    observed: 'BOOK_NOW', plan: { kind: 'FIT' }, timeArg: '7:30am',
+    dateArg: '2026-05-22', target, name: null, alertCount: 1,
+  });
+  assert.ok(!msg.includes(', FIT'), 'should not have a "[blank], FIT" gap');
+  assert.ok(msg.includes('FIT @ 7:30am'), 'class line should still appear');
+});
+
+test('waitlist v3 buildAlertMessage: includes Mindbody URL for action link', () => {
+  const target = new Date('2026-05-22T00:00:00');
+  const msg = buildAlertMessage({
+    observed: 'BOOK_NOW', plan: { kind: 'FIT' }, timeArg: '7:30am',
+    dateArg: '2026-05-22', target, name: 'Mer', alertCount: 1,
+  });
+  assert.ok(msg.includes('mindbodyonline.com/explore/locations/ragtag'), 'should include gym URL');
+});
