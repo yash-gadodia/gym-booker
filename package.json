@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test test.js",
+    "test": "node --test test.js test-wodup.js",
     "book": "node book.js",
     "dry": "node book.js --dry-run --now"
   },
