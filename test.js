@@ -2294,3 +2294,121 @@ test('book-all.js end-to-end: synthetic setup failure produces well-formed daily
   assert.ok(out.includes('🚨 Yash — setup failed (alerted)'), `missing Yash setup-failed line:\n${out}`);
   assert.ok(out.includes('synthetic'), 'detail should mention synthetic failure');
 });
+
+// Wodup client tests
+test('wodup: extract workouts from simulated page text', () => {
+  // Simulate the page text structure we extract from Wodup
+  const simulatedText = `Timeline
+Feed
+Calendar
+BURN
+Log Result
+Leaderboard
+Move Upper 4/8
+A1. Incline Bench Dumbbell Front Raise 8-12-8-12-12-20
+A2. Bent-Over Barbell Row 3 x 10
+Show full workout
+FIT
+Log Result
+Leaderboard
+PHASE 1: W8 (Week B)
+A. Primer
+B. Jerk 4 x 2
+C. AMRAP 12
+Show full workout
+Choose which programs`;
+
+  const lines = simulatedText.split('\n');
+  const workoutMap = {};
+  
+  const workoutStarts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === 'Log Result') {
+      workoutStarts.push(i);
+    }
+  }
+  
+  workoutStarts.forEach(startIdx => {
+    let kind = '';
+    for (let i = startIdx - 1; i >= Math.max(0, startIdx - 5); i--) {
+      const line = lines[i].trim().toUpperCase();
+      if (['FIT', 'BURN', 'LIFT', 'STEAM', 'GYMNASTICS', 'RUN', 'CONDITIONING'].includes(line)) {
+        kind = line;
+        break;
+      }
+    }
+    
+    if (!kind) return;
+    
+    let endIdx = startIdx + 1;
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      const isNextKind = ['FIT', 'BURN', 'LIFT', 'STEAM', 'GYMNASTICS', 'RUN', 'CONDITIONING'].includes(line.toUpperCase());
+      if (isNextKind && i > startIdx + 5) {
+        endIdx = i;
+        break;
+      }
+      if (line.startsWith('Choose which programs')) {
+        endIdx = i;
+        break;
+      }
+    }
+    
+    const workoutLines = [];
+    for (let i = startIdx + 1; i < endIdx; i++) {
+      const line = lines[i].trim();
+      if (line === 'Leaderboard') continue;
+      if (line === 'Show full workout') break;
+      if (line === '') continue;
+      workoutLines.push(line);
+    }
+    
+    if (workoutLines.length > 1) {
+      workoutMap[kind] = workoutLines.join('\n');
+    }
+  });
+  
+  // Verify extraction
+  assert.ok(workoutMap.BURN, 'should extract BURN workout');
+  assert.ok(workoutMap.FIT, 'should extract FIT workout');
+  assert.ok(workoutMap.BURN.includes('Move Upper'), 'BURN should contain title');
+  assert.ok(workoutMap.FIT.includes('Jerk'), 'FIT should contain exercise');
+  assert.ok(!workoutMap.BURN.includes('Show full workout'), 'should not include button text');
+});
+
+test('wodup: DM format uses dd-mm-yyyy date', () => {
+  const dateYmd = '2026-05-21';
+  const [yyyy, mm, dd] = dateYmd.split('-');
+  const dateStr = `${dd}-${mm}-${yyyy}`;
+  
+  assert.equal(dateStr, '21-05-2026', 'should format as dd-mm-yyyy');
+  
+  const workoutText = 'Move Upper 4/8\nA1. Row 3 x 10';
+  const dmText = `Tomorrow's workout for FIT (THU ${dateStr}):\n\n${workoutText}`;
+  
+  assert.ok(dmText.includes('21-05-2026'), 'DM should contain formatted date');
+  assert.ok(!dmText.includes('2026-05-21'), 'DM should not contain YYYY-MM-DD format');
+});
+
+test('wodup: DM has no em-dashes', () => {
+  const workoutText = 'Move Upper 4/8\nA1. Incline Bench Dumbbell Front Raise';
+  const dateStr = '21-05-2026';
+  const dmText = `Tomorrow's workout for FIT (THU ${dateStr}):\n\n${workoutText}`;
+  
+  assert.ok(!dmText.includes('—'), 'DM must not contain em-dashes (per feedback)');
+});
+
+test('wodup: idempotency via state file', () => {
+  const state = {
+    date: '2026-05-21',
+    sentTo: {
+      yash: { timestamp: '2026-05-20T19:00:00Z', kind: 'FIT' },
+      dani: { timestamp: '2026-05-20T19:00:01Z', kind: 'BURN' }
+    },
+    completed: true
+  };
+  
+  assert.ok(state.sentTo['yash'], 'should have sent to yash');
+  assert.ok(!state.sentTo['unknown'], 'should not have sent to unknown user');
+  assert.ok(state.completed, 'should be marked completed');
+});

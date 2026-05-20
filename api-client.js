@@ -228,6 +228,7 @@ async function generateRecaptchaToken(page, { action = 'process_order', timeoutM
 async function joinWaitlistViaApi(bearer, { classMeta }) {
   const t0 = Date.now();
   const timing = {};
+  console.log(`[DEBUG] joinWaitlistViaApi called with bearer: ${bearer.substring(0, 30)}...`);
   const headers = { ...MB_HEADERS_BASE, authorization: bearer };
   const post = async (label, urlPath, body) => {
     const t = Date.now();
@@ -245,17 +246,16 @@ async function joinWaitlistViaApi(bearer, { classMeta }) {
   }
   const orderId = r1.json.data.id;
 
-  // 2. Add waitlist booking item (use inventory_category 'class_time_waitlist').
-  const r2 = await post('booking_items', `/v1/orders/${orderId}/booking_items`, {
+  // 2. Add waitlist booking item (using waitlist_items endpoint instead of booking_items).
+  const r2 = await post('waitlist_items', `/v1/orders/${orderId}/waitlist_items`, {
     inventoryItemRefJson: JSON.stringify({
       mb_class_id: classMeta.mb_class_id,
       mb_class_schedule_id: classMeta.mb_class_schedule_id,
       mb_class_description_id: classMeta.mb_class_description_id,
       ...RAGTAG,
-      inventory_category: 'class_time_waitlist',
     }),
   });
-  if (!r2.ok) return { ok: false, step: 'booking_items', status: r2.status, body: r2.txt.slice(0, 400), orderId, timing };
+  if (!r2.ok) return { ok: false, step: 'booking_items', status: r2.status, body: r2.txt.slice(0, 1200), orderId, timing };
   const bookingItemUuid = r2.json && r2.json.data && r2.json.data.relationships && r2.json.data.relationships.bookingItems && r2.json.data.relationships.bookingItems.data && r2.json.data.relationships.bookingItems.data[0] && r2.json.data.relationships.bookingItems.data[0].id;
   if (!bookingItemUuid) return { ok: false, step: 'booking_items', status: r2.status, body: 'no bookingItemUuid', orderId, timing };
 

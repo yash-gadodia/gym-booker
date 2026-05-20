@@ -273,6 +273,7 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
     observedText = result.observedText;
     bearer = result.bearer;
     classMeta = result.classMeta;
+    if (bearer) console.log(`[DEBUG] captured bearer: ${bearer.substring(0, 30)}...${bearer.substring(bearer.length - 20)}`);
   } catch (e) {
     observed = 'ERROR';
     observedText = e.message;
@@ -318,7 +319,7 @@ async function checkApiStatus(page, plan, dateArg, timeArg) {
         const yashMsg = `[${process.env.WAITLIST_NAME || 'user'}] joined waitlist: ${plan.kind} @ ${timeArg} on ${dateArg}`;
         await tg(yashMsg);
       } else {
-        console.log(`JOIN FAILED: ${result.step} status=${result.status} body=${result.body.slice(0, 100)}`);
+        console.log(`JOIN FAILED: ${result.step} status=${result.status} body=${result.body}`);
         // Continue anyway — don't block on join API failures
       }
     } catch (e) {
