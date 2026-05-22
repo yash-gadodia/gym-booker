@@ -218,3 +218,90 @@ test('scheduledClasses: Cheryl Thu single BURN returns [BURN]', () => {
   assert.equal(got.length, 1);
   assert.equal(got[0].kind, 'BURN');
 });
+
+// ── classesFor: manifest precedence (regression — 2026-05-22 Yash skipped) ──
+// The real exported function reads runs/bookings-<date>.json. Write a fixture
+// file with a sentinel date and assert that schedule:null users get classes
+// from the manifest, while users with a schedule still get theirs.
+
+const fs = require('node:fs');
+const path = require('node:path');
+const realSender = require('./wodup-daily-send');
+
+const FIXTURE_DATE = '2099-01-15';
+const FIXTURE_PATH = path.join(__dirname, 'runs', `bookings-${FIXTURE_DATE}.json`);
+
+function writeManifest(bookings) {
+  fs.mkdirSync(path.dirname(FIXTURE_PATH), { recursive: true });
+  fs.writeFileSync(FIXTURE_PATH, JSON.stringify({
+    date: FIXTURE_DATE,
+    updated: new Date().toISOString(),
+    runId: 'test-fixture',
+    bookings,
+  }));
+}
+function cleanupManifest() { try { fs.unlinkSync(FIXTURE_PATH); } catch {} }
+
+test('manifestClasses: returns [] when no manifest exists', () => {
+  cleanupManifest();
+  const got = realSender.manifestClasses({ id: 'yash' }, FIXTURE_DATE);
+  assert.deepEqual(got, []);
+});
+
+test('manifestClasses: returns booked classes for the right user', () => {
+  writeManifest({
+    yash: [{ kind: 'Gymnastics', time: '1:00pm' }],
+    dani: [{ kind: 'Gymnastics', time: '1:00pm' }],
+  });
+  const got = realSender.manifestClasses({ id: 'yash' }, FIXTURE_DATE);
+  assert.deepEqual(got, [{ kind: 'Gymnastics', primaryTime: '1:00pm' }]);
+  cleanupManifest();
+});
+
+test('manifestClasses: returns [] for user not in manifest', () => {
+  writeManifest({ yash: [{ kind: 'Gymnastics', time: '1:00pm' }] });
+  const got = realSender.manifestClasses({ id: 'cheryllee' }, FIXTURE_DATE);
+  assert.deepEqual(got, []);
+  cleanupManifest();
+});
+
+test('classesFor: schedule:null user gets manifest entries (the actual bug)', () => {
+  writeManifest({ yash: [{ kind: 'FIT', time: '6:30am' }] });
+  const got = realSender.classesFor({ id: 'yash', schedule: null }, FIXTURE_DATE);
+  assert.equal(got.length, 1);
+  assert.equal(got[0].kind, 'FIT');
+  assert.equal(got[0].primaryTime, '6:30am');
+  cleanupManifest();
+});
+
+test('classesFor: with schedule AND manifest, both surface (de-duped)', () => {
+  writeManifest({
+    cheryllee: [
+      { kind: 'BURN', time: '7:00am' },        // matches schedule, de-duped
+      { kind: 'FIT',  time: '8:30am' },        // extra
+    ],
+  });
+  const user = { id: 'cheryllee', schedule: { Wed: { kind: 'BURN', primaryTime: '7:00am' } } };
+  // 2099-01-15 is a Thursday in real life, but for the schedule test we want
+  // a day with a hit — use a Wed by adjusting fixture date.
+  const wedFixture = '2099-01-14'; // Wed
+  const wedPath = path.join(__dirname, 'runs', `bookings-${wedFixture}.json`);
+  fs.writeFileSync(wedPath, JSON.stringify({
+    date: wedFixture,
+    updated: new Date().toISOString(),
+    runId: 'test-fixture',
+    bookings: { cheryllee: [{ kind: 'BURN', time: '7:00am' }, { kind: 'FIT', time: '8:30am' }] },
+  }));
+  const got = realSender.classesFor(user, wedFixture);
+  // De-dupe means BURN@7:00am appears once even though both sources have it.
+  const keys = got.map(c => `${c.kind}|${c.primaryTime}`).sort();
+  assert.deepEqual(keys, ['BURN|7:00am', 'FIT|8:30am']);
+  try { fs.unlinkSync(wedPath); } catch {}
+  cleanupManifest();
+});
+
+test('classesFor: returns [] when neither schedule nor manifest has the user', () => {
+  cleanupManifest();
+  const got = realSender.classesFor({ id: 'ghost', schedule: null }, FIXTURE_DATE);
+  assert.deepEqual(got, []);
+});

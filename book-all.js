@@ -160,6 +160,46 @@ function stripFlag(args, name) {
     console.log('book-all: daily summary suppressed (dry/now flag)');
   }
 
+  // Write the daily bookings manifest so downstream agents (wodup-daily-send,
+  // chasers, etc.) can see what each user ACTUALLY booked today, not what
+  // their static users.json schedule claims. Solves a gap for users with
+  // schedule:null (Yash, Dani) whose classes are driven dynamically by the
+  // overrides/all-classes flow.
+  //
+  // File: runs/bookings-<targetYmd>.json. Only successful bookings are
+  // listed; failures show up in the daily summary, not here.
+  try {
+    let manifestDate = null;
+    const bookings = {};
+    for (const r of filtered) {
+      const file = resultPathFor(r.id);
+      let parsed = null;
+      try { if (fs.existsSync(file)) parsed = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+      if (!parsed) continue;
+      if (parsed.targetYmd && !manifestDate) manifestDate = parsed.targetYmd;
+      const ok = (parsed.results || []).filter(x => x.status && x.status.ok);
+      if (!ok.length) continue;
+      bookings[r.id] = ok.map(x => ({
+        kind: x.plan.kind,
+        time: x.status.time || x.plan.primaryTime,
+      }));
+    }
+    if (manifestDate) {
+      const manifestPath = path.join(__dirname, 'runs', `bookings-${manifestDate}.json`);
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        date: manifestDate,
+        updated: new Date().toISOString(),
+        runId,
+        bookings,
+      }, null, 2));
+      console.log(`book-all: wrote bookings manifest ${manifestPath} (${Object.keys(bookings).length} user(s) with bookings)`);
+    } else {
+      console.log('book-all: skipped manifest (no targetYmd in any child payload)');
+    }
+  } catch (e) {
+    console.error(`book-all: manifest write failed: ${e.message}`);
+  }
+
   // Cleanup tmpdir.
   try { fs.rmSync(resultsDir, { recursive: true, force: true }); } catch {}
 

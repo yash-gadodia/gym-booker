@@ -7,7 +7,7 @@ const {
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
-  isBookingInUpcoming,
+  isBookingInUpcoming, isInventoryRowRace,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
 } = require('./lib');
@@ -606,6 +606,31 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
     } catch (e) {
       log(`api-direct: recaptcha mint failed (${e.message.slice(0,120)})`);
     }
+  }
+
+  // 5b'. Inventory-row INSERT race retry.
+  //
+  // Observed 2026-05-22 (Dani vs Yash, both targeting Sun 1pm Gymnastics):
+  // booking_items returned HTTP 400 with `PG::UniqueViolation` on
+  // `index_inventory_item_references_on_source_reference`. The Ragtag/Mindbody
+  // backend INSERTs a single inventory_item_references row keyed by class
+  // (mb_class_id + mb_location_id + ...), not per-user. When N parallel
+  // requests target the same class at 9am, only one INSERT wins; the rest get
+  // RecordNotUnique. On the loser's RETRY the row already exists, so the
+  // INSERT path is skipped and the booking proceeds normally (so long as the
+  // class still has a free spot, which it usually does for non-cap classes).
+  //
+  // Retry up to 2 times with brief backoff. Costs ~600ms in the worst case,
+  // way cheaper than falling through to the 30+s UI flow.
+  let inventoryRetries = 0;
+  while (isInventoryRowRace(result) && inventoryRetries < 2) {
+    inventoryRetries += 1;
+    const backoff = 150 + inventoryRetries * 100;
+    log(`api-direct: booking_items RecordNotUnique (inventory row INSERT race) — retry ${inventoryRetries}/2 after ${backoff}ms`);
+    await new Promise(r => setTimeout(r, backoff));
+    try { result = await bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken: '' }); }
+    catch (e) { log(`api-direct: retry ${inventoryRetries} exception (${e.message.slice(0,140)})`); break; }
+    log(`api-direct: retry ${inventoryRetries} result ${JSON.stringify(result)}`);
   }
 
   if (!result.ok) {

@@ -2575,3 +2575,53 @@ test('waitlist v3 buildAlertMessage: includes Mindbody URL for action link', () 
   });
   assert.ok(msg.includes('mindbodyonline.com/explore/locations/ragtag'), 'should include gym URL');
 });
+
+// ── isInventoryRowRace (regression — 2026-05-22 Dani vs Yash Sun 1pm) ──
+const { isInventoryRowRace } = require('./lib');
+
+test('isInventoryRowRace: matches the real Mindbody RecordNotUnique 400', () => {
+  const result = {
+    ok: false,
+    step: 'booking_items',
+    status: 400,
+    body: '{"errors":[{"status":"400","title":"ActiveRecord::RecordNotUnique","detail":"PG::UniqueViolation: ERROR:  duplicate key value violates unique constraint \\"index_inventory_item_references_on_source_reference\\"',
+    orderId: 'a55d771a-cc39-41dc-ae85-7234c7d63362',
+  };
+  assert.equal(isInventoryRowRace(result), true);
+});
+
+test('isInventoryRowRace: matches a bare PG::UniqueViolation body', () => {
+  assert.equal(isInventoryRowRace({ ok: false, step: 'booking_items', body: 'PG::UniqueViolation: yada' }), true);
+});
+
+test('isInventoryRowRace: ignores non-booking_items step', () => {
+  assert.equal(
+    isInventoryRowRace({ ok: false, step: 'process', body: 'RecordNotUnique somewhere else' }),
+    false,
+  );
+});
+
+test('isInventoryRowRace: ignores other booking_items errors (capacity, auth)', () => {
+  assert.equal(
+    isInventoryRowRace({ ok: false, step: 'booking_items', body: 'class is at max capacity' }),
+    false,
+  );
+  assert.equal(
+    isInventoryRowRace({ ok: false, step: 'booking_items', body: '{"errors":[{"title":"Unauthorized"}]}' }),
+    false,
+  );
+});
+
+test('isInventoryRowRace: ok=true never matches', () => {
+  assert.equal(
+    isInventoryRowRace({ ok: true, step: 'process', body: 'whatever' }),
+    false,
+  );
+});
+
+test('isInventoryRowRace: null/undefined-safe', () => {
+  assert.equal(isInventoryRowRace(null), false);
+  assert.equal(isInventoryRowRace(undefined), false);
+  assert.equal(isInventoryRowRace({}), false);
+  assert.equal(isInventoryRowRace({ ok: false, step: 'booking_items' }), false);
+});

@@ -42,6 +42,37 @@ function scheduledClasses(user, dateYmd) {
   return day;
 }
 
+// Read the daily bookings manifest written by book-all.js (runs/bookings-<date>.json)
+// and return {kind, primaryTime} entries for `user` on `dateYmd`. Empty if no
+// manifest or no entry for this user. Source-of-truth for users with
+// schedule:null whose classes are booked dynamically.
+function manifestClasses(user, dateYmd) {
+  if (!user) return [];
+  const file = path.join(__dirname, 'runs', `bookings-${dateYmd}.json`);
+  if (!fs.existsSync(file)) return [];
+  let m;
+  try { m = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return []; }
+  const entries = (m && m.bookings && m.bookings[user.id]) || [];
+  return entries.map(e => ({ kind: e.kind, primaryTime: e.time }));
+}
+
+// Merge static schedule + manifest. Manifest wins on conflicts (it reflects
+// reality). De-dupe on `${kind}|${time}`.
+function classesFor(user, dateYmd) {
+  const fromManifest = manifestClasses(user, dateYmd);
+  const fromSchedule = scheduledClasses(user, dateYmd);
+  const seen = new Set();
+  const out = [];
+  for (const c of [...fromManifest, ...fromSchedule]) {
+    if (!c || !c.kind) continue;
+    const key = `${String(c.kind).toUpperCase()}|${c.primaryTime || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
+}
+
 async function sendTg(chatId, text, token) {
   const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
@@ -101,9 +132,9 @@ async function main() {
       console.log(`skip ${user.id}: no telegramChatId`);
       continue;
     }
-    const classes = scheduledClasses(user, dateYmd);
+    const classes = classesFor(user, dateYmd);
     if (classes.length === 0) {
-      console.log(`skip ${user.id}: no class scheduled on ${dayOfWeekFor(dateYmd)}`);
+      console.log(`skip ${user.id}: no class on ${dayOfWeekFor(dateYmd)} (no users.json schedule and no manifest entry)`);
       continue;
     }
 
@@ -180,7 +211,13 @@ async function main() {
   console.log(`state written: ${stateFile}`);
 }
 
-main().catch(e => {
-  console.error('FATAL:', e.message);
-  process.exit(1);
-});
+// Export the resolution helpers so the test suite can exercise the
+// schedule-vs-manifest precedence without spawning the full sender.
+module.exports = { scheduledClasses, manifestClasses, classesFor, dayOfWeekFor };
+
+if (require.main === module) {
+  main().catch(e => {
+    console.error('FATAL:', e.message);
+    process.exit(1);
+  });
+}

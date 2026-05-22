@@ -303,7 +303,21 @@ function isBookingInUpcoming(upcoming, { targetYmd, kind, time }) {
   return upcoming.some(b => b && b.ymd === targetYmd && b.kind === kind && b.time === time);
 }
 
+// True when api-direct booking_items failed with the Mindbody/Ragtag inventory
+// row INSERT race: parallel requests targeting the same class collide on the
+// `index_inventory_item_references_on_source_reference` unique index. On a
+// retry the row exists, the INSERT path is skipped, and the booking proceeds
+// normally (so long as the class still has a spot). Cheap to retry — the
+// alternative is a 30+s UI fallback that loses the spot anyway.
+function isInventoryRowRace(result) {
+  if (!result || result.ok) return false;
+  if (result.step !== 'booking_items') return false;
+  const body = String(result.body || '');
+  return /RecordNotUnique|UniqueViolation/i.test(body);
+}
+
 module.exports = {
+  isInventoryRowRace,
   DAY_SHORT,
   addDays,
   ymd,
