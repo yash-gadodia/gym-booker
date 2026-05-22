@@ -5,9 +5,15 @@
 
 set -uo pipefail
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNS_DIR="$REPO_DIR/runs"
 mkdir -p "$RUNS_DIR"
+
+# dotenv in wodup-daily-send.js reads .env from CWD, not __dirname. Without
+# this cd, launchd's CWD is `/` and the token lookup silently fails.
+cd "$REPO_DIR"
 
 # Open the log BEFORE any other commands so early-exit failures still leave
 # evidence. The previous version did date math + sourcing before exec>tee,

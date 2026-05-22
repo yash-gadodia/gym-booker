@@ -305,3 +305,31 @@ test('classesFor: returns [] when neither schedule nor manifest has the user', (
   const got = realSender.classesFor({ id: 'ghost', schedule: null }, FIXTURE_DATE);
   assert.deepEqual(got, []);
 });
+
+// ── run-wodup-daily.sh launchd safety pins ──
+// 2026-05-22 outage: launchd's stripped PATH meant `node` was not found,
+// AND the script never `cd`'d to the repo so dotenv could not locate .env.
+// Both manifested as a silent cron failure for the daily 19:00 SGT DMs.
+// These tests pin the script-level invariants so the regression can't recur.
+
+const runScriptPath = path.join(__dirname, 'run-wodup-daily.sh');
+const runScript = fs.readFileSync(runScriptPath, 'utf8');
+
+test('run-wodup-daily.sh: exports PATH including /opt/homebrew/bin (launchd strips it)', () => {
+  const pathLine = runScript.split('\n').find(l => /^\s*export\s+PATH=/.test(l));
+  assert.ok(pathLine, 'run-wodup-daily.sh must export PATH so launchd can find node');
+  assert.match(pathLine, /\/opt\/homebrew\/bin/, 'PATH must include /opt/homebrew/bin where node lives on Apple Silicon');
+});
+
+test('run-wodup-daily.sh: cd into repo before invoking node (dotenv reads .env from CWD)', () => {
+  const cdLine = runScript.split('\n').find(l => /^\s*cd\s+"?\$\{?REPO_DIR\}?"?/.test(l) || /^\s*cd\s+"?\$\{?HOME\}?\/gym-booker"?/.test(l));
+  assert.ok(cdLine, 'run-wodup-daily.sh must cd into repo dir before node calls (otherwise dotenv.config() finds no .env)');
+});
+
+test('com.voltade.gym-wodup-daily.plist: no literal ${VAR} env value (launchd does not expand)', () => {
+  const home = process.env.HOME || '/Users/yash';
+  const plistPath = path.join(home, 'Library', 'LaunchAgents', 'com.voltade.gym-wodup-daily.plist');
+  if (!fs.existsSync(plistPath)) return; // skip on machines that haven't installed the agent
+  const plist = fs.readFileSync(plistPath, 'utf8');
+  assert.doesNotMatch(plist, /\$\{[A-Z_]+\}/, 'plist must not contain literal ${VAR} placeholders — launchd does not expand them');
+});
