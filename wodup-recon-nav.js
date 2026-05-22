@@ -1,8 +1,13 @@
+require('dotenv').config();
 const { chromium } = require('playwright');
 const fs = require('fs');
 
-const WODUP_EMAIL = 'pirsquare.yash@gmail.com';
-const WODUP_PASSWORD = '***REMOVED-SEE-COMMIT-MSG***';
+const WODUP_EMAIL = process.env.WODUP_EMAIL || 'pirsquare.yash@gmail.com';
+const WODUP_PASSWORD = process.env.WODUP_PASSWORD;
+if (!WODUP_PASSWORD) {
+  console.error('WODUP_PASSWORD missing — set in .env (this file used to hardcode it, was leaked, scrubbed via filter-repo on 2026-05-22)');
+  process.exit(1);
+}
 
 async function main() {
   const browser = await chromium.launch({ headless: false });
