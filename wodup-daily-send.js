@@ -206,14 +206,41 @@ async function main() {
     }
   }
 
-  state.completed = true;
+  // Only mark completed when every booked (user, kind) pair has been sent.
+  // If the gym hasn't posted a workout for kind X yet (e.g. FIT after 19:00),
+  // we keep completed=false so the next launchd retry slot re-fetches and
+  // sends the missing DM as soon as the workout is published. Pinned by
+  // test-wodup.js: "isAllExpectedSent" suite.
+  state.completed = isAllExpectedSent(state, users, dateYmd);
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
-  console.log(`state written: ${stateFile}`);
+  if (state.completed) {
+    console.log(`state written: ${stateFile} (completed=true)`);
+  } else {
+    console.log(`state written: ${stateFile} (completed=false — missing workout(s), later cron will retry)`);
+  }
+}
+
+// True only if every booked user has a sentTo entry for every kind they're
+// booked for on dateYmd. Used to gate state.completed so launchd retries
+// keep running until all DMs land.
+function isAllExpectedSent(state, users, dateYmd) {
+  for (const user of users) {
+    if (!user || !user.telegramChatId) continue;
+    const classes = classesFor(user, dateYmd);
+    if (classes.length === 0) continue;
+    for (const cls of classes) {
+      const kind = (cls.kind || '').toUpperCase();
+      if (!kind) continue;
+      const sent = state && state.sentTo && state.sentTo[user.id] && state.sentTo[user.id][kind];
+      if (!sent) return false;
+    }
+  }
+  return true;
 }
 
 // Export the resolution helpers so the test suite can exercise the
 // schedule-vs-manifest precedence without spawning the full sender.
-module.exports = { scheduledClasses, manifestClasses, classesFor, dayOfWeekFor };
+module.exports = { scheduledClasses, manifestClasses, classesFor, dayOfWeekFor, isAllExpectedSent };
 
 if (require.main === module) {
   main().catch(e => {

@@ -326,6 +326,70 @@ test('run-wodup-daily.sh: cd into repo before invoking node (dotenv reads .env f
   assert.ok(cdLine, 'run-wodup-daily.sh must cd into repo dir before node calls (otherwise dotenv.config() finds no .env)');
 });
 
+// ── state.completed gating ──
+// 2026-05-24 outage: Yash's FIT 6:30am Mon-Fri DMs stopped landing because the
+// gym posts FIT workouts on Wodup AFTER 19:00 SGT. The 19:00 cron found no
+// FIT, skipped Yash's send, then unconditionally wrote completed=true.
+// Subsequent runs (had we even had them) would exit early via the bash
+// wrapper's completed-check. Fix: gate completed on "every booked (user,kind)
+// pair has a sentTo entry". These tests pin that contract.
+
+test('isAllExpectedSent: returns false when a booked user has unmatched kind', () => {
+  const date = '2099-02-10';
+  const manifestPath = path.join(__dirname, 'runs', `bookings-${date}.json`);
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, JSON.stringify({
+    date, updated: new Date().toISOString(), runId: 'test-fixture',
+    bookings: { yash: [{ kind: 'FIT', time: '6:30am' }] },
+  }));
+  const users = [{ id: 'yash', telegramChatId: 1, schedule: null }];
+  const stateEmpty = { sentTo: {} };
+  assert.equal(realSender.isAllExpectedSent(stateEmpty, users, date), false);
+  const stateSent = { sentTo: { yash: { FIT: { timestamp: 'now', messageId: 1 } } } };
+  assert.equal(realSender.isAllExpectedSent(stateSent, users, date), true);
+  try { fs.unlinkSync(manifestPath); } catch {}
+});
+
+test('isAllExpectedSent: ignores users with no class booked', () => {
+  const date = '2099-02-11';
+  const users = [
+    { id: 'yash', telegramChatId: 1, schedule: null },
+    { id: 'noclass', telegramChatId: 2, schedule: null },
+  ];
+  // No manifest, no schedule — both users have no booked class
+  const state = { sentTo: {} };
+  assert.equal(realSender.isAllExpectedSent(state, users, date), true);
+});
+
+test('isAllExpectedSent: returns false until every kind for a multi-kind user is sent', () => {
+  const date = '2099-02-12';
+  const manifestPath = path.join(__dirname, 'runs', `bookings-${date}.json`);
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, JSON.stringify({
+    date, updated: new Date().toISOString(), runId: 'test-fixture',
+    bookings: { melissa: [{ kind: 'BURN', time: '6:30pm' }, { kind: 'FIT', time: '7:30pm' }] },
+  }));
+  const users = [{ id: 'melissa', telegramChatId: 1, schedule: null }];
+  const partial = { sentTo: { melissa: { BURN: { timestamp: 'now', messageId: 1 } } } };
+  assert.equal(realSender.isAllExpectedSent(partial, users, date), false);
+  const full = { sentTo: { melissa: { BURN: { messageId: 1 }, FIT: { messageId: 2 } } } };
+  assert.equal(realSender.isAllExpectedSent(full, users, date), true);
+  try { fs.unlinkSync(manifestPath); } catch {}
+});
+
+test('com.voltade.gym-wodup-daily.plist: has retry slots 20:00–23:00 (not just 19:00)', () => {
+  const home = process.env.HOME || '/Users/yash';
+  const plistPath = path.join(home, 'Library', 'LaunchAgents', 'com.voltade.gym-wodup-daily.plist');
+  if (!fs.existsSync(plistPath)) return; // skip on machines without the agent installed
+  const plist = fs.readFileSync(plistPath, 'utf8');
+  // launchd needs <array> wrapper for multiple StartCalendarInterval entries
+  assert.match(plist, /<key>StartCalendarInterval<\/key>\s*<array>/, 'plist must use <array> form so multiple hourly retries fire');
+  for (const hour of [19, 20, 21, 22, 23]) {
+    const rx = new RegExp(`<integer>${hour}</integer>`);
+    assert.match(plist, rx, `plist must include hour ${hour} retry slot (gym posts FIT after 19:00 some nights)`);
+  }
+});
+
 test('com.voltade.gym-wodup-daily.plist: no literal ${VAR} env value (launchd does not expand)', () => {
   const home = process.env.HOME || '/Users/yash';
   const plistPath = path.join(home, 'Library', 'LaunchAgents', 'com.voltade.gym-wodup-daily.plist');
