@@ -10,7 +10,10 @@ const fs = require('fs');
 // 2026-05-13 (Yash had FIT 6:30am on May 14 AND May 15; the old timeMatch &&
 // (dayMatch || kindMatch) logic grabbed the wrong card).
 function matchCancelCard(flat, { dayOfMonth, kindArg, timeArg }) {
-  const dayMatch = new RegExp(`\\b${dayOfMonth}\\b`).test(flat);
+  // Mindbody renders the day-of-month zero-padded ("03 Wednesday June"), so a
+  // bare `\b3\b` never matches days 1-9 (no word boundary between "0" and "3").
+  // Allow an optional leading zero so single-digit days cancel correctly.
+  const dayMatch = new RegExp(`\\b0?${dayOfMonth}\\b`).test(flat);
   // Word-boundary kindMatch: `/FIT/i` would falsely match the FIT inside
   // "CROSSFIT®". `/\bFIT\b/i` only hits the standalone class label.
   // Escape any regex meta chars in kindArg first (e.g. "Open Gym" has space).
