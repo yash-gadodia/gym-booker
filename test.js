@@ -1125,6 +1125,56 @@ test('resolveBookingsForDate: per-date override → single plan (back-to-back no
   assert.deepEqual(r, { plans: [{ kind: 'FIT', primaryTime: '8:00pm', fallback: null }]});
 });
 
+test('resolveBookingsForDate: per-date ARRAY override → multiple plans (double-booking)', () => {
+  // Sun 2026-06-07: 8:30am Lift + 9:30am Steam, replacing the Gymnastics default
+  const overrides = { users: { yash: { perDate: { '2026-06-07': [
+    { time: '8:30am', kind: 'Lift' },
+    { time: '9:30am', kind: 'Steam' },
+  ] } } } };
+  const r = resolveBookingsForDate(new Date('2026-06-07T00:00:00'), 'yash', null, overrides);
+  assert.deepEqual(r, { plans: [
+    { kind: 'Lift', primaryTime: '8:30am', fallback: null },
+    { kind: 'Steam', primaryTime: '9:30am', fallback: null },
+  ]});
+});
+
+test('resolveBookingsForDate: array entry missing kind defaults to DOW kind', () => {
+  const overrides = { users: { yash: { perDate: { '2026-06-07': [{ time: '8:30am' }] } } } };
+  const r = resolveBookingsForDate(new Date('2026-06-07T00:00:00'), 'yash', null, overrides);
+  assert.deepEqual(r, { plans: [{ kind: 'Gymnastics', primaryTime: '8:30am', fallback: null }]});
+});
+
+test('resolveBookingsForDate: empty per-date array → date_skip', () => {
+  const overrides = { users: { yash: { perDate: { '2026-06-07': [] } } } };
+  const r = resolveBookingsForDate(new Date('2026-06-07T00:00:00'), 'yash', null, overrides);
+  assert.deepEqual(r, { skip: 'date_skip' });
+});
+
+test('resolveBookingForDate (singular): per-date array collapses to first class', () => {
+  const overrides = { users: { yash: { perDate: { '2026-06-07': [
+    { time: '8:30am', kind: 'Lift' },
+    { time: '9:30am', kind: 'Steam' },
+  ] } } } };
+  const r = resolveBookingForDate(new Date('2026-06-07T00:00:00'), 'yash', null, overrides);
+  assert.deepEqual(r, { kind: 'Lift', primaryTime: '8:30am', fallback: null });
+});
+
+test('parseBookingCard: recognizes a Steam class', () => {
+  const card = '07 Sunday June, 2026 Steam Room RagTag 9:30am (30 min) Cancel +CALENDAR';
+  const r = parseBookingCard(card);
+  assert.equal(r.kind, 'Steam');
+  assert.equal(r.time, '9:30am');
+  assert.equal(r.ymd, '2026-06-07');
+});
+
+test('rowMatches: Steam matches a Steam row at the target time', () => {
+  assert.equal(rowMatches('Steam Room 9:30am (30 min) BOOK NOW', { kind: 'Steam', time: '9:30am' }), true);
+});
+
+test('rowMatches: Steam rejects a non-Steam row at the same time', () => {
+  assert.equal(rowMatches('CROSSFIT® FIT 9:30am (60 min) BOOK NOW', { kind: 'Steam', time: '9:30am' }), false);
+});
+
 test('resolveBookingsForDate: per-date null on back-to-back day → date_skip (cancels both)', () => {
   const sched = { Mon: [
     { kind: 'BURN', primaryTime: '6:30pm' },

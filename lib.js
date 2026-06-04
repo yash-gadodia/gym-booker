@@ -88,10 +88,15 @@ function resolveBookingForDate(targetDate, userKey, userScheduleOverride, dateOv
     const entry = perDate[target];
     if (entry === null) return { skip: 'date_skip' };
     if (entry && typeof entry === 'object') {
+      // Singular resolver: an array per-date override (double-booking) collapses
+      // to its first class, mirroring resolveSchedule. Plural callers (book.js)
+      // get every class via resolveBookingsForDate.
       const dowDefault = classPlan(targetDate);
+      const first = Array.isArray(entry) ? entry[0] : entry;
+      if (!first) return { skip: 'date_skip' };
       return {
-        kind: entry.kind || dowDefault.kind,
-        primaryTime: entry.time || dowDefault.primaryTime,
+        kind: first.kind || dowDefault.kind,
+        primaryTime: first.time || first.primaryTime || dowDefault.primaryTime,
         fallback: null,
       };
     }
@@ -122,13 +127,18 @@ function resolveBookingsForDate(targetDate, userKey, userScheduleOverride, dateO
     const entry = perDate[target];
     if (entry === null) return { skip: 'date_skip' };
     if (entry && typeof entry === 'object') {
+      // A per-date override is a single class {time,kind} OR an array of them
+      // for a double-booking (e.g. 8:30am Lift + 9:30am Steam). Either way it
+      // fully replaces the day's baseline.
       const dowDefault = classPlan(targetDate);
+      const arr = Array.isArray(entry) ? entry : [entry];
+      if (arr.length === 0) return { skip: 'date_skip' };
       return {
-        plans: [{
-          kind: entry.kind || dowDefault.kind,
-          primaryTime: entry.time || dowDefault.primaryTime,
+        plans: arr.map(e => ({
+          kind: e.kind || dowDefault.kind,
+          primaryTime: e.time || e.primaryTime || dowDefault.primaryTime,
           fallback: null,
-        }],
+        })),
       };
     }
   }
@@ -157,6 +167,9 @@ function rowMatches(text, { kind, time }) {
     if (!/\bBurn\b/i.test(t)) return false;
     if (/CROSSFIT®\s*(FIT|Lift|Gymnastics|Foundations)\b/i.test(t)) return false;
   }
+  // Steam has no kind-specific text gate elsewhere; require the row to actually
+  // say "Steam" so a same-time class can't be latched by mistake.
+  if (kind === 'Steam' && !/steam/i.test(t)) return false;
   const [hhmm, ap] = time.split(/(am|pm)/i);
   const timeRe = new RegExp(`${hhmm.trim().replace(':','\\:')}\\s*${ap}`, 'i');
   return timeRe.test(t);
@@ -286,6 +299,7 @@ function parseBookingCard(text) {
              : /CROSSFIT®\s*Lift\b/i.test(flat) ? 'Lift'
              : /\bBurn\b/i.test(flat) ? 'BURN'
              : /Open Gym/i.test(flat) ? 'Open Gym'
+             : /\bSteam\b/i.test(flat) ? 'Steam'
              : null;
   if (!dayM || !monthM || !timeM || !kind) return null;
   const dom = parseInt(dayM[1], 10);
