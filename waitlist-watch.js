@@ -166,6 +166,10 @@ async function main() {
 
   const target = new Date(`${dateArg}T00:00:00`);
   const plan = classPlan(target);
+  // Allow caller to override the class kind (e.g. Sat 9:30am FIT, not default Sat Gymnastics).
+  if (process.env.WAITLIST_KIND) {
+    plan.kind = process.env.WAITLIST_KIND;
+  }
   const watchId = `${dateArg}_${timeArg.replace(':', '')}`;
   const stateFile = path.join(__dirname, 'runs', `waitlist-state-${watchId}.json`);
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
