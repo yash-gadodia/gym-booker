@@ -14,11 +14,17 @@ WATCH_TIME="${WAITLIST_TIME:-6:30am}"
 # Recipient(s) for the alert: Dani (80151943). Override TELEGRAM_CHAT_ID
 # so the alert routes to her instead of Yash. Comma-separated supported.
 export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-80151943}"
-export WAITLIST_NAME="${WAITLIST_NAME:-Dani}"
 
-# Use Dani's auth so the API status reflects what *she* would see (Yash's
-# auth would return "Booked" for this class, masking the public capacity).
+# Use the watched user's auth so the API status reflects what *they* would see
+# (Yash's auth would return "Booked" for this class, masking public capacity).
 export WAITLIST_USER="${WAITLIST_USER:-dani}"
+
+# Greeting name: derive from the watched user's label in users.json. An empty
+# WAITLIST_NAME used to fall back to a hardcoded "Dani", mislabeling every other
+# user's watch (Geraldine's 7:30 alert showed up addressed to "Dani").
+if [ -z "${WAITLIST_NAME:-}" ]; then
+  export WAITLIST_NAME="$(node -e "try{const u=require('$HOME/gym-booker/users.json').users;const m=u.find(x=>x.id===process.env.WAITLIST_USER);process.stdout.write((m&&m.label)?m.label:'');}catch(e){process.stdout.write('');}")"
+fi
 
 WATCH_ID="${WATCH_DATE}_${WATCH_TIME/:/}"
 # Each instance self-unloads its OWN plist. Defaults to the original single-watcher
