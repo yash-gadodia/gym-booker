@@ -8,6 +8,7 @@ const {
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, isInventoryRowRace,
+  navRetryPlan, canRetrySetup,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
 } = require('./lib');
@@ -64,6 +65,29 @@ async function snap(page, name) {
   const p = path.join(RUN_DIR, `${String(Date.now()).slice(-8)}-${name}.png`);
   try { await page.screenshot({ path: p, fullPage: true }); log(`snap ${name}`); } catch (e) { log('snap err', name, e.message); }
   return p;
+}
+
+// Navigate with bounded retries instead of one monolithic 30s goto. The
+// 2026-06-06 wipeout: all 5 users died on the first page.goto when a load spike
+// (5 Chromium cold-starts at once) made the nav time out at 30s, and the run
+// had no budget left to recover. navRetryPlan sizes the attempts to the time
+// left before the 9am sprint, so a transient blip is absorbed in a couple
+// seconds while a genuinely-dead network still fails fast enough to alert.
+async function gotoWithRetry(page, url, msRemaining = null, label = 'nav') {
+  const { attempts, perAttemptMs, backoffMs } = navRetryPlan(msRemaining, { noWait });
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: perAttemptMs });
+      if (i > 1) log(`${label}: goto recovered on attempt ${i}/${attempts}`);
+      return;
+    } catch (e) {
+      lastErr = e;
+      log(`${label}: goto attempt ${i}/${attempts} failed (${String(e.message).split('\n')[0].slice(0, 90)})`);
+      if (i < attempts) await page.waitForTimeout(backoffMs);
+    }
+  }
+  throw lastErr;
 }
 
 // Interactive test modes (--dry-run / --now) skip telegram — otherwise every
@@ -950,7 +974,7 @@ async function attemptFallbackBooking(page, plan, target) {
 
     if (simulateSetupFail) throw new Error('synthetic setup failure for alert testing (--simulate-setup-fail)');
     log('navigating to ragtag');
-    await localPage.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await gotoWithRetry(localPage, GYM_URL, t9.getTime() - Date.now(), 'ragtag');
     await localPage.waitForTimeout(2500);
     await dismissCookieBanner(localPage);
     await snap(localPage, 'landed');
@@ -961,7 +985,7 @@ async function attemptFallbackBooking(page, plan, target) {
       await snap(localPage, 'logged-out');
       await loginAndSave(localPage, localCtx, authPath);
       log('AUTH: re-navigating to ragtag after login');
-      await localPage.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await gotoWithRetry(localPage, GYM_URL, t9.getTime() - Date.now(), 'post-login');
       await localPage.waitForTimeout(2500);
       await dismissCookieBanner(localPage);
       await snap(localPage, 'post-relogin');
@@ -983,7 +1007,7 @@ async function attemptFallbackBooking(page, plan, target) {
         log(`my-schedule pre-flight failed (${e.message.slice(0,120)}) — continuing without guard`);
       }
       // Re-land on ragtag for the rest of the flow.
-      await localPage.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await gotoWithRetry(localPage, GYM_URL, t9.getTime() - Date.now(), 'reland');
       await localPage.waitForTimeout(2000);
       await dismissCookieBanner(localPage);
     }
@@ -1010,7 +1034,7 @@ async function attemptFallbackBooking(page, plan, target) {
       browser = null; ctx = null; page = null;
       setupError = e;
       const msRemaining = t9.getTime() - Date.now();
-      const canRetry = attempt < MAX_SETUP_ATTEMPTS && (noWait || msRemaining > 75000);
+      const canRetry = canRetrySetup({ attempt, maxAttempts: MAX_SETUP_ATTEMPTS, msRemaining, marginMs: 75000, noWait });
       if (canRetry) {
         log(`SETUP RETRY: ${msRemaining}ms to 9am, relaunching fresh browser (attempt ${attempt + 1}/${MAX_SETUP_ATTEMPTS})`);
         continue;

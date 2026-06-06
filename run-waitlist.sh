@@ -21,7 +21,10 @@ export WAITLIST_NAME="${WAITLIST_NAME:-Dani}"
 export WAITLIST_USER="${WAITLIST_USER:-dani}"
 
 WATCH_ID="${WATCH_DATE}_${WATCH_TIME/:/}"
-PLIST="${HOME}/Library/LaunchAgents/com.voltade.gym-waitlist.plist"
+# Each instance self-unloads its OWN plist. Defaults to the original single-watcher
+# label for back-compat; multi-slot plists pass WAITLIST_PLIST_LABEL.
+PLIST_LABEL="${WAITLIST_PLIST_LABEL:-com.voltade.gym-waitlist}"
+PLIST="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
 STATE_FILE="${HOME}/gym-booker/runs/waitlist-state-${WATCH_ID}.json"
 LOG_FILE="${HOME}/gym-booker/runs/waitlist-launchd.log"
 

@@ -330,8 +330,48 @@ function isInventoryRowRace(result) {
   return /RecordNotUnique|UniqueViolation/i.test(body);
 }
 
+// ── Resilience helpers (2026-06-06 mass-failure incident) ───────────────────
+// At 08:57 all 5 users died on the first page.goto: 5 parallel Chromium
+// cold-starts thrashed the Mac Mini (~58s just to launch the browser), then the
+// nav itself timed out at 30s. With the run firing only ~160s before the 09:00
+// sprint, the setup-retry was skipped (71s left < 75s margin) and everyone
+// missed. These three pure helpers encode the fix and are unit-tested.
+
+// Stagger N parallel child spawns so their Chromium cold-starts don't collide.
+// Linear step, capped. Each child independently busy-waits to 09:00:00.000, so
+// spreading setup out costs nothing at booking time.
+function spawnStaggerMs(index, stepMs = 1500, capMs = 12000) {
+  if (!(index > 0)) return 0;
+  return Math.min(Math.round(index * stepMs), capMs);
+}
+
+// Decide the navigation retry budget given ms remaining to the 9am sprint.
+// One monolithic 30s goto turns a 2-second blip into a total miss; several
+// short attempts absorb it. When time is tight we shrink to fail fast so the
+// caller can still alert before 09:00. noWait (manual --now / tests) has no
+// deadline, so use the full budget.
+function navRetryPlan(msRemaining, { noWait = false, perAttemptMs = 15000, maxAttempts = 3, backoffMs = 1000, reserveMs = 8000 } = {}) {
+  if (noWait || msRemaining == null) return { attempts: maxAttempts, perAttemptMs, backoffMs };
+  const usable = Math.max(0, msRemaining - reserveMs);
+  const fit = Math.floor(usable / perAttemptMs);
+  const attempts = Math.max(1, Math.min(maxAttempts, fit));
+  return { attempts, perAttemptMs, backoffMs };
+}
+
+// Whether the outer setup loop (relaunch browser + fresh login, ~60s) should
+// retry after a setup failure. noWait has no deadline. Otherwise we need enough
+// headroom (marginMs) to redo setup AND still book before 09:00 — below that we
+// fail fast so Yash gets alerted instead of a silent miss past the deadline.
+function canRetrySetup({ attempt, maxAttempts, msRemaining, marginMs = 75000, noWait = false }) {
+  if (attempt >= maxAttempts) return false;
+  return noWait || msRemaining > marginMs;
+}
+
 module.exports = {
   isInventoryRowRace,
+  spawnStaggerMs,
+  navRetryPlan,
+  canRetrySetup,
   DAY_SHORT,
   addDays,
   ymd,

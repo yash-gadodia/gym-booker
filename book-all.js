@@ -20,7 +20,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { loadUsers } = require('./users');
-const { buildDailySummary, sendYashAlert } = require('./lib');
+const { buildDailySummary, sendYashAlert, spawnStaggerMs } = require('./lib');
 
 const NODE_BIN = process.execPath;
 const BOOK_JS = path.join(__dirname, 'book.js');
@@ -74,10 +74,19 @@ function stripFlag(args, name) {
   const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'booker-results-'));
   const resultPathFor = (id) => path.join(resultsDir, `${id}.json`);
 
-  const children = filtered.map(r => {
+  // Stagger the spawns so 5 Chromium cold-starts don't hit the host at the same
+  // instant — the 2026-06-06 wipeout was all 5 browsers launching together,
+  // thrashing the Mac Mini into a 58s startup that blew the 9am budget. Each
+  // child still busy-waits to 09:00:00.000, so spreading setup costs nothing at
+  // booking time. ~1.5s steps, capped (negligible vs the ~180s pre-9am budget).
+  const children = [];
+  for (let i = 0; i < filtered.length; i++) {
+    const r = filtered[i];
+    const stagger = spawnStaggerMs(i);
+    if (stagger > 0) await new Promise(res => setTimeout(res, stagger));
     const childArgs = [...r.bookArgs, ...args];
     const tag = `[${r.id}]`;
-    console.log(`${tag} spawn: node book.js ${childArgs.join(' ')}`);
+    console.log(`${tag} spawn (+${stagger}ms): node book.js ${childArgs.join(' ')}`);
     const proc = spawn(NODE_BIN, [BOOK_JS, ...childArgs], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, BOOKER_RESULT_FILE: resultPathFor(r.id) },
@@ -98,8 +107,8 @@ function stripFlag(args, name) {
     tagStream(proc.stdout, process.stdout);
     tagStream(proc.stderr, process.stderr);
     const done = new Promise(resolve => proc.on('exit', code => resolve({ id: r.id, label: r.label, code })));
-    return { proc, done };
-  });
+    children.push({ proc, done });
+  }
 
   const results = await Promise.all(children.map(c => c.done));
   const failed = results.filter(r => r.code !== 0);

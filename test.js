@@ -10,6 +10,7 @@ const {
   timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming,
+  spawnStaggerMs, navRetryPlan, canRetrySetup,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
 } = require('./lib');
@@ -2674,4 +2675,77 @@ test('isInventoryRowRace: null/undefined-safe', () => {
   assert.equal(isInventoryRowRace(undefined), false);
   assert.equal(isInventoryRowRace({}), false);
   assert.equal(isInventoryRowRace({ ok: false, step: 'booking_items' }), false);
+});
+
+// ── 2026-06-06 mass-failure resilience (spawnStaggerMs / navRetryPlan / canRetrySetup) ──
+// Incident: all 5 users died on the first page.goto at 08:57. Root cause chain:
+// (1) 5 Chromium cold-starts at once thrashed the Mini → 58s browser launch,
+// (2) one monolithic 30s goto timed out, (3) the setup-retry was skipped because
+// only 71125ms remained, below the 75000ms margin. These lock in each link's fix.
+
+test('spawnStaggerMs: first child starts immediately', () => {
+  assert.equal(spawnStaggerMs(0), 0);
+});
+
+test('spawnStaggerMs: linear 1.5s steps so cold-starts do not collide', () => {
+  assert.equal(spawnStaggerMs(1), 1500);
+  assert.equal(spawnStaggerMs(2), 3000);
+  assert.equal(spawnStaggerMs(3), 4500);
+  assert.equal(spawnStaggerMs(4), 6000);
+});
+
+test('spawnStaggerMs: caps so the last child still starts well before 9am', () => {
+  assert.equal(spawnStaggerMs(100), 12000);       // 100*1500 would be 150s; capped
+  assert.equal(spawnStaggerMs(10, 1500, 5000), 5000);
+});
+
+test('spawnStaggerMs: custom step + defensive on non-positive index', () => {
+  assert.equal(spawnStaggerMs(2, 1000), 2000);
+  assert.equal(spawnStaggerMs(-1), 0);
+  assert.equal(spawnStaggerMs(NaN), 0);
+});
+
+test('navRetryPlan: ample budget allows the full 3 attempts', () => {
+  const p = navRetryPlan(60000);
+  assert.equal(p.attempts, 3);          // (60000-8000)/15000 = 3.46 -> 3
+  assert.equal(p.perAttemptMs, 15000);
+  assert.equal(p.backoffMs, 1000);
+});
+
+test('navRetryPlan: shrinks attempts when time is tight (fail fast to alert)', () => {
+  assert.equal(navRetryPlan(40000).attempts, 2);   // (40000-8000)/15000 = 2.13 -> 2
+  assert.equal(navRetryPlan(23000).attempts, 1);   // (23000-8000)/15000 = 1.0  -> 1
+  assert.equal(navRetryPlan(20000).attempts, 1);   // (20000-8000)/15000 = 0.8  -> floored to 0 -> min 1
+  assert.equal(navRetryPlan(8000).attempts, 1);    // no usable budget -> still try once
+});
+
+test('navRetryPlan: noWait (manual --now / tests) ignores the deadline', () => {
+  assert.equal(navRetryPlan(1000, { noWait: true }).attempts, 3);
+  assert.equal(navRetryPlan(null).attempts, 3);    // unknown budget -> full retries
+});
+
+test('canRetrySetup: REPRODUCES the 2026-06-06 skip (71125ms < 75000 margin)', () => {
+  // The exact numbers from the incident log: setup attempt 1/2, 71125ms to 9am.
+  assert.equal(
+    canRetrySetup({ attempt: 1, maxAttempts: 2, msRemaining: 71125, marginMs: 75000, noWait: false }),
+    false,
+  );
+});
+
+test('canRetrySetup: with adequate budget the retry now fires', () => {
+  // Same failure, but the run started earlier / setup was faster -> headroom left.
+  assert.equal(
+    canRetrySetup({ attempt: 1, maxAttempts: 2, msRemaining: 120000, marginMs: 75000, noWait: false }),
+    true,
+  );
+});
+
+test('canRetrySetup: noWait always retries; no retries left at max attempt', () => {
+  assert.equal(canRetrySetup({ attempt: 1, maxAttempts: 2, msRemaining: 1000, marginMs: 75000, noWait: true }), true);
+  assert.equal(canRetrySetup({ attempt: 2, maxAttempts: 2, msRemaining: 999999, marginMs: 75000, noWait: false }), false);
+});
+
+test('canRetrySetup: margin is strict (> not >=)', () => {
+  assert.equal(canRetrySetup({ attempt: 1, maxAttempts: 2, msRemaining: 75000, marginMs: 75000, noWait: false }), false);
+  assert.equal(canRetrySetup({ attempt: 1, maxAttempts: 2, msRemaining: 75001, marginMs: 75000, noWait: false }), true);
 });
