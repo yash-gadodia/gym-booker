@@ -26,7 +26,13 @@ if [ -z "${WAITLIST_NAME:-}" ]; then
   export WAITLIST_NAME="$(node -e "try{const u=require('$HOME/gym-booker/users.json').users;const m=u.find(x=>x.id===process.env.WAITLIST_USER);process.stdout.write((m&&m.label)?m.label:'');}catch(e){process.stdout.write('');}")"
 fi
 
-WATCH_ID="${WATCH_DATE}_${WATCH_TIME/:/}"
+# Mirror waitlist-watch.js: per-user state id when WAITLIST_USER is set, so two
+# users watching the same slot don't share (and clobber) one state file.
+if [ -n "${WAITLIST_USER:-}" ]; then
+  WATCH_ID="${WATCH_DATE}_${WATCH_TIME/:/}-${WAITLIST_USER}"
+else
+  WATCH_ID="${WATCH_DATE}_${WATCH_TIME/:/}"
+fi
 # Each instance self-unloads its OWN plist. Defaults to the original single-watcher
 # label for back-compat; multi-slot plists pass WAITLIST_PLIST_LABEL.
 PLIST_LABEL="${WAITLIST_PLIST_LABEL:-com.voltade.gym-waitlist}"

@@ -575,3 +575,171 @@ Object.assign(module.exports, {
   buildDailySummary,
   sendYashAlert,
 });
+
+// ── Failure diagnosis + auto-enroll into the waitlist watcher ────────────────
+// When the daily booker fails for a user, book-all.js asks classifyBookingFailure
+// what went wrong and whether it's worth auto-arming the waitlist watcher for
+// that person. Pure (status in → verdict out) so it's fully unit-testable; the
+// 2026-06-07 Geraldine miss surfaced as `exception: could not click
+// Classes/Schedule tab` (an api-direct pass-fetch miss masked by a fragile
+// pre-window UI fallback), which lands in the `infra` bucket → autoWatch.
+//
+// status = { ok, reason, detail, time }. We read BOTH reason and detail because
+// FULL arrives as detail ("FIT FULL (primary and fallback)") off a thrown error
+// whose reason is the generic "exception".
+function classifyBookingFailure(status) {
+  if (status && status.ok) return { category: 'ok', cause: 'booked', autoWatch: false };
+  const reason = String((status && status.reason) || '').toLowerCase();
+  const detail = String((status && status.detail) || '').toLowerCase();
+  const blob = `${reason} ${detail}`;
+
+  // Class full / waitlist-only — lost the 09:00 race. A cancellation may free a
+  // slot, which is exactly what the watcher is for.
+  if (/\bfull\b|max capacity|on waitlist|waitlist required|waitlist — manual/.test(blob)) {
+    return { category: 'full', cause: 'Class was full by 09:00 (lost the booking race).', autoWatch: true };
+  }
+  // No eligible pass at booking time. Either a pre-window timing artifact (the
+  // eligible-pass list had not populated when we fetched it pre-09:00) or the
+  // user is low on class credits. Watch either way; the DM hints to check passes.
+  if (reason === 'pass-fetch-failed' || /no eligible pass/.test(blob)) {
+    return { category: 'no_pass', cause: 'No eligible class pass at booking time (pre-window timing, or low on class credits).', autoWatch: true };
+  }
+  // Class never appeared on the schedule — nothing for a watcher to poll.
+  if (reason === 'class-not-found' || /not in schedule|row disappeared|no .* row found/.test(blob)) {
+    return { category: 'not_found', cause: 'Target class was not on the schedule.', autoWatch: false };
+  }
+  // Login / token capture failed — the watcher shares the same auth and would
+  // hit the same wall, so route to a fix rather than a watch.
+  if (/\bauth\b|login|bearer-capture|logged out|sign in/.test(blob)) {
+    return { category: 'auth', cause: 'Login/auth failed before booking could run.', autoWatch: false };
+  }
+  // Everything else: the automation broke (tab-click, pipeline, timeout,
+  // unverified, generic exception, no-result-file). The class may well have
+  // been bookable, so arm a watch as a safety net — if the user actually did
+  // get in, the watcher detects the existing booking and self-unloads.
+  const shortDetail = String((status && status.detail) || (status && status.reason) || 'unknown')
+    .replace(/\s+/g, ' ').trim().slice(0, 120);
+  return { category: 'infra', cause: `Booking automation error: ${shortDetail}`, autoWatch: true };
+}
+
+// ── Waitlist watch registry (pure helpers) ──────────────────────────────────
+// The registry is a JSON file ({ updated, watches: [...] }); waitlist-registry.js
+// fans waitlist-watch.js out over each active entry, mirroring how book-all.js
+// fans book.js out. These helpers operate on the bare `watches` array so they
+// stay pure and testable. Entry shape:
+//   { user, name, date, time, kind, chatIds, source, reason, addedAt }
+function parseClockToMinutes(t) {
+  const m = /^(\d{1,2}):(\d{2})\s*(am|pm)$/i.exec(String(t || '').trim());
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const mins = parseInt(m[2], 10);
+  const ap = m[3].toLowerCase();
+  if (ap === 'pm' && h !== 12) h += 12;
+  if (ap === 'am' && h === 12) h = 0;
+  return h * 60 + mins;
+}
+
+// SGT class-start epoch ms. Built from an explicit +08:00 offset so it is
+// timezone-independent (works the same on the SGT Mac Mini and in CI).
+function classStartMs(date, time) {
+  const mins = parseClockToMinutes(time);
+  if (mins == null || !/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) return null;
+  const hh = String(Math.floor(mins / 60)).padStart(2, '0');
+  const mm = String(mins % 60).padStart(2, '0');
+  const t = new Date(`${date}T${hh}:${mm}:00+08:00`).getTime();
+  return Number.isNaN(t) ? null : t;
+}
+
+// Dedupe key: one watch per (user, date, time, kind), normalized.
+function watchRegistryKey(w) {
+  return [
+    String((w && w.user) || '').toLowerCase(),
+    String((w && w.date) || ''),
+    String((w && w.time) || '').replace(/\s+/g, '').toLowerCase(),
+    String((w && w.kind) || '').toUpperCase(),
+  ].join('|');
+}
+
+// Add or refresh an entry. Returns a NEW array (does not mutate). Re-enrolling
+// the same slot replaces the prior entry (so addedAt/reason/chatIds refresh)
+// rather than duplicating it.
+function upsertWatch(watches, entry) {
+  const key = watchRegistryKey(entry);
+  const out = (watches || []).filter(w => watchRegistryKey(w) !== key);
+  out.push(entry);
+  return out;
+}
+
+// Drop entries whose class has already started (or are malformed). nowMs is the
+// current epoch ms. Returns a NEW array.
+function pruneWatchRegistry(watches, nowMs) {
+  return (watches || []).filter(w => {
+    const startMs = classStartMs(w && w.date, w && w.time);
+    if (startMs == null) return false;
+    return startMs > nowMs;
+  });
+}
+
+// Turn the daily booker's per-user run results into watch-registry entries for
+// every failed plan that classifyBookingFailure says is worth watching, skipping
+// classes that have already started. Pure: nowMs / nowIso / yashChatId are
+// injected so book-all stays thin and this is unit-testable.
+//   runs: [{ id, user:{label}, targetYmd, results:[{plan,status}] }]
+function buildWatchCandidates(runs, { usersById = {}, nowMs = null, yashChatId = null, nowIso = null } = {}) {
+  const out = [];
+  for (const run of runs || []) {
+    if (!run || !run.targetYmd || !Array.isArray(run.results)) continue;
+    for (const res of run.results) {
+      const status = (res && res.status) || {};
+      if (status.ok) continue;
+      const verdict = classifyBookingFailure(status);
+      if (!verdict.autoWatch) continue;
+      const time = (res.plan && res.plan.primaryTime) || status.time;
+      const kind = res.plan && res.plan.kind;
+      if (!time || !kind) continue;
+      const startMs = classStartMs(run.targetYmd, time);
+      if (startMs == null || (nowMs != null && startMs <= nowMs)) continue;
+      const u = usersById[run.id] || {};
+      const chatIds = [...new Set([u.telegramChatId, yashChatId].filter(Boolean).map(String))];
+      out.push({
+        user: run.id,
+        name: (run.user && run.user.label) || u.label || run.id,
+        date: run.targetYmd,
+        time,
+        kind,
+        chatIds: chatIds.join(','),
+        source: 'auto-enroll',
+        reason: verdict.category,
+        cause: verdict.cause,
+        addedAt: nowIso,
+      });
+    }
+  }
+  return out;
+}
+
+// ── Pre-window pass-fetch recovery (Geraldine root-cause fix, 2026-06-07) ────
+// api-direct pre-fetches the payment pass BEFORE the 09:00 booking window opens.
+// On 2026-06-07 Geraldine's eligible-pass list was empty at 08:59 ("Outside
+// booking window") while Dani's populated, so her api-direct bailed with
+// `pass-fetch-failed` and fell into a fragile pre-window UI flow that then threw
+// on the schedule tab. The window opens at 09:00 regardless, so the right move
+// when the pass-fetch misses pre-window is to WAIT for the window and retry the
+// fetch once (the list usually populates), rather than abandon the fast path.
+// Pure so book.js can unit-test the decision without Playwright/clock.
+function shouldRetryPassFetchPreWindow(passResult, msToNine, waitEnabled) {
+  if (!waitEnabled) return false;
+  if (!passResult || passResult.reason !== 'pass-fetch-failed') return false;
+  return msToNine > 0;
+}
+
+Object.assign(module.exports, {
+  classifyBookingFailure,
+  parseClockToMinutes,
+  classStartMs,
+  watchRegistryKey,
+  upsertWatch,
+  pruneWatchRegistry,
+  buildWatchCandidates,
+  shouldRetryPassFetchPreWindow,
+});

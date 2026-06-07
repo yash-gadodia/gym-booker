@@ -8,7 +8,7 @@ const {
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, isInventoryRowRace,
-  navRetryPlan, canRetrySetup,
+  navRetryPlan, canRetrySetup, shouldRetryPassFetchPreWindow,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
 } = require('./lib');
@@ -586,11 +586,38 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
   }
   log(`api-direct: class mb_class_id=${classMeta.mb_class_id} schedule_id=${classMeta.mb_class_schedule_id} status=${classMeta.statusText}`);
 
-  // 3. Pre-fetch payment pass.
+  // 3. Pre-fetch payment pass. If the eligible-pass list misses BEFORE the
+  //    booking window opens (Geraldine, 2026-06-07: empty list at 08:59 while
+  //    Dani's populated, status "Outside booking window"), do NOT bail to the
+  //    fragile pre-window UI fallback — wait for 09:00 and retry the fetch once.
+  //    The list typically populates when the window opens; if it still misses
+  //    we return pass-fetch-failed AFTER 9am so any fallback sees an open window.
   log('api-direct: fetching payment pass UUID');
   let paymentMethodUuid;
+  let passErr = null;
   try { paymentMethodUuid = await fetchPaymentPassUuid(bearer, classMeta); }
-  catch (e) { return { ok: false, reason: 'pass-fetch-failed', detail: e.message, time: plan.primaryTime }; }
+  catch (e) { passErr = e; }
+
+  if (passErr && shouldRetryPassFetchPreWindow({ reason: 'pass-fetch-failed' }, t9.getTime() - Date.now(), !noWait)) {
+    const ms = t9.getTime() - Date.now();
+    log(`api-direct: pass-fetch missed pre-window (${passErr.message.slice(0, 80)}); waiting ${ms}ms to 09:00 then retrying`);
+    try { await tg(personality.standby(user, { planLine: `${plan.kind} @ ${plan.primaryTime}`, secs: Math.round(ms / 1000), mode: 'api' })); } catch {}
+    if (ms > 500) await new Promise(r => setTimeout(r, ms - 400));
+    while (Date.now() < t9.getTime()) {}
+    log(`api-direct: drift ${Date.now() - t9.getTime()}ms (window now open, retrying pass-fetch)`);
+    try {
+      const fresh = await fetchScheduleClasses(bearer, { fromIso, toIso });
+      const freshMeta = findClass(fresh, { kindNeedle: plan.kind, sgtDate, sgtHHMM })
+        || (plan.fallback ? findClass(fresh, { kindNeedle: plan.kind, sgtDate, sgtHHMM: timeToHHMM(plan.fallback) }) : null);
+      if (freshMeta) { classMeta = freshMeta; log(`api-direct: refreshed class status=${classMeta.statusText}`); }
+      paymentMethodUuid = await fetchPaymentPassUuid(bearer, classMeta);
+      passErr = null;
+    } catch (e2) {
+      passErr = e2;
+      log(`api-direct: pass-fetch still failing after window open (${e2.message.slice(0, 80)})`);
+    }
+  }
+  if (passErr) return { ok: false, reason: 'pass-fetch-failed', detail: passErr.message, time: plan.primaryTime };
   log(`api-direct: pass ${paymentMethodUuid}`);
 
   // 4. Wait to 09:00:00.000 SGT.

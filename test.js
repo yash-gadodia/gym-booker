@@ -2749,3 +2749,182 @@ test('canRetrySetup: margin is strict (> not >=)', () => {
   assert.equal(canRetrySetup({ attempt: 1, maxAttempts: 2, msRemaining: 75000, marginMs: 75000, noWait: false }), false);
   assert.equal(canRetrySetup({ attempt: 1, maxAttempts: 2, msRemaining: 75001, marginMs: 75000, noWait: false }), true);
 });
+
+// ── Failure classifier + waitlist watch registry (2026-06-07) ────────────────
+const {
+  classifyBookingFailure, parseClockToMinutes, classStartMs,
+  watchRegistryKey, upsertWatch, pruneWatchRegistry, shouldRetryPassFetchPreWindow,
+} = require('./lib');
+
+test('classifyBookingFailure: success is not a failure', () => {
+  const v = classifyBookingFailure({ ok: true, reason: 'booked (api-direct)' });
+  assert.equal(v.category, 'ok');
+  assert.equal(v.autoWatch, false);
+});
+
+test('classifyBookingFailure: FULL arrives via detail off a generic exception → watch', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'exception', detail: 'FIT FULL (primary and fallback)' });
+  assert.equal(v.category, 'full');
+  assert.equal(v.autoWatch, true);
+});
+
+test('classifyBookingFailure: went FULL before 9am → full/watch', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'exception', detail: 'FIT went FULL before 9am (all fallbacks too)' });
+  assert.equal(v.category, 'full');
+  assert.equal(v.autoWatch, true);
+});
+
+test('classifyBookingFailure: pass-fetch-failed → no_pass/watch (the Geraldine trigger)', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'pass-fetch-failed', detail: 'no eligible pass found for this class' });
+  assert.equal(v.category, 'no_pass');
+  assert.equal(v.autoWatch, true);
+});
+
+test('classifyBookingFailure: the masked tab-click symptom lands in infra/watch', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'exception', detail: 'could not click Classes/Schedule tab after 4 attempts' });
+  assert.equal(v.category, 'infra');
+  assert.equal(v.autoWatch, true);
+  assert.match(v.cause, /could not click Classes\/Schedule tab/);
+});
+
+test('classifyBookingFailure: class-not-found → not_found, no watch', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'class-not-found', detail: 'FIT 07:30 not in schedule (12 classes)' });
+  assert.equal(v.category, 'not_found');
+  assert.equal(v.autoWatch, false);
+});
+
+test('classifyBookingFailure: no row found → not_found, no watch', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'exception', detail: 'no FIT row found on 2026-06-09 (tried 6:30am + 7:30am)' });
+  assert.equal(v.category, 'not_found');
+  assert.equal(v.autoWatch, false);
+});
+
+test('classifyBookingFailure: auth/bearer failures route to fix, not watch', () => {
+  assert.equal(classifyBookingFailure({ ok: false, reason: 'bearer-capture-failed', detail: 'timeout' }).autoWatch, false);
+  assert.equal(classifyBookingFailure({ ok: false, reason: 'exception', detail: 'auth expired and no visible Login button found' }).category, 'auth');
+});
+
+test('classifyBookingFailure: unknown/no-result-file → infra/watch (safety net)', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'no-result-file', detail: 'child exited 1 without writing result file' });
+  assert.equal(v.category, 'infra');
+  assert.equal(v.autoWatch, true);
+});
+
+test('parseClockToMinutes: am/pm + noon/midnight', () => {
+  assert.equal(parseClockToMinutes('7:30am'), 7 * 60 + 30);
+  assert.equal(parseClockToMinutes('6:30pm'), 18 * 60 + 30);
+  assert.equal(parseClockToMinutes('12:00am'), 0);
+  assert.equal(parseClockToMinutes('12:30pm'), 12 * 60 + 30);
+  assert.equal(parseClockToMinutes('garbage'), null);
+});
+
+test('classStartMs: timezone-independent SGT epoch', () => {
+  // 2026-06-09 07:30 SGT == 2026-06-08T23:30:00Z
+  assert.equal(classStartMs('2026-06-09', '7:30am'), Date.parse('2026-06-08T23:30:00Z'));
+  assert.equal(classStartMs('bad-date', '7:30am'), null);
+  assert.equal(classStartMs('2026-06-09', 'nope'), null);
+});
+
+test('watchRegistryKey: normalizes user/time/kind', () => {
+  const a = watchRegistryKey({ user: 'Geraldine', date: '2026-06-09', time: '7:30 AM', kind: 'fit' });
+  const b = watchRegistryKey({ user: 'geraldine', date: '2026-06-09', time: '7:30am', kind: 'FIT' });
+  assert.equal(a, b);
+});
+
+test('upsertWatch: dedupes the same slot, keeps distinct slots, no mutation', () => {
+  const e1 = { user: 'geraldine', date: '2026-06-09', time: '7:30am', kind: 'FIT', reason: 'full' };
+  const orig = [];
+  const r1 = upsertWatch(orig, e1);
+  assert.equal(orig.length, 0); // pure: original untouched
+  assert.equal(r1.length, 1);
+  // Re-enroll same slot (different reason) replaces, does not duplicate.
+  const r2 = upsertWatch(r1, { ...e1, reason: 'infra' });
+  assert.equal(r2.length, 1);
+  assert.equal(r2[0].reason, 'infra');
+  // A different user on the same slot is a separate watch.
+  const r3 = upsertWatch(r2, { ...e1, user: 'dani' });
+  assert.equal(r3.length, 2);
+});
+
+test('pruneWatchRegistry: strictly-after cutoff, malformed always dropped', () => {
+  const w = { user: 'a', date: '2026-06-09', time: '7:30am', kind: 'FIT' };
+  const malformed = { user: 'c', date: 'xxx', time: 'yyy', kind: 'FIT' };
+  const startMs = classStartMs('2026-06-09', '7:30am');
+  assert.equal(pruneWatchRegistry([w, malformed], startMs - 1).length, 1); // not yet started → kept
+  assert.equal(pruneWatchRegistry([w, malformed], startMs).length, 0);     // started → dropped
+  assert.equal(pruneWatchRegistry([malformed], 0).length, 0);              // malformed → dropped
+});
+
+test('shouldRetryPassFetchPreWindow: only retries no-pass before the window opens', () => {
+  // pass-fetch miss, still pre-9am, api-direct on → wait for the window then retry
+  assert.equal(shouldRetryPassFetchPreWindow({ reason: 'pass-fetch-failed' }, 60000, true), true);
+  // same miss but already past 9am → no point retrying, fall back now
+  assert.equal(shouldRetryPassFetchPreWindow({ reason: 'pass-fetch-failed' }, -5000, true), false);
+  // a different failure (bearer) is not the pre-window pass case
+  assert.equal(shouldRetryPassFetchPreWindow({ reason: 'bearer-capture-failed' }, 60000, true), false);
+  // --no-wait / nowait disables the wait-and-retry
+  assert.equal(shouldRetryPassFetchPreWindow({ reason: 'pass-fetch-failed' }, 60000, false), false);
+});
+
+const { buildWatchCandidates } = require('./lib');
+// 10:00 SGT on 2026-06-07 — after the 09:00 window, the 2026-06-09 classes are
+// still in the future so they survive the prune.
+const ENROLL_NOW = Date.parse('2026-06-07T02:00:00Z');
+const ENROLL_USERS = {
+  geraldine: { id: 'geraldine', label: 'Geraldine', telegramChatId: 80808080 },
+  yash: { id: 'yash', label: 'Yash', telegramChatId: 166637821 },
+};
+const enrollRun = (id, results, targetYmd = '2026-06-09') =>
+  [{ id, user: { label: ENROLL_USERS[id] ? ENROLL_USERS[id].label : id }, targetYmd, results }];
+
+test('buildWatchCandidates: Geraldine tab-click miss → infra watch, user+Yash chatIds', () => {
+  const runs = enrollRun('geraldine', [
+    { plan: { kind: 'FIT', primaryTime: '7:30am', fallback: null },
+      status: { ok: false, reason: 'exception', detail: 'could not click Classes/Schedule tab after 4 attempts' } },
+  ]);
+  const c = buildWatchCandidates(runs, { usersById: ENROLL_USERS, nowMs: ENROLL_NOW, yashChatId: 166637821, nowIso: 'x' });
+  assert.equal(c.length, 1);
+  assert.deepEqual(
+    { user: c[0].user, kind: c[0].kind, time: c[0].time, date: c[0].date, reason: c[0].reason, chatIds: c[0].chatIds, source: c[0].source },
+    { user: 'geraldine', kind: 'FIT', time: '7:30am', date: '2026-06-09', reason: 'infra', chatIds: '80808080,166637821', source: 'auto-enroll' },
+  );
+});
+
+test('buildWatchCandidates: FULL → watch; class-not-found and success → skipped', () => {
+  const full = buildWatchCandidates(enrollRun('geraldine', [
+    { plan: { kind: 'FIT', primaryTime: '6:30am' }, status: { ok: false, reason: 'exception', detail: 'FIT FULL (primary and fallback)' } },
+  ]), { usersById: ENROLL_USERS, nowMs: ENROLL_NOW, yashChatId: 166637821 });
+  assert.equal(full.length, 1);
+  assert.equal(full[0].reason, 'full');
+
+  const notFound = buildWatchCandidates(enrollRun('geraldine', [
+    { plan: { kind: 'FIT', primaryTime: '7:30am' }, status: { ok: false, reason: 'class-not-found', detail: 'FIT 07:30 not in schedule' } },
+  ]), { usersById: ENROLL_USERS, nowMs: ENROLL_NOW, yashChatId: 166637821 });
+  assert.equal(notFound.length, 0);
+
+  const ok = buildWatchCandidates(enrollRun('geraldine', [
+    { plan: { kind: 'FIT', primaryTime: '7:30am' }, status: { ok: true, reason: 'booked (api-direct)' } },
+  ]), { usersById: ENROLL_USERS, nowMs: ENROLL_NOW, yashChatId: 166637821 });
+  assert.equal(ok.length, 0);
+});
+
+test('buildWatchCandidates: classes already started are pruned', () => {
+  const past = buildWatchCandidates(enrollRun('geraldine', [
+    { plan: { kind: 'FIT', primaryTime: '7:30am' }, status: { ok: false, reason: 'exception', detail: 'FIT FULL' } },
+  ], '2026-06-06'), { usersById: ENROLL_USERS, nowMs: ENROLL_NOW, yashChatId: 166637821 });
+  assert.equal(past.length, 0);
+});
+
+test('buildWatchCandidates: when the failed user IS Yash, chatIds dedupes to one', () => {
+  const c = buildWatchCandidates(enrollRun('yash', [
+    { plan: { kind: 'FIT', primaryTime: '6:30am' }, status: { ok: false, reason: 'exception', detail: 'FIT FULL (primary and fallback)' } },
+  ]), { usersById: ENROLL_USERS, nowMs: ENROLL_NOW, yashChatId: 166637821 });
+  assert.equal(c.length, 1);
+  assert.equal(c[0].chatIds, '166637821');
+});
+
+test('buildWatchCandidates: tolerates malformed/empty runs', () => {
+  assert.deepEqual(buildWatchCandidates(null, {}), []);
+  assert.deepEqual(buildWatchCandidates([{ id: 'x', targetYmd: '2026-06-09' }], { nowMs: ENROLL_NOW }), []); // no results array
+  assert.deepEqual(buildWatchCandidates([{ id: 'x', results: [] }], { nowMs: ENROLL_NOW }), []); // no targetYmd
+});

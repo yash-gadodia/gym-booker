@@ -20,7 +20,13 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { loadUsers } = require('./users');
-const { buildDailySummary, sendYashAlert, spawnStaggerMs } = require('./lib');
+const {
+  buildDailySummary, sendYashAlert, spawnStaggerMs,
+  buildWatchCandidates, upsertWatch, pruneWatchRegistry,
+  YASH_ALERT_CHAT_ID,
+} = require('./lib');
+
+const REGISTRY_PATH = process.env.GYM_WAITLIST_REGISTRY || path.join(__dirname, 'runs', 'waitlist-registry.json');
 
 const NODE_BIN = process.execPath;
 const BOOK_JS = path.join(__dirname, 'book.js');
@@ -207,6 +213,57 @@ function stripFlag(args, name) {
     }
   } catch (e) {
     console.error(`book-all: manifest write failed: ${e.message}`);
+  }
+
+  // ── Auto-enroll failed users into the waitlist watcher ────────────────────
+  // For every plan that failed with a recoverable cause (classifyBookingFailure
+  // → autoWatch), add the user+slot to runs/waitlist-registry.json so
+  // waitlist-registry.js polls it and DMs them the moment a spot frees. This is
+  // the safety net for misses like Geraldine's 2026-06-07 (api-direct pass-fetch
+  // → fragile UI fallback → lost the booking). The enroll CONFIRMATION goes to
+  // Yash only — no new unapproved user-facing send — while the watcher's
+  // slot-open alerts reach the user via the chatIds stored on each entry.
+  try {
+    const nowMs = Date.now();
+    const usersById = Object.fromEntries(users.map(u => [u.id, u]));
+    const enrollRuns = [];
+    for (const r of filtered) {
+      let parsed = null;
+      try {
+        const f = resultPathFor(r.id);
+        if (fs.existsSync(f)) parsed = JSON.parse(fs.readFileSync(f, 'utf8'));
+      } catch {}
+      if (!parsed) continue;
+      enrollRuns.push({ id: r.id, user: parsed.user, targetYmd: parsed.targetYmd, results: parsed.results });
+    }
+    const candidates = buildWatchCandidates(enrollRuns, {
+      usersById, nowMs, yashChatId: YASH_ALERT_CHAT_ID, nowIso: new Date().toISOString(),
+    });
+
+    if (candidates.length) {
+      const lines = candidates.map(c => `• ${c.name}: ${c.kind} @ ${c.time} on ${c.date} (${c.reason})`);
+      const note = `🔁 *Auto-enrolled into waitlist watcher* (${candidates.length})\n${lines.join('\n')}\nWill DM the second a slot frees.`;
+      if (process.env.GYM_TEST_PRINT_ENROLL === '1') {
+        console.log('--- TEST AUTO-ENROLL ---');
+        console.log(JSON.stringify(candidates, null, 2));
+        console.log(note);
+        console.log('--- END TEST AUTO-ENROLL ---');
+      } else if (suppress) {
+        console.log(`book-all: auto-enroll suppressed (dry/now) — ${candidates.length} candidate(s)`);
+      } else {
+        let registry = { updated: null, watches: [] };
+        try { if (fs.existsSync(REGISTRY_PATH)) registry = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf8')); } catch {}
+        let watches = pruneWatchRegistry(Array.isArray(registry.watches) ? registry.watches : [], nowMs);
+        for (const c of candidates) watches = upsertWatch(watches, c);
+        fs.writeFileSync(REGISTRY_PATH, JSON.stringify({ updated: new Date().toISOString(), watches }, null, 2));
+        console.log(`book-all: auto-enrolled ${candidates.length} user-slot(s); registry now has ${watches.length} active`);
+        await sendYashAlert(note);
+      }
+    } else {
+      console.log('book-all: no auto-enroll candidates');
+    }
+  } catch (e) {
+    console.error(`book-all: auto-enroll failed: ${e.message}`);
   }
 
   // Cleanup tmpdir.

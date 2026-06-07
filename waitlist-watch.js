@@ -170,7 +170,13 @@ async function main() {
   if (process.env.WAITLIST_KIND) {
     plan.kind = process.env.WAITLIST_KIND;
   }
-  const watchId = `${dateArg}_${timeArg.replace(':', '')}`;
+  // Per-user state: two users can watch the same date+time slot without
+  // clobbering each other's userBooked/alert state. Falls back to the legacy
+  // slot-only id when WAITLIST_USER is unset (back-compat).
+  const watchUserId = (process.env.WAITLIST_USER || '').trim();
+  const watchId = watchUserId
+    ? `${dateArg}_${timeArg.replace(':', '')}-${watchUserId}`
+    : `${dateArg}_${timeArg.replace(':', '')}`;
   const stateFile = path.join(__dirname, 'runs', `waitlist-state-${watchId}.json`);
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
 
