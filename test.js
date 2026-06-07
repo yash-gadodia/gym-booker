@@ -2885,9 +2885,10 @@ test('buildWatchCandidates: Geraldine tab-click miss → infra watch, user+Yash 
   const c = buildWatchCandidates(runs, { usersById: ENROLL_USERS, nowMs: ENROLL_NOW, yashChatId: 166637821, nowIso: 'x' });
   assert.equal(c.length, 1);
   assert.deepEqual(
-    { user: c[0].user, kind: c[0].kind, time: c[0].time, date: c[0].date, reason: c[0].reason, chatIds: c[0].chatIds, source: c[0].source },
-    { user: 'geraldine', kind: 'FIT', time: '7:30am', date: '2026-06-09', reason: 'infra', chatIds: '80808080,166637821', source: 'auto-enroll' },
+    { user: c[0].user, kind: c[0].kind, time: c[0].time, date: c[0].date, reason: c[0].reason, userChatId: c[0].userChatId, chatIds: c[0].chatIds, source: c[0].source },
+    { user: 'geraldine', kind: 'FIT', time: '7:30am', date: '2026-06-09', reason: 'infra', userChatId: '80808080', chatIds: '80808080,166637821', source: 'auto-enroll' },
   );
+  assert.match(c[0].cause, /could not click Classes\/Schedule tab/); // technical reason flows to the user DM
 });
 
 test('buildWatchCandidates: FULL → watch; class-not-found and success → skipped', () => {

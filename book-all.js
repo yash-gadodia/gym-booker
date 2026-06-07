@@ -21,7 +21,7 @@ const fs = require('fs');
 const os = require('os');
 const { loadUsers } = require('./users');
 const {
-  buildDailySummary, sendYashAlert, spawnStaggerMs,
+  buildDailySummary, sendYashAlert, sendTelegram, spawnStaggerMs,
   buildWatchCandidates, upsertWatch, pruneWatchRegistry,
   YASH_ALERT_CHAT_ID,
 } = require('./lib');
@@ -257,6 +257,16 @@ function stripFlag(args, name) {
         for (const c of candidates) watches = upsertWatch(watches, c);
         fs.writeFileSync(REGISTRY_PATH, JSON.stringify({ updated: new Date().toISOString(), watches }, null, 2));
         console.log(`book-all: auto-enrolled ${candidates.length} user-slot(s); registry now has ${watches.length} active`);
+        // DM each enrolled user their OWN technical reason + watchlist note (Yash
+        // gets the same detail in the aggregate note below).
+        for (const c of candidates) {
+          if (!c.userChatId) continue;
+          const dmy = c.date.split('-').reverse().join('-');
+          await sendTelegram(c.userChatId,
+            `🔁 ${c.name}, I couldn't lock in your ${c.kind} @ ${c.time} on ${dmy}.\n` +
+            `Reason: ${c.cause}\n` +
+            `You're on the waitlist watcher now and I'll ping you the second a spot frees. 🦞`);
+        }
         await sendYashAlert(note);
       }
     } else {

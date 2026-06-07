@@ -565,6 +565,24 @@ async function sendYashAlert(text, { fetchImpl = (typeof fetch !== 'undefined' ?
   } catch (e) { logger(`ERR ${e.message}`); return false; }
 }
 
+// Generic single-message send to ANY chat id. Same fail-soft contract as
+// sendYashAlert (false on any failure, never throws). Used by book-all.js to DM
+// an auto-enrolled user their own failure reason + watchlist note.
+async function sendTelegram(chatId, text, { fetchImpl = (typeof fetch !== 'undefined' ? fetch : null), env = process.env, logger = (m) => process.stderr.write(`tg: ${m}\n`) } = {}) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  if (!token || !fetchImpl || !chatId) { logger('missing token/fetch/chatId — send dropped'); return false; }
+  try {
+    const r = await fetchImpl(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: String(chatId), text, disable_web_page_preview: true }),
+    });
+    if (r.ok) return true;
+    logger(`HTTP ${r.status}`);
+    return false;
+  } catch (e) { logger(`ERR ${e.message}`); return false; }
+}
+
 Object.assign(module.exports, {
   LOGIN_BUTTON_SEL,
   OVERLAY_DISMISS_SELS,
@@ -574,6 +592,7 @@ Object.assign(module.exports, {
   buildSetupFailureAlert,
   buildDailySummary,
   sendYashAlert,
+  sendTelegram,
 });
 
 // ── Failure diagnosis + auto-enroll into the waitlist watcher ────────────────
@@ -700,6 +719,7 @@ function buildWatchCandidates(runs, { usersById = {}, nowMs = null, yashChatId =
       const startMs = classStartMs(run.targetYmd, time);
       if (startMs == null || (nowMs != null && startMs <= nowMs)) continue;
       const u = usersById[run.id] || {};
+      const userChatId = u.telegramChatId ? String(u.telegramChatId) : null;
       const chatIds = [...new Set([u.telegramChatId, yashChatId].filter(Boolean).map(String))];
       out.push({
         user: run.id,
@@ -707,6 +727,7 @@ function buildWatchCandidates(runs, { usersById = {}, nowMs = null, yashChatId =
         date: run.targetYmd,
         time,
         kind,
+        userChatId,
         chatIds: chatIds.join(','),
         source: 'auto-enroll',
         reason: verdict.category,
