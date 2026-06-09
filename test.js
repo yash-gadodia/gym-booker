@@ -9,7 +9,7 @@ const {
   classifyCheckoutButton, classifyButtonStates, parseBookingCard,
   timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
-  isBookingInUpcoming,
+  isBookingInUpcoming, findBookingInUpcoming,
   spawnStaggerMs, navRetryPlan, canRetrySetup,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
@@ -416,6 +416,24 @@ test('parseBookingCard: month abbreviations work', () => {
   assert.equal(b.ymd, '2026-05-01');
 });
 
+// 2026-06-09: Yash was waitlisted but Lawrence said "Smashed the queue". On
+// /account/schedule a confirmed booking card ends "Cancel +CALENDAR" while a
+// waitlist card ends "Cancel WAITLISTED" — the ONLY parseable difference. These
+// are the exact card strings observed live from Yash's account.
+test('parseBookingCard: confirmed booking card is NOT waitlisted', () => {
+  const b = parseBookingCard('11 Thursday June, 2026 CROSSFIT® FIT RagTag Training w/ Annie Set 6:30am (60 min) Cancel +CALENDAR');
+  assert.equal(b.kind, 'FIT');
+  assert.equal(b.time, '6:30am');
+  assert.equal(b.waitlisted, false);
+});
+
+test('parseBookingCard: WAITLISTED card is flagged waitlisted', () => {
+  const b = parseBookingCard('11 Thursday June, 2026 CROSSFIT® FIT RagTag Training w/ Annie Set 6:30am (60 min) Cancel WAITLISTED');
+  assert.equal(b.kind, 'FIT');
+  assert.equal(b.time, '6:30am');
+  assert.equal(b.waitlisted, true);
+});
+
 // ---------- timeToHHMM: API-direct uses 24h SGT for matching schedule entries ----------
 
 test('timeToHHMM: am/pm conversion', () => {
@@ -806,6 +824,9 @@ test('outcome bucket selection: classifies all known outcomes', () => {
   assert.equal(personality._bucket({ ok: false, reason: 'unverified' }), 'unverified');
   assert.equal(personality._bucket({ ok: false, reason: 'not booked' }), 'full');
   assert.equal(personality._bucket({ ok: false, reason: 'FULL' }), 'full');
+  // class-full-waitlisted (2026-06-09 honesty fix): waitlist placement must read
+  // as the "Outflexed / try the waitlist" message, never a booking confirmation.
+  assert.equal(personality._bucket({ ok: false, reason: 'class-full-waitlisted' }), 'full');
   // Unknown failure → bucketed as exception (generic error template)
   assert.equal(personality._bucket({ ok: false, reason: 'something weird' }), 'exception');
 });
@@ -2509,6 +2530,25 @@ test('isBookingInUpcoming: time format must match exactly (regression guard)', (
   assert.equal(isBookingInUpcoming(upcoming, { targetYmd: '2026-05-22', kind: 'FIT', time: '07:30am' }), false);
 });
 
+// findBookingInUpcoming returns the matched card so callers can read .waitlisted
+// (the 2026-06-09 fix: a waitlist entry must never be reported as a booking).
+test('findBookingInUpcoming: returns the matched card, exposing waitlisted', () => {
+  const upcoming = [
+    { ymd: '2026-06-11', kind: 'FIT', time: '6:30am', waitlisted: true },
+    { ymd: '2026-06-10', kind: 'FIT', time: '6:30am', waitlisted: false },
+  ];
+  const wl = findBookingInUpcoming(upcoming, { targetYmd: '2026-06-11', kind: 'FIT', time: '6:30am' });
+  assert.equal(wl.waitlisted, true);
+  const booked = findBookingInUpcoming(upcoming, { targetYmd: '2026-06-10', kind: 'FIT', time: '6:30am' });
+  assert.equal(booked.waitlisted, false);
+});
+
+test('findBookingInUpcoming: returns null when nothing matches or input is bad', () => {
+  assert.equal(findBookingInUpcoming([{ ymd: '2026-06-11', kind: 'FIT', time: '6:30am' }], { targetYmd: '2026-06-11', kind: 'FIT', time: '7:30am' }), null);
+  assert.equal(findBookingInUpcoming([], { targetYmd: '2026-06-11', kind: 'FIT', time: '6:30am' }), null);
+  assert.equal(findBookingInUpcoming(null, { targetYmd: '2026-06-11', kind: 'FIT', time: '6:30am' }), null);
+});
+
 // Mer scenario simulation: bookViaApi returned HTTP 400 with PG::UniqueViolation
 // on the booking_items step, but the booking actually DID write to Mindbody.
 // The verify-don't-trust path fetches /account/schedule and finds the booking
@@ -2706,16 +2746,16 @@ test('spawnStaggerMs: custom step + defensive on non-positive index', () => {
 });
 
 test('navRetryPlan: ample budget allows the full 3 attempts', () => {
-  const p = navRetryPlan(60000);
-  assert.equal(p.attempts, 3);          // (60000-8000)/15000 = 3.46 -> 3
-  assert.equal(p.perAttemptMs, 15000);
+  const p = navRetryPlan(80000);
+  assert.equal(p.attempts, 3);          // (80000-8000)/22000 = 3.27 -> 3
+  assert.equal(p.perAttemptMs, 22000);  // bumped from 15000: the cold ragtag nav reliably needs ~18s
   assert.equal(p.backoffMs, 1000);
 });
 
 test('navRetryPlan: shrinks attempts when time is tight (fail fast to alert)', () => {
-  assert.equal(navRetryPlan(40000).attempts, 2);   // (40000-8000)/15000 = 2.13 -> 2
-  assert.equal(navRetryPlan(23000).attempts, 1);   // (23000-8000)/15000 = 1.0  -> 1
-  assert.equal(navRetryPlan(20000).attempts, 1);   // (20000-8000)/15000 = 0.8  -> floored to 0 -> min 1
+  assert.equal(navRetryPlan(60000).attempts, 2);   // (60000-8000)/22000 = 2.36 -> 2
+  assert.equal(navRetryPlan(40000).attempts, 1);   // (40000-8000)/22000 = 1.45 -> 1
+  assert.equal(navRetryPlan(23000).attempts, 1);   // (23000-8000)/22000 = 0.68 -> floored to 0 -> min 1
   assert.equal(navRetryPlan(8000).attempts, 1);    // no usable budget -> still try once
 });
 
@@ -2770,6 +2810,12 @@ test('classifyBookingFailure: FULL arrives via detail off a generic exception �
 
 test('classifyBookingFailure: went FULL before 9am → full/watch', () => {
   const v = classifyBookingFailure({ ok: false, reason: 'exception', detail: 'FIT went FULL before 9am (all fallbacks too)' });
+  assert.equal(v.category, 'full');
+  assert.equal(v.autoWatch, true);
+});
+
+test('classifyBookingFailure: class-full-waitlisted → full/watch (the 2026-06-09 fix arms the watcher)', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'class-full-waitlisted', detail: 'FIT @ 6:30am on Thu 2026-06-11 was FULL at 09:00 — you\'re on the waitlist now.' });
   assert.equal(v.category, 'full');
   assert.equal(v.autoWatch, true);
 });

@@ -7,7 +7,7 @@ const {
   decideNextAction, isBookingWindowErrorText, isLoginRedirectUrl,
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
-  isBookingInUpcoming, isInventoryRowRace,
+  isBookingInUpcoming, findBookingInUpcoming, isInventoryRowRace,
   navRetryPlan, canRetrySetup, shouldRetryPassFetchPreWindow,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
@@ -705,7 +705,21 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
     try {
       await new Promise(r => setTimeout(r, 1500));
       const upcoming = await fetchMyUpcomingBookings(page);
-      if (isBookingInUpcoming(upcoming, { targetYmd, kind: plan.kind, time: usedTime })) {
+      const match = findBookingInUpcoming(upcoming, { targetYmd, kind: plan.kind, time: usedTime });
+      if (match && match.waitlisted) {
+        log(`api-direct: WAITLISTED (NOT booked) on /account/schedule after HTTP ${result.status} at ${result.step} — reporting honestly`);
+        try { await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+        return {
+          ok: false,
+          reason: 'class-full-waitlisted',
+          detail: `${plan.kind} @ ${usedTime} on ${DAY_SHORT[target.getDay()]} ${targetYmd} was FULL — you're on the waitlist now (Mindbody auto-promotes if a spot frees). Class status: ${classMeta.statusText || 'waitlist'}.`,
+          time: usedTime,
+          timing: result.timing,
+          via: 'api',
+          waitlisted: true,
+        };
+      }
+      if (match) {
         log(`api-direct: BOOKED on /account/schedule despite HTTP ${result.status} at ${result.step} . claiming success (response was bogus)`);
         try { await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
         return {
@@ -742,21 +756,38 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
   // claiming success; otherwise return ok=false so the caller can fall back.
   if (result.statusTitle === 'processing_requested') {
     const targetYmd = ymd(target);
-    let upcoming = null;
+    let match = null;       // matched /account/schedule card (has .waitlisted), or null
+    let fetched = false;    // did at least one schedule fetch succeed?
     for (const waitMs of [3500, 3500]) {
       await new Promise(r => setTimeout(r, waitMs));
-      try { upcoming = await fetchMyUpcomingBookings(page); }
+      let upcoming;
+      try { upcoming = await fetchMyUpcomingBookings(page); fetched = true; }
       catch (e) { log(`api-direct: confirm fetch failed (${e.message.slice(0,140)})`); break; }
-      if (isBookingInUpcoming(upcoming, { targetYmd, kind: plan.kind, time: usedTime })) {
-        log(`api-direct: confirmed ${plan.kind} @ ${usedTime} on ${targetYmd} in /account/schedule`);
-        upcoming = 'confirmed';
+      match = findBookingInUpcoming(upcoming, { targetYmd, kind: plan.kind, time: usedTime });
+      if (match) {
+        log(`api-direct: ${match.waitlisted ? 'WAITLISTED (NOT booked)' : 'confirmed'} ${plan.kind} @ ${usedTime} on ${targetYmd} in /account/schedule`);
         break;
       }
       log(`api-direct: not yet confirmed (${upcoming.length} upcoming, none matched ${plan.kind} @ ${usedTime} on ${targetYmd}) — re-checking`);
     }
-    if (upcoming !== 'confirmed' && upcoming !== null) {
-      // fetchMyUpcomingBookings navigated to /account/schedule. Restore the
-      // gym URL so the UI-flow fallback (clickClassesTab) finds its anchors.
+    // fetchMyUpcomingBookings navigated to /account/schedule. Restore the gym URL
+    // so any UI-flow fallback (clickClassesTab) finds its anchors.
+    if (match && match.waitlisted) {
+      // The class was FULL: the booking landed on the WAITLIST, not a reservation.
+      // Never report this as a booking. ok:false + "full"/"waitlist" routes to the
+      // honest message AND arms the waitlist watcher (classifyBookingFailure).
+      try { await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+      return {
+        ok: false,
+        reason: 'class-full-waitlisted',
+        detail: `${plan.kind} @ ${usedTime} on ${DAY_SHORT[target.getDay()]} ${targetYmd} was FULL at 09:00 — you're on the waitlist now (Mindbody auto-promotes if a spot frees). Class status: ${classMeta.statusText || 'waitlist'}.`,
+        time: usedTime,
+        timing: result.timing,
+        via: 'api',
+        waitlisted: true,
+      };
+    }
+    if (!match && fetched) {
       try { await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
       return {
         ok: false,
@@ -766,6 +797,8 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
         timing: result.timing,
       };
     }
+    // match && !waitlisted → real booking; or fetch never succeeded → trust the
+    // 202 (can't verify), both fall through to ok:true below.
   }
 
   return {
@@ -986,14 +1019,21 @@ async function attemptFallbackBooking(page, plan, target) {
   // fresh browser only when we have >75s headroom to 9am SGT (fresh login ~50s
   // + book ~3s + buffer). noWait mode (testing) skips the headroom check.
   async function attemptSetup() {
-    const msToNineNow = t9.getTime() - Date.now();
-    const forceLogin = !noWait && msToNineNow > 90000;
-    log(`auth: ${forceLogin ? `FORCE fresh login (${msToNineNow}ms to 9am, >90s safety margin)` : 'using cached auth.json if available'}`);
+    // Use the cached session if we have one; log in only when it's missing or
+    // expired (isLoggedOut, below). The 2026-04-23 "force fresh login every run"
+    // was for the OLD UI-click flow, where a stale session only surfaced on the
+    // BOOK NOW click (too late). The api-direct flow captures the real Bearer
+    // from the page, so a stale session fails SAFE (401 → alert, never a wrong
+    // booking). Forcing an ~80s login every morning was eating the pre-09:00
+    // budget and starving the post-login nav of retries — the 2026-06-09
+    // Dani/Melissa miss. Cached auth hands that budget back.
+    const haveCachedAuth = fs.existsSync(authPath);
+    log(`auth: ${haveCachedAuth ? 'using cached auth.json (login only if expired)' : 'no cached auth.json — will log in'}`);
     const localBrowser = await chromium.launch({ headless: true });
     const localCtx = await localBrowser.newContext({
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       viewport: { width: 1440, height: 900 }, locale: 'en-SG', timezoneId: SGT_TZ,
-      storageState: (!forceLogin && fs.existsSync(authPath)) ? authPath : undefined,
+      storageState: haveCachedAuth ? authPath : undefined,
     });
     const localPage = await localCtx.newPage();
     let localDidRelogin = false;
@@ -1006,8 +1046,8 @@ async function attemptFallbackBooking(page, plan, target) {
     await dismissCookieBanner(localPage);
     await snap(localPage, 'landed');
 
-    if (await isLoggedOut(localPage)) {
-      log(`AUTH: detected logged-out state — ${forceLogin ? 'proactive' : 'reactive'} login`);
+    if (!haveCachedAuth || await isLoggedOut(localPage)) {
+      log(`AUTH: ${haveCachedAuth ? 'cached session expired' : 'no cached session'} — logging in`);
       localDidRelogin = true;
       await snap(localPage, 'logged-out');
       await loginAndSave(localPage, localCtx, authPath);
@@ -1107,6 +1147,15 @@ async function attemptFallbackBooking(page, plan, target) {
         try {
           const apiResult = await executeApiDirect(page, plan, target, t9, noWait);
           if (apiResult.ok) {
+            status = apiResult;
+            return status;
+          }
+          // Class was FULL → we landed on the waitlist. This is terminal and
+          // honest (matches the pre-existing control flow, which also returned
+          // here — it just used to mislabel it "booked"). Do NOT fall through to
+          // the UI flow: it can't book a full class, it would only burn ~30s and
+          // re-throw FULL. classifyBookingFailure arms the watcher off this.
+          if (apiResult.waitlisted) {
             status = apiResult;
             return status;
           }

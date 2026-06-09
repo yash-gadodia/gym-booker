@@ -306,7 +306,18 @@ function parseBookingCard(text) {
   const mon = _MONTHS[monthM[1].toLowerCase().slice(0, 3)];
   const yr = parseInt(monthM[2], 10);
   const date = new Date(yr, mon, dom);
-  return { date, ymd: ymd(date), kind, time: `${timeM[1]}${timeM[2].toLowerCase()}`, raw: flat };
+  // A waitlist entry and a confirmed booking parse to the same {date,kind,time};
+  // the ONLY difference on /account/schedule is the card label ("WAITLISTED" vs
+  // "+CALENDAR"). Capture it so the booking flow never reports a waitlist spot as
+  // a confirmed booking (2026-06-09: Yash was waitlisted but told "Smashed the queue").
+  return { date, ymd: ymd(date), kind, time: `${timeM[1]}${timeM[2].toLowerCase()}`, waitlisted: /waitlist/i.test(flat), raw: flat };
+}
+
+// Find the matching entry (date + kind + time) in an /account/schedule "upcoming"
+// list, or null. Returns the card so callers can read `.waitlisted`.
+function findBookingInUpcoming(upcoming, { targetYmd, kind, time }) {
+  if (!Array.isArray(upcoming)) return null;
+  return upcoming.find(b => b && b.ymd === targetYmd && b.kind === kind && b.time === time) || null;
 }
 
 // Check whether a target booking (date + kind + time) appears in an
@@ -350,7 +361,7 @@ function spawnStaggerMs(index, stepMs = 1500, capMs = 12000) {
 // short attempts absorb it. When time is tight we shrink to fail fast so the
 // caller can still alert before 09:00. noWait (manual --now / tests) has no
 // deadline, so use the full budget.
-function navRetryPlan(msRemaining, { noWait = false, perAttemptMs = 15000, maxAttempts = 3, backoffMs = 1000, reserveMs = 8000 } = {}) {
+function navRetryPlan(msRemaining, { noWait = false, perAttemptMs = 22000, maxAttempts = 3, backoffMs = 1000, reserveMs = 8000 } = {}) {
   if (noWait || msRemaining == null) return { attempts: maxAttempts, perAttemptMs, backoffMs };
   const usable = Math.max(0, msRemaining - reserveMs);
   const fit = Math.floor(usable / perAttemptMs);
@@ -393,6 +404,7 @@ module.exports = {
   resolveBookingForDate,
   resolveBookingsForDate,
   isBookingInUpcoming,
+  findBookingInUpcoming,
 };
 
 // ── Login-button protection (2026-05-12 incident) ───────────────────────────
