@@ -18,6 +18,7 @@ const {
 } = require('./api-client');
 const usersLib = require('./users');
 const personality = require('./personality');
+const { loginAndSave } = require('./mb-login');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
 const SGT_TZ = 'Asia/Singapore';
@@ -144,16 +145,6 @@ async function isLoggedOut(page) {
   return false;
 }
 
-async function clickVisible(page, selector) {
-  const els = await page.locator(selector).all();
-  for (const el of els) {
-    const r = await el.evaluate(n => n.getBoundingClientRect()).catch(() => null);
-    if (!r || r.width === 0 || r.height === 0) continue;
-    try { await el.click({ timeout: 5000 }); return { ok: true, rect: r }; } catch {}
-  }
-  return { ok: false };
-}
-
 // Resolve creds once. As of 2026-05-10, every user (including Yash) lives in
 // users.json with creds in the keychain — pass `--user <id>` to look up.
 // The .env fallback path is retained for one-off ad-hoc test runs only and
@@ -161,92 +152,6 @@ async function clickVisible(page, selector) {
 const creds = user
   ? usersLib.getCreds(user)
   : { email: process.env.MINDBODY_EMAIL, password: process.env.MINDBODY_PASSWORD };
-
-// Generic z-stack guard: poll until the Login button is at the top of the
-// click surface (not covered by any overlay). On each iteration, the inner
-// probe (probeLoginButtonInBrowser from lib.js) runs in browser context via
-// page.evaluate and returns {state, blocker?}. If covered, walks
-// OVERLAY_DISMISS_SELS, clicks the first that exists, re-probes.
-//
-// Why this is generic, not OneTrust-specific: 2026-05-12 incident showed that
-// a targeted-by-text dismiss is one Mindbody rename away from regressing. By
-// asking "is the button clickable?" instead of "is the cookie banner here?",
-// we handle ANY overlay — cookie banner, newsletter modal, GDPR variant,
-// future surprises. Adding a new dismiss pattern is one line in lib.js.
-async function ensureLoginUnblocked(page, { maxWaitMs = 8000 } = {}) {
-  const start = Date.now();
-  let attempts = 0;
-  let lastBlocker = null;
-  while (Date.now() - start < maxWaitMs) {
-    attempts++;
-    const probe = await page.evaluate(probeLoginButtonInBrowser, LOGIN_BUTTON_SEL);
-
-    if (probe.state === 'clear') {
-      if (attempts > 1) log(`AUTH: Login unblocked after ${attempts} probes (${Date.now() - start}ms)`);
-      return { ok: true };
-    }
-    if (probe.state === 'no-button') return { ok: true, reason: 'no-login-button' };
-    lastBlocker = probe.state === 'covered' ? probe.blocker : probe.state;
-
-    // Try every dismiss selector. Silent on miss — overlay may not exist yet.
-    let dismissed = false;
-    for (const sel of OVERLAY_DISMISS_SELS) {
-      const el = await page.$(sel);
-      if (!el) continue;
-      try {
-        await el.click({ timeout: 1500 });
-        log(`AUTH: dismissed overlay via ${sel} (was blocked by: ${lastBlocker})`);
-        await page.waitForTimeout(400);
-        dismissed = true;
-        break;
-      } catch {}
-    }
-    await page.waitForTimeout(dismissed ? 200 : 400);
-  }
-  log(`AUTH: ensureLoginUnblocked TIMEOUT after ${attempts} probes — last blocker: ${lastBlocker}`);
-  return { ok: false, blocker: lastBlocker, attempts };
-}
-
-async function loginAndSave(page, ctx, authPath) {
-  log('AUTH: re-login starting');
-  if (!creds.email || !creds.password) {
-    throw new Error('auth expired but creds not available' +
-      (user
-        ? ` for user "${user.id}" — keychain miss, run \`node migrate-creds-to-keychain.js --apply\``
-        : ' — pass `--user <id>` to look up creds via the keychain (MINDBODY_* env path is deprecated)'));
-  }
-  // Confirm the Login button is on top of the z-stack before clicking. Handles
-  // cookie banner, modals, or any other late-arriving overlay generically.
-  const unblock = await ensureLoginUnblocked(page, { maxWaitMs: 8000 });
-  if (!unblock.ok) log(`AUTH: proceeding to click despite blocker (${unblock.blocker}) — Playwright may still recover`);
-  let clicked = await clickVisible(page, 'button[data-name="NavigationBar.Login.Button"]');
-  if (clicked.ok) log(`AUTH: clicked Login button (${clicked.rect.width}x${clicked.rect.height}) via data-name`);
-  if (!clicked.ok) {
-    for (const sel of [
-      'button:has-text("Sign in")', 'a:has-text("Sign in")',
-      'button:has-text("Log in")', 'a:has-text("Log in")',
-    ]) {
-      clicked = await clickVisible(page, sel);
-      if (clicked.ok) { log(`AUTH: clicked ${sel} (text fallback)`); break; }
-    }
-  }
-  if (!clicked.ok) throw new Error('auth expired and no visible Login button found');
-  await page.waitForTimeout(2500);
-  const emailInput = page.locator('input:visible').first();
-  await emailInput.waitFor({ state: 'visible', timeout: 15000 });
-  await emailInput.fill(creds.email);
-  await page.click('button:has-text("Continue"), button:has-text("Next"), button[type="submit"]');
-  await page.waitForSelector('input[type="password"]', { timeout: 20000 });
-  await page.waitForTimeout(800);
-  await page.fill('input[type="password"]', creds.password);
-  await Promise.all([
-    page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {}),
-    page.click('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Continue")'),
-  ]);
-  await page.waitForTimeout(3000);
-  await ctx.storageState({ path: authPath });
-  log('AUTH: login complete, auth.json refreshed');
-}
 
 // Cookie banner appears asynchronously via OneTrust JS. On slow page loads it
 // can arrive AFTER the initial 2.5s settle, then overlay the navbar and block
@@ -1050,7 +955,7 @@ async function attemptFallbackBooking(page, plan, target) {
       log(`AUTH: ${haveCachedAuth ? 'cached session expired' : 'no cached session'} — logging in`);
       localDidRelogin = true;
       await snap(localPage, 'logged-out');
-      await loginAndSave(localPage, localCtx, authPath);
+      await loginAndSave(localPage, localCtx, authPath, { creds, log });
       log('AUTH: re-navigating to ragtag after login');
       await gotoWithRetry(localPage, GYM_URL, t9.getTime() - Date.now(), 'post-login');
       await localPage.waitForTimeout(2500);

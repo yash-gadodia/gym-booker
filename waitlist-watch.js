@@ -34,6 +34,7 @@ const fs = require('fs');
 const {
   DAY_SHORT, ymd, classPlan, parseBookingCard, isBookingInUpcoming, findBookingInUpcoming,
 } = require('./lib');
+const { loginAndSave } = require('./mb-login');
 const { captureBearerToken, fetchScheduleClasses, findClass } = require('./api-client');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
@@ -261,21 +262,11 @@ async function main() {
     const loggedOut = await page.locator('button[data-name="NavigationBar.Login.Button"]').count() > 0;
     if (loggedOut && useAuth && mbEmail && mbPassword) {
       console.log(`logged out . re-login as ${mbEmail}`);
-      await page.click('button[data-name="NavigationBar.Login.Button"]');
-      await page.waitForTimeout(2000);
-      const emailInput = page.locator('input:visible').first();
-      await emailInput.waitFor({ state: 'visible', timeout: 15000 });
-      await emailInput.fill(mbEmail);
-      await page.click('button:has-text("Continue"), button:has-text("Next"), button[type="submit"]');
-      await page.waitForSelector('input[type="password"]', { timeout: 20000 });
-      await page.waitForTimeout(800);
-      await page.fill('input[type="password"]', mbPassword);
-      await Promise.all([
-        page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {}),
-        page.click('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")'),
-      ]);
-      await page.waitForTimeout(3000);
-      await ctx.storageState({ path: authPath });
+      // Shared hardened login (mb-login.js): dismisses the consent overlay and
+      // clicks the VISIBLE Login button. The old bare page.click hung the full
+      // 30s on the invisible overlay and errored every poll for every user
+      // (2026-06-09 watcher outage that made Lawrence blame users' passwords).
+      await loginAndSave(page, ctx, authPath, { creds: { email: mbEmail, password: mbPassword }, log: (m) => console.log(m) });
       await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(2000);
     }
