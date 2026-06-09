@@ -32,7 +32,7 @@ const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 const {
-  DAY_SHORT, ymd, classPlan, parseBookingCard, isBookingInUpcoming,
+  DAY_SHORT, ymd, classPlan, parseBookingCard, isBookingInUpcoming, findBookingInUpcoming,
 } = require('./lib');
 const { captureBearerToken, fetchScheduleClasses, findClass } = require('./api-client');
 
@@ -281,9 +281,13 @@ async function main() {
     }
 
     // 1. Did the user (manually or via Mindbody auto-promote) end up booked?
+    //    A WAITLISTED entry also appears here — it must NOT count as booked, or
+    //    the watcher would falsely DM "you're in!" and self-unload on its first
+    //    poll, exactly when the user most needs it to keep watching.
     try {
       const upcoming = await fetchMyUpcomingBookings(page);
-      if (isBookingInUpcoming(upcoming, { targetYmd: dateArg, kind: plan.kind, time: timeArg })) {
+      const match = findBookingInUpcoming(upcoming, { targetYmd: dateArg, kind: plan.kind, time: timeArg });
+      if (match && !match.waitlisted) {
         bookingDetected = true;
       }
     } catch (e) {
