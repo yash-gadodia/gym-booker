@@ -8,7 +8,7 @@ const {
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming, isInventoryRowRace,
-  navRetryPlan, canRetrySetup, shouldRetryPassFetchPreWindow,
+  navRetryPlan, canRetrySetup, decideAuthAction, shouldRetryPassFetchPreWindow,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
 } = require('./lib');
@@ -951,8 +951,19 @@ async function attemptFallbackBooking(page, plan, target) {
     await dismissCookieBanner(localPage);
     await snap(localPage, 'landed');
 
-    if (!haveCachedAuth || await isLoggedOut(localPage)) {
-      log(`AUTH: ${haveCachedAuth ? 'cached session expired' : 'no cached session'} — logging in`);
+    // Auth decision (unit-tested via decideAuthAction). Probe the Bearer only on
+    // a cached session that LOOKS logged-in — that's the only case where a zombie
+    // (logged-in UI but dead API session) can hide. Re-login covers no-session,
+    // expired, AND zombie, while there's still time before 09:00.
+    const loggedOut = await isLoggedOut(localPage);
+    let bearerOk = null;
+    if (haveCachedAuth && !loggedOut) {
+      try { await captureBearerToken(localPage, { timeoutMs: 12000 }); bearerOk = true; }
+      catch { bearerOk = false; }
+    }
+    const auth = decideAuthAction({ haveCachedAuth, loggedOut, bearerOk });
+    if (auth.login) {
+      log(`AUTH: ${auth.reason} — logging in`);
       localDidRelogin = true;
       await snap(localPage, 'logged-out');
       await loginAndSave(localPage, localCtx, authPath, { creds, log });
@@ -963,6 +974,8 @@ async function attemptFallbackBooking(page, plan, target) {
       await snap(localPage, 'post-relogin');
       if (await isLoggedOut(localPage)) throw new Error('still logged out after re-login attempt');
       await tg(personality.loggedIn(user));
+    } else {
+      log(`AUTH: ${auth.reason}`);
     }
 
     // Pre-flight: /account/schedule is the authoritative bookings list. Skip

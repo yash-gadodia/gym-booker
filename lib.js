@@ -378,11 +378,31 @@ function canRetrySetup({ attempt, maxAttempts, msRemaining, marginMs = 75000, no
   return noWait || msRemaining > marginMs;
 }
 
+// The 09:00 auth decision, factored out so it is unit-tested in isolation. Auth
+// was the #1 cause of missed bookings: forcing a fresh ~80s login EVERY run ate
+// the pre-09:00 budget (2026-06-09 Dani/Melissa timeouts), so we switched to
+// cached auth. But a cached session can be a ZOMBIE — the nav bar reads
+// logged-in yet the session is dead for API calls (no Bearer), so api-direct
+// would silently fail (2026-06-09 e2e check: geraldine + cheryllee). Decision:
+//   - no cached session            → login
+//   - cached but UI shows logged-out (expired) → login
+//   - cached, UI logged-in, but Bearer probe failed (zombie) → login
+//   - cached, UI logged-in, Bearer present (or not probed) → use cached
+// bearerOk: true / false after probing, or null when the probe was skipped
+// (i.e. we already knew we must log in, so didn't bother probing).
+function decideAuthAction({ haveCachedAuth, loggedOut, bearerOk = null }) {
+  if (!haveCachedAuth) return { login: true, reason: 'no cached session' };
+  if (loggedOut) return { login: true, reason: 'cached session expired' };
+  if (bearerOk === false) return { login: true, reason: 'zombie session (logged-in UI but no Bearer)' };
+  return { login: false, reason: 'cached session valid' };
+}
+
 module.exports = {
   isInventoryRowRace,
   spawnStaggerMs,
   navRetryPlan,
   canRetrySetup,
+  decideAuthAction,
   DAY_SHORT,
   addDays,
   ymd,

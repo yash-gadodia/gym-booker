@@ -10,7 +10,7 @@ const {
   timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming,
-  spawnStaggerMs, navRetryPlan, canRetrySetup,
+  spawnStaggerMs, navRetryPlan, canRetrySetup, decideAuthAction,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
 } = require('./lib');
@@ -2743,6 +2743,42 @@ test('spawnStaggerMs: custom step + defensive on non-positive index', () => {
   assert.equal(spawnStaggerMs(2, 1000), 2000);
   assert.equal(spawnStaggerMs(-1), 0);
   assert.equal(spawnStaggerMs(NaN), 0);
+});
+
+// ── decideAuthAction: the 09:00 auth decision (the #1 reliability path) ──────
+test('decideAuthAction: no cached session → login', () => {
+  const a = decideAuthAction({ haveCachedAuth: false, loggedOut: true });
+  assert.equal(a.login, true);
+  assert.match(a.reason, /no cached/);
+});
+
+test('decideAuthAction: cached but UI logged-out (expired) → login', () => {
+  const a = decideAuthAction({ haveCachedAuth: true, loggedOut: true, bearerOk: null });
+  assert.equal(a.login, true);
+  assert.match(a.reason, /expired/);
+});
+
+test('decideAuthAction: ZOMBIE (cached, looks logged-in, no Bearer) → login (2026-06-09 geraldine/cheryllee)', () => {
+  const a = decideAuthAction({ haveCachedAuth: true, loggedOut: false, bearerOk: false });
+  assert.equal(a.login, true);
+  assert.match(a.reason, /zombie/i);
+});
+
+test('decideAuthAction: healthy cached session (Bearer present) → USE CACHED, no login', () => {
+  // The core of the timeout fix: a valid session must NOT trigger the ~80s
+  // forced login that ate the budget and caused the 2026-06-09 misses.
+  const a = decideAuthAction({ haveCachedAuth: true, loggedOut: false, bearerOk: true });
+  assert.equal(a.login, false);
+});
+
+test('decideAuthAction: cached + logged-in + probe skipped (null) → use cached (no needless login)', () => {
+  assert.equal(decideAuthAction({ haveCachedAuth: true, loggedOut: false, bearerOk: null }).login, false);
+  assert.equal(decideAuthAction({ haveCachedAuth: true, loggedOut: false }).login, false);
+});
+
+test('decideAuthAction: no-cache takes precedence over a stale bearerOk flag', () => {
+  // Defensive: if somehow bearerOk=true but there is no cached session, still login.
+  assert.equal(decideAuthAction({ haveCachedAuth: false, loggedOut: false, bearerOk: true }).login, true);
 });
 
 test('navRetryPlan: ample budget allows the full 3 attempts', () => {
