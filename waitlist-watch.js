@@ -38,6 +38,10 @@ const { loginAndSave } = require('./mb-login');
 const { captureBearerToken, fetchScheduleClasses, findClass } = require('./api-client');
 
 const GYM_URL = 'https://www.mindbodyonline.com/explore/locations/ragtag';
+// "Join the waitlist" is a one-time, stable ask — nudge at most this many times
+// then go quiet (overridable via env). BOOK_NOW (a real freed slot) is exempt:
+// it's urgent and self-limiting (the slot vanishes once taken).
+const MAX_WAITLIST_NUDGES = parseInt(process.env.WAITLIST_MAX_NUDGES || '3', 10);
 
 function parseTimeToMinutes(t) {
   const m = /^(\d{1,2}):(\d{2})\s*(am|pm)$/i.exec(t);
@@ -193,6 +197,7 @@ async function main() {
     firstSeen: null,
     userBooked: false,
     userBookedAt: null,
+    userWaitlisted: false,
     alertCount: 0,
     lastAlertedAt: null,
   };
@@ -251,6 +256,7 @@ async function main() {
   let observed = 'ERROR';
   let observedText = '';
   let bookingDetected = false;
+  let userOnWaitlist = false;   // user has already joined the Mindbody waitlist
 
   try {
     await page.goto(GYM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -280,6 +286,8 @@ async function main() {
       const match = findBookingInUpcoming(upcoming, { targetYmd: dateArg, kind: plan.kind, time: timeArg });
       if (match && !match.waitlisted) {
         bookingDetected = true;
+      } else if (match && match.waitlisted) {
+        userOnWaitlist = true;   // she's already in the queue → stop nagging her to join
       }
     } catch (e) {
       console.log(`schedule fetch failed (${e.message.slice(0, 140)})`);
@@ -308,27 +316,57 @@ async function main() {
   state.lastStatus = bookingDetected ? 'BOOKED' : observed;
   if (!state.firstSeen) state.firstSeen = { at: state.lastChecked, status: state.lastStatus };
 
+  const dayLabel = DAY_SHORT[target.getDay()];
+  const name = process.env.WAITLIST_NAME || 'You';
   if (bookingDetected) {
     state.userBooked = true;
     state.userBookedAt = state.lastChecked;
-    const dayLabel = DAY_SHORT[target.getDay()];
-    const name = process.env.WAITLIST_NAME || 'You';
     const msg =
       `🎉 *${name}, you.re in!*\n` +
       `${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}.\n` +
       `See you there.`;
     await tg(msg);
     console.log('USER BOOKED . sent confirmation DM');
-  } else if (observed === 'BOOK_NOW' || observed === 'WAITLIST') {
+  } else if (userOnWaitlist) {
+    // She has ALREADY joined the Mindbody waitlist — joining is a one-time
+    // action, so STOP nagging her to do it (2026-06-09: Melissa joined and got
+    // pinged "JOIN WAITLIST" every 2 min, reminder 7+). Send ONE warm sign-off
+    // the first time we see her in the queue, then stay silent until she's
+    // actually promoted (bookingDetected → "you're in!").
+    if (!state.userWaitlisted) {
+      state.userWaitlisted = true;
+      await tg(
+        `✅ *${name}, you're on the waitlist* for ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}.\n` +
+        `Sit tight . Mindbody auto-promotes you when a spot frees, and I'll shout the second you're in. ` +
+        `No need to keep the app open . I'll stop pinging now. 💪`);
+      console.log('USER ON WAITLIST . sent one sign-off, going silent');
+    } else {
+      console.log('user already on waitlist . staying silent (no spam)');
+    }
+  } else if (observed === 'BOOK_NOW') {
+    // A real spot freed (someone cancelled) — time-critical, keep nudging. This
+    // is self-limiting: the slot vanishes (back to FULL/WAITLIST) once taken.
     state.alertCount += 1;
     state.lastAlertedAt = state.lastChecked;
-    const msg = buildAlertMessage({
+    await tg(buildAlertMessage({
       observed, plan, timeArg, dateArg, target,
-      name: process.env.WAITLIST_NAME || null,
-      alertCount: state.alertCount,
-    });
-    await tg(msg);
-    console.log(`ALERTED (count=${state.alertCount}) . status=${observed}`);
+      name: process.env.WAITLIST_NAME || null, alertCount: state.alertCount,
+    }));
+    console.log(`ALERTED BOOK_NOW (count=${state.alertCount})`);
+  } else if (observed === 'WAITLIST') {
+    // Class full, waitlist open, user hasn't joined yet. Nudge a FEW times then
+    // stop — "join the waitlist" is a stable, one-time ask, not a per-minute one.
+    if (state.alertCount < MAX_WAITLIST_NUDGES) {
+      state.alertCount += 1;
+      state.lastAlertedAt = state.lastChecked;
+      await tg(buildAlertMessage({
+        observed, plan, timeArg, dateArg, target,
+        name: process.env.WAITLIST_NAME || null, alertCount: state.alertCount,
+      }));
+      console.log(`ALERTED WAITLIST (count=${state.alertCount}/${MAX_WAITLIST_NUDGES})`);
+    } else {
+      console.log(`WAITLIST nudge cap reached (${state.alertCount}/${MAX_WAITLIST_NUDGES}) . staying silent`);
+    }
   } else {
     console.log(`no alert (status=${observed}, userBooked=${state.userBooked})`);
   }
