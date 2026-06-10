@@ -18,7 +18,7 @@
 //
 // Exit code: 0 only if every child exited 0; non-zero if any failed.
 require('dotenv').config();
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -26,8 +26,8 @@ const { chromium } = require('playwright');
 const { loadUsers } = require('./users');
 const {
   buildDailySummary, sendYashAlert, sendTelegram, SETUP_COMPLETE_MARKER,
-  buildWatchCandidates, upsertWatch, pruneWatchRegistry,
-  YASH_ALERT_CHAT_ID,
+  buildWatchCandidates, upsertWatch, pruneWatchRegistry, decideDailyClaim,
+  ymd, YASH_ALERT_CHAT_ID,
 } = require('./lib');
 
 const REGISTRY_PATH = process.env.GYM_WAITLIST_REGISTRY || path.join(__dirname, 'runs', 'waitlist-registry.json');
@@ -73,6 +73,56 @@ function stripFlag(args, name) {
   if (filtered.length === 0) {
     console.error(`book-all: no users to run (only=${onlyList} skip=${skipList} roster=${roster.map(r => r.id).join(',')})`);
     process.exit(2);
+  }
+
+  // ── Daily-claim guard (dual-trigger arbitration) ────────────────────────
+  // Two schedulers invoke a bare `node book-all.js` each morning: the 08:40
+  // user LaunchAgent (primary, normal QoS) and the 08:54 system daemon
+  // (backstop). The claim file makes the pair safe — never both booking, since
+  // a double 9am sprint would double-book (Mindbody doesn't enforce
+  // one-per-day) — and useful: the backstop auto-retries a failed or crashed
+  // primary. Invocations carrying any flag/date (--only, --dry-run, recovery
+  // dates...) are operator-driven and bypass the claim entirely.
+  const isScheduledRun = process.argv.length <= 2;
+  const todayYmd = ymd(new Date());
+  const claimPath = path.join(__dirname, 'runs', `daily-claim-${todayYmd}.json`);
+  const claimStartedAt = new Date().toISOString();
+  const writeClaim = (status, extra = {}) => {
+    try {
+      const tmp = `${claimPath}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify({
+        date: todayYmd, pid: process.pid, startedAt: claimStartedAt,
+        status, updatedAt: new Date().toISOString(), ...extra,
+      }, null, 2));
+      fs.renameSync(tmp, claimPath);
+    } catch (e) { console.error(`book-all: claim write failed: ${e.message}`); }
+  };
+  if (isScheduledRun) {
+    let claim = null;
+    try { if (fs.existsSync(claimPath)) claim = JSON.parse(fs.readFileSync(claimPath, 'utf8')); } catch {}
+    // pid-alive probe hardened against post-reboot pid reuse: the holder must
+    // both respond to signal 0 AND still look like a booker node process.
+    let pidAlive = false;
+    if (claim && claim.status === 'running' && claim.pid) {
+      try {
+        process.kill(claim.pid, 0);
+        const ps = spawnSync('ps', ['-p', String(claim.pid), '-o', 'command='], { encoding: 'utf8' });
+        pidAlive = ps.status === 0 && /book-all|book\.js|node/.test(ps.stdout || '');
+      } catch { pidAlive = false; }
+    }
+    const verdict = decideDailyClaim({ claim, pidAlive });
+    console.log(`book-all: daily claim → ${verdict.action} (${verdict.reason})`);
+    if (verdict.action === 'skip') process.exit(0);
+    writeClaim('running');
+    // Best-effort prune of claim files older than a week.
+    try {
+      for (const f of fs.readdirSync(path.join(__dirname, 'runs'))) {
+        const m = f.match(/^daily-claim-(\d{4}-\d{2}-\d{2})\.json$/);
+        if (m && (Date.now() - new Date(`${m[1]}T00:00:00+08:00`).getTime()) > 7 * 86400000) {
+          fs.unlinkSync(path.join(__dirname, 'runs', f));
+        }
+      }
+    } catch {}
   }
 
   console.log(`book-all: launching ${filtered.length} parallel run(s): ${filtered.map(r => r.id).join(', ')}`);
@@ -332,5 +382,7 @@ function stripFlag(args, name) {
   // Cleanup tmpdir.
   try { fs.rmSync(resultsDir, { recursive: true, force: true }); } catch {}
 
-  process.exit(failed.length > 0 ? 1 : 0);
+  const exitCode = failed.length > 0 ? 1 : 0;
+  if (isScheduledRun) writeClaim(exitCode === 0 ? 'success' : 'fail', { exitCode, runId });
+  process.exit(exitCode);
 })();

@@ -390,6 +390,27 @@ function canRetrySetup({ attempt, maxAttempts, msRemaining, marginMs = 75000, no
 // 09:00 sprint still fires for everyone simultaneously.
 const SETUP_COMPLETE_MARKER = 'SETUP_STAGED: ready for next user';
 
+// Daily-claim arbitration for the dual-trigger schedule (08:40 user LaunchAgent
+// primary + 08:54 system daemon backstop, both invoking a bare book-all). The
+// first scheduled run of the day claims runs/daily-claim-<date>.json; the
+// second trigger reads it and must decide without ever double-booking:
+//   no claim                          → proceed (fresh claim)
+//   claim running + holder pid alive  → skip   (other run is mid-flight)
+//   claim running + holder pid dead   → proceed (holder crashed; take over)
+//   claim success                     → skip   (today is done)
+//   claim fail                        → proceed (RETRY — the backstop's job)
+// Pure decision; the caller supplies pidAlive so this stays unit-testable.
+function decideDailyClaim({ claim, pidAlive }) {
+  if (!claim || typeof claim !== 'object') return { action: 'proceed', reason: 'no claim — fresh run' };
+  if (claim.status === 'success') return { action: 'skip', reason: `today already completed by pid ${claim.pid} (runId ${claim.runId || '?'})` };
+  if (claim.status === 'running') {
+    if (pidAlive) return { action: 'skip', reason: `another daily run is active (pid ${claim.pid}, started ${claim.startedAt || '?'})` };
+    return { action: 'proceed', reason: `previous run (pid ${claim.pid}) died mid-flight — taking over` };
+  }
+  // status === 'fail' or anything unrecognized: retrying beats silently skipping.
+  return { action: 'proceed', reason: `previous run ended '${claim.status}' — retrying` };
+}
+
 // Validate a Playwright storageState file before handing it to newContext.
 // 2026-06-10: melissa.json had trailing bytes after the JSON ("non-whitespace
 // after JSON at pos 34566") from a non-atomic storageState write that got
@@ -446,6 +467,7 @@ module.exports = {
   isInventoryRowRace,
   spawnStaggerMs,
   SETUP_COMPLETE_MARKER,
+  decideDailyClaim,
   navRetryPlan,
   canRetrySetup,
   storageStatePathIfValid,

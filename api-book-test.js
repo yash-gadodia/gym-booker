@@ -41,7 +41,14 @@ function parseTime(t) {
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     viewport: { width: 1440, height: 900 },
     locale: 'en-SG', timezoneId: 'Asia/Singapore',
-    storageState: fs.existsSync(path.join(__dirname, 'auth.json')) ? path.join(__dirname, 'auth.json') : undefined,
+    // users-auth/yash.json is the live session; root auth.json is the
+    // pre-multi-user legacy copy and goes stale (2026-06-10 bearer timeout).
+    storageState: (() => {
+      const current = path.join(__dirname, 'users-auth', 'yash.json');
+      if (fs.existsSync(current)) return current;
+      const legacy = path.join(__dirname, 'auth.json');
+      return fs.existsSync(legacy) ? legacy : undefined;
+    })(),
   });
   const page = await ctx.newPage();
 
@@ -98,7 +105,7 @@ function parseTime(t) {
     await browser.close();
     if (result && result.ok && !skipCancel) {
       log('AUTO-CANCEL: undoing test booking');
-      const r = spawnSync('node', ['cancel-booking.js', '--date', dateArg, '--time', timeArg, '--kind', kindArg], { cwd: __dirname, encoding: 'utf8' });
+      const r = spawnSync('node', ['cancel-booking.js', '--user', 'yash', '--date', dateArg, '--time', timeArg, '--kind', kindArg], { cwd: __dirname, encoding: 'utf8' });
       log(`  cancel exit=${r.status}\n${r.stdout}\n${r.stderr}`);
     } else if (result && result.ok) {
       log('AUTO-CANCEL skipped (--no-cancel)');

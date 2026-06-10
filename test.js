@@ -11,7 +11,7 @@ const {
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming,
   spawnStaggerMs, navRetryPlan, canRetrySetup, decideAuthAction,
-  SETUP_COMPLETE_MARKER,
+  SETUP_COMPLETE_MARKER, decideDailyClaim,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
 } = require('./lib');
@@ -2864,6 +2864,41 @@ test('canRetrySetup: negative msRemaining (post-9am recovery) retries freely', (
 
 test('canRetrySetup: attempt cap still binds in recovery mode', () => {
   assert.equal(canRetrySetup({ attempt: 6, maxAttempts: 6, msRemaining: -438304, marginMs: 75000, noWait: false }), false);
+});
+
+// ── decideDailyClaim: dual-trigger arbitration (08:40 agent + 08:54 daemon) ──
+// Both schedulers run a bare book-all. The claim must guarantee they never
+// both book (double 9am sprint = double-booking, Mindbody allows it) while
+// making the 08:54 daemon an automatic retry of a failed/crashed 08:40 run.
+
+test('decideDailyClaim: no claim → fresh run proceeds', () => {
+  assert.equal(decideDailyClaim({ claim: null, pidAlive: false }).action, 'proceed');
+});
+
+test('decideDailyClaim: holder alive and running → skip (never double-book)', () => {
+  const v = decideDailyClaim({ claim: { status: 'running', pid: 123 }, pidAlive: true });
+  assert.equal(v.action, 'skip');
+});
+
+test('decideDailyClaim: holder crashed mid-flight → take over', () => {
+  const v = decideDailyClaim({ claim: { status: 'running', pid: 123 }, pidAlive: false });
+  assert.equal(v.action, 'proceed');
+  assert.match(v.reason, /died|taking over/);
+});
+
+test('decideDailyClaim: today already succeeded → skip', () => {
+  assert.equal(decideDailyClaim({ claim: { status: 'success', pid: 123 }, pidAlive: false }).action, 'skip');
+});
+
+test('decideDailyClaim: previous run FAILED → backstop retries', () => {
+  const v = decideDailyClaim({ claim: { status: 'fail', pid: 123 }, pidAlive: false });
+  assert.equal(v.action, 'proceed');
+  assert.match(v.reason, /retrying/);
+});
+
+test('decideDailyClaim: garbage claim never blocks the booking', () => {
+  assert.equal(decideDailyClaim({ claim: 'not-an-object', pidAlive: false }).action, 'proceed');
+  assert.equal(decideDailyClaim({ claim: { status: 'banana' }, pidAlive: false }).action, 'proceed');
 });
 
 test('SETUP_COMPLETE_MARKER: stable contract between book.js (prints) and book-all.js (gates)', () => {
