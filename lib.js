@@ -384,6 +384,16 @@ function canRetrySetup({ attempt, maxAttempts, msRemaining, marginMs = 75000, no
   return noWait || msRemaining < 0 || msRemaining > marginMs;
 }
 
+// Resolve the 9am sprint target. GYM_T9_OVERRIDE_ISO (dress rehearsals) wins;
+// an invalid override throws so a typo'd rehearsal dies loudly instead of
+// sprinting at a NaN instant; no override → the caller's real nine-am value.
+function resolveSprintTarget({ overrideIso, fallback }) {
+  if (!overrideIso) return { t9: fallback, overridden: false };
+  const t9 = new Date(overrideIso);
+  if (isNaN(t9.getTime())) throw new Error(`GYM_T9_OVERRIDE_ISO is not a valid date: ${overrideIso}`);
+  return { t9, overridden: true };
+}
+
 // Printed by book.js (via log) the moment setup — browser, auth, pre-flight —
 // is staged. book-all.js gates the NEXT child's spawn on this line, so the
 // fleet sets up one user at a time (peak load = ONE browser launch) while the
@@ -468,6 +478,7 @@ module.exports = {
   spawnStaggerMs,
   SETUP_COMPLETE_MARKER,
   decideDailyClaim,
+  resolveSprintTarget,
   navRetryPlan,
   canRetrySetup,
   storageStatePathIfValid,

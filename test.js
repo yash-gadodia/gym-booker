@@ -11,7 +11,7 @@ const {
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming,
   spawnStaggerMs, navRetryPlan, canRetrySetup, decideAuthAction,
-  SETUP_COMPLETE_MARKER, decideDailyClaim,
+  SETUP_COMPLETE_MARKER, decideDailyClaim, resolveSprintTarget,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
 } = require('./lib');
@@ -2899,6 +2899,28 @@ test('decideDailyClaim: previous run FAILED → backstop retries', () => {
 test('decideDailyClaim: garbage claim never blocks the booking', () => {
   assert.equal(decideDailyClaim({ claim: 'not-an-object', pidAlive: false }).action, 'proceed');
   assert.equal(decideDailyClaim({ claim: { status: 'banana' }, pidAlive: false }).action, 'proceed');
+});
+
+// ── resolveSprintTarget: the dress-rehearsal T9 override knob ────────────────
+test('resolveSprintTarget: no override → real 9am, not flagged', () => {
+  const nineAm = new Date('2026-06-11T01:00:00.000Z');
+  const r = resolveSprintTarget({ overrideIso: undefined, fallback: nineAm });
+  assert.equal(r.t9, nineAm);
+  assert.equal(r.overridden, false);
+  assert.equal(resolveSprintTarget({ overrideIso: '', fallback: nineAm }).overridden, false);
+});
+
+test('resolveSprintTarget: valid override wins and is flagged (10-06 rehearsal: 337ms drift)', () => {
+  const r = resolveSprintTarget({ overrideIso: '2026-06-10T06:13:36.000Z', fallback: new Date() });
+  assert.equal(r.t9.toISOString(), '2026-06-10T06:13:36.000Z');
+  assert.equal(r.overridden, true);
+});
+
+test('resolveSprintTarget: garbage override throws loudly (never sprint at NaN)', () => {
+  assert.throws(
+    () => resolveSprintTarget({ overrideIso: 'tomorrow-ish', fallback: new Date() }),
+    /not a valid date/,
+  );
 });
 
 test('SETUP_COMPLETE_MARKER: stable contract between book.js (prints) and book-all.js (gates)', () => {

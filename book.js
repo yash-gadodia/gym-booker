@@ -9,7 +9,7 @@ const {
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming, isInventoryRowRace,
   navRetryPlan, canRetrySetup, storageStatePathIfValid, saveStorageStateAtomic,
-  SETUP_COMPLETE_MARKER,
+  SETUP_COMPLETE_MARKER, resolveSprintTarget,
   decideAuthAction, shouldRetryPassFetchPreWindow,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
@@ -914,7 +914,17 @@ async function attemptFallbackBooking(page, plan, target) {
   // worst case if only one booking lands, FIT wins. Stable sort.
   plans.sort((a, b) => (b.kind === 'FIT' ? 1 : 0) - (a.kind === 'FIT' ? 1 : 0));
 
-  const t9 = nineAmToday();
+  // GYM_T9_OVERRIDE_ISO: dress-rehearsal knob. Points the "9am" sprint target
+  // at an arbitrary instant so the FULL time-critical path (stage → standby →
+  // busy-wait → T+0 sprint → book → verify) can be exercised live off-cycle.
+  // Test-only: nothing in launchd sets it; a real booking still happens, so
+  // pair with a quiet slot + cancel-booking afterwards, and give users a
+  // heads-up if any test DM could reach them. Proven 10-06-2026: 337ms drift,
+  // booked + verified + cancelled.
+  const { t9, overridden: t9Overridden } = resolveSprintTarget({
+    overrideIso: process.env.GYM_T9_OVERRIDE_ISO, fallback: nineAmToday(),
+  });
+  if (t9Overridden) log(`⚠️ T9 OVERRIDE ACTIVE (dress rehearsal): sprint target ${t9.toISOString()}`);
 
   log(`RUN ${RUN_ID}`);
   log(`today: ${ymd(today)} ${DAY_SHORT[today.getDay()]}`);
