@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/yash</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>TZ</key>
+		<string>Asia/Singapore</string>
+	</dict>
+	<key>GroupName</key>
+	<string>staff</string>
+	<key>Label</key>
+	<string>com.voltade.gym-booker</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/yash/gym-booker/run-daily.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/yash/gym-booker/runs/launchd.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/yash/gym-booker/runs/launchd.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>8</integer>
+		<key>Minute</key>
+		<integer>40</integer>
+	</dict>
+	<key>UserName</key>
+	<string>yash</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/yash/gym-booker</string>
+</dict>
+</plist>

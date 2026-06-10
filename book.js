@@ -9,6 +9,7 @@ const {
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming, isInventoryRowRace,
   navRetryPlan, canRetrySetup, storageStatePathIfValid, saveStorageStateAtomic,
+  SETUP_COMPLETE_MARKER,
   decideAuthAction, shouldRetryPassFetchPreWindow,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
@@ -86,7 +87,13 @@ async function gotoWithRetry(page, url, msRemaining = null, label = 'nav') {
     } catch (e) {
       lastErr = e;
       log(`${label}: goto attempt ${i}/${attempts} failed (${String(e.message).split('\n')[0].slice(0, 90)})`);
-      if (i < attempts) await page.waitForTimeout(backoffMs);
+      if (i < attempts) {
+        // A timed-out goto can leave its navigation in flight; a bare retry
+        // then dies with "interrupted by another navigation" (2026-06-10, all
+        // users' final attempt). Parking on about:blank cancels the stale nav.
+        await page.goto('about:blank', { timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(backoffMs);
+      }
     }
   }
   throw lastErr;
@@ -148,11 +155,20 @@ async function isLoggedOut(page) {
 
 // Resolve creds once. As of 2026-05-10, every user (including Yash) lives in
 // users.json with creds in the keychain — pass `--user <id>` to look up.
-// The .env fallback path is retained for one-off ad-hoc test runs only and
-// will be empty in normal operation since MINDBODY_* was scrubbed.
+// A bare `node book.js` (no --user) used to read MINDBODY_* from .env, but
+// those were scrubbed in the keychain migration, which silently broke every
+// ad-hoc/recovery invocation that needed a re-login (2026-06-10 09:07 run
+// died exactly there). Fall back to Yash's keychain entry; the empty-creds
+// guard in mb-login still catches the truly-unresolvable case.
 const creds = user
   ? usersLib.getCreds(user)
-  : { email: process.env.MINDBODY_EMAIL, password: process.env.MINDBODY_PASSWORD };
+  : (() => {
+      if (process.env.MINDBODY_EMAIL && process.env.MINDBODY_PASSWORD) {
+        return { email: process.env.MINDBODY_EMAIL, password: process.env.MINDBODY_PASSWORD };
+      }
+      try { return usersLib.getCreds(usersLib.getUser('yash')); }
+      catch { return { email: undefined, password: undefined }; }
+    })();
 
 // Cookie banner appears asynchronously via OneTrust JS. On slow page loads it
 // can arrive AFTER the initial 2.5s settle, then overlay the navbar and block
@@ -185,6 +201,15 @@ async function dismissCookieBanner(page, { maxWaitMs = 0 } = {}) {
 
 async function clickClassesTab(page) {
   for (let i = 0; i < 4; i++) {
+    // The current Mindbody explore page renders the schedule directly — there
+    // is no Classes/Schedule tab at all (2026-06-10: every UI-fallback run died
+    // here hunting for one). If the day chips are already visible, the schedule
+    // is on screen and there is nothing to click.
+    const dayChip = page.locator('[class*="Day_item"]').first();
+    if (await dayChip.count() > 0 && await dayChip.isVisible().catch(() => false)) {
+      log('classes tab: schedule already visible, no tab to click');
+      return;
+    }
     const btn = page.locator('button, a, [role="tab"]').filter({ hasText: /^(Classes|Schedule)$/i }).first();
     if (await btn.count() === 0) { await page.waitForTimeout(1500); continue; }
     try { await btn.scrollIntoViewIfNeeded({ timeout: 3000 }); } catch {}
@@ -919,6 +944,27 @@ async function attemptFallbackBooking(page, plan, target) {
   let setupError = null;          // login or pre-flight failure → all plans fail
   const results = [];             // per-plan { plan, status }
 
+  // One Chromium for the whole fleet: book-all runs launchServer() and hands
+  // children the ws endpoint via BOOKER_WS_ENDPOINT. Five simultaneous
+  // Chromium cold-starts on a loaded mini were the 2026-06-06 and 2026-06-10
+  // wipeouts; connect() to the shared server is near-instant. Any connect
+  // failure falls back to a private launch so a dead/dying server can never
+  // strand a user. browser.close() on a connected browser only disconnects
+  // this child (and its contexts) — the server and other users live on.
+  async function acquireBrowser() {
+    const ws = process.env.BOOKER_WS_ENDPOINT;
+    if (ws) {
+      try {
+        const b = await chromium.connect(ws, { timeout: 15000 });
+        log('browser: connected to shared server');
+        return b;
+      } catch (e) {
+        log(`browser: shared connect failed (${String(e.message).split('\n')[0].slice(0, 80)}) — private launch fallback`);
+      }
+    }
+    return chromium.launch({ headless: true });
+  }
+
   // Setup is retried once on failure (e.g. Chromium child process crash mid-auth
   // — see 2026-05-14 incident: Dani's run died at snap(landed) → next page.evaluate
   // hit "Target page, context or browser has been closed"). Retry relaunches a
@@ -945,7 +991,7 @@ async function attemptFallbackBooking(page, plan, target) {
       try { fs.unlinkSync(authPath); } catch {}
     }
     log(`auth: ${haveCachedAuth ? 'using cached auth.json (login only if expired)' : 'no cached auth.json — will log in'}`);
-    const localBrowser = await chromium.launch({ headless: true });
+    const localBrowser = await acquireBrowser();
     const localCtx = await localBrowser.newContext({
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       viewport: { width: 1440, height: 900 }, locale: 'en-SG', timezoneId: SGT_TZ,
@@ -1048,6 +1094,11 @@ async function attemptFallbackBooking(page, plan, target) {
       break;
     }
   }
+
+  // Tell book-all this child is fully staged so it can release the next user's
+  // setup. Serialized setups keep peak host load to one browser launch at a
+  // time; the 09:00 sprint itself still fires in parallel for everyone.
+  if (!setupError) log(SETUP_COMPLETE_MARKER);
 
   // Per-plan booking flow. Shares browser/ctx (so login + cookies are reused)
   // but receives its OWN page so multiple plans can run in parallel without

@@ -1,7 +1,10 @@
-// Multi-user fan-out wrapper. Spawns Yash's legacy run (no --user) plus one
-// child per user defined in users.json, all in parallel. Each child runs its
-// own busy-wait to 09:00:00.000 SGT with its own browser, auth, and Bearer
-// token, so popular slots are not lost to sequential scheduling delay.
+// Multi-user fan-out wrapper. Spawns one child per user defined in users.json.
+// ONE shared Chromium server backs the whole fleet (children connect() and get
+// an isolated context each), and setups run one-at-a-time gated on the previous
+// child being staged — five simultaneous browser cold-starts thrashed the mini
+// into the 2026-06-06 and 2026-06-10 mass-misses. Every child still busy-waits
+// to 09:00:00.000 SGT with its own auth and Bearer token, so the booking sprint
+// itself stays simultaneous and popular slots are not lost to scheduling delay.
 //
 // Pass-through flags: any args other than --only/--skip are forwarded to every
 // child (e.g. --dry-run, --now, a YYYY-MM-DD date, --no-api-direct).
@@ -19,9 +22,10 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { chromium } = require('playwright');
 const { loadUsers } = require('./users');
 const {
-  buildDailySummary, sendYashAlert, sendTelegram, spawnStaggerMs,
+  buildDailySummary, sendYashAlert, sendTelegram, SETUP_COMPLETE_MARKER,
   buildWatchCandidates, upsertWatch, pruneWatchRegistry,
   YASH_ALERT_CHAT_ID,
 } = require('./lib');
@@ -80,43 +84,87 @@ function stripFlag(args, name) {
   const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'booker-results-'));
   const resultPathFor = (id) => path.join(resultsDir, `${id}.json`);
 
-  // Stagger the spawns so 5 Chromium cold-starts don't hit the host at the same
-  // instant — the 2026-06-06 wipeout was all 5 browsers launching together,
-  // thrashing the Mac Mini into a 58s startup that blew the 9am budget. Each
-  // child still busy-waits to 09:00:00.000, so spreading setup costs nothing at
-  // booking time. ~1.5s steps, capped (negligible vs the ~180s pre-9am budget).
+  // ONE shared Chromium for the whole fleet. launchServer() here, each child
+  // connect()s and creates its own isolated context (per-user cookies/auth).
+  // Five separate Chromium cold-starts at once thrashed the mini into the
+  // 2026-06-06 (58s launch) and 2026-06-10 (every goto timing out) wipeouts.
+  // If the server fails to launch, children fall back to private launches.
+  let browserServer = null;
+  let wsEndpoint = null;
+  try {
+    browserServer = await chromium.launchServer({ headless: true });
+    wsEndpoint = browserServer.wsEndpoint();
+    console.log('book-all: shared Chromium server up');
+  } catch (e) {
+    console.error(`book-all: launchServer failed (${e.message}) — children will launch private browsers`);
+  }
+
+  // Serialize the expensive phase: spawn the next child only when the previous
+  // one is staged (SETUP_COMPLETE_MARKER on stdout), exits early (skip/failure),
+  // or the gate times out. Peak host load becomes ONE browser setup at a time;
+  // the 09:00 sprint is parallel API calls and stays simultaneous for everyone.
+  const SETUP_GATE_TIMEOUT_MS = 150000;
   const children = [];
   for (let i = 0; i < filtered.length; i++) {
     const r = filtered[i];
-    const stagger = spawnStaggerMs(i);
-    if (stagger > 0) await new Promise(res => setTimeout(res, stagger));
     const childArgs = [...r.bookArgs, ...args];
     const tag = `[${r.id}]`;
-    console.log(`${tag} spawn (+${stagger}ms): node book.js ${childArgs.join(' ')}`);
+    console.log(`${tag} spawn: node book.js ${childArgs.join(' ')}`);
     const proc = spawn(NODE_BIN, [BOOK_JS, ...childArgs], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, BOOKER_RESULT_FILE: resultPathFor(r.id) },
+      env: {
+        ...process.env,
+        BOOKER_RESULT_FILE: resultPathFor(r.id),
+        ...(wsEndpoint ? { BOOKER_WS_ENDPOINT: wsEndpoint } : {}),
+      },
     });
+    const isLast = i === filtered.length - 1;
+    let releaseGate = () => {};
+    let gate = null;
+    if (!isLast) {
+      gate = new Promise(resolve => {
+        let released = false;
+        releaseGate = (why) => {
+          if (released) return;
+          released = true;
+          console.log(`${tag} setup gate released (${why})`);
+          resolve();
+        };
+      });
+    }
     // Tag every child line with [id] so interleaved output stays readable.
-    const tagStream = (stream, sink) => {
+    const tagStream = (stream, sink, onLine) => {
       let buf = '';
       stream.on('data', chunk => {
         buf += chunk.toString();
         let idx;
         while ((idx = buf.indexOf('\n')) >= 0) {
-          sink.write(`${tag} ${buf.slice(0, idx + 1)}`);
+          const line = buf.slice(0, idx + 1);
+          sink.write(`${tag} ${line}`);
+          if (onLine) onLine(line);
           buf = buf.slice(idx + 1);
         }
       });
-      stream.on('end', () => { if (buf) sink.write(`${tag} ${buf}\n`); });
+      stream.on('end', () => { if (buf) { sink.write(`${tag} ${buf}\n`); if (onLine) onLine(buf); } });
     };
-    tagStream(proc.stdout, process.stdout);
+    tagStream(proc.stdout, process.stdout, line => {
+      if (line.includes(SETUP_COMPLETE_MARKER)) releaseGate('staged');
+    });
     tagStream(proc.stderr, process.stderr);
-    const done = new Promise(resolve => proc.on('exit', code => resolve({ id: r.id, label: r.label, code })));
+    const done = new Promise(resolve => proc.on('exit', code => {
+      releaseGate(`exited ${code}`);
+      resolve({ id: r.id, label: r.label, code });
+    }));
     children.push({ proc, done });
+    if (!isLast) {
+      const timer = setTimeout(() => releaseGate(`timeout ${SETUP_GATE_TIMEOUT_MS}ms`), SETUP_GATE_TIMEOUT_MS);
+      await gate;
+      clearTimeout(timer);
+    }
   }
 
   const results = await Promise.all(children.map(c => c.done));
+  try { if (browserServer) await browserServer.close(); } catch {}
   const failed = results.filter(r => r.code !== 0);
   console.log(`\nbook-all: ${results.length} run(s) complete; ${failed.length} failed`);
   for (const r of results) console.log(`  ${r.code === 0 ? 'ok' : 'FAIL'} ${r.id} (exit=${r.code})`);
@@ -182,8 +230,13 @@ function stripFlag(args, name) {
   // overrides/all-classes flow.
   //
   // File: runs/bookings-<targetYmd>.json. Only successful bookings are
-  // listed; failures show up in the daily summary, not here.
-  try {
+  // listed; failures show up in the daily summary, not here. Suppressed runs
+  // (--dry-run / --now smoke tests) must never touch it: a dry_run status is
+  // ok:true, so without the guard a smoke test would overwrite the REAL
+  // morning manifest with fake rows that wodup-daily-send then trusts.
+  if (suppress) {
+    console.log('book-all: bookings manifest skipped (dry/now flag)');
+  } else try {
     let manifestDate = null;
     const bookings = {};
     for (const r of filtered) {
@@ -192,7 +245,7 @@ function stripFlag(args, name) {
       try { if (fs.existsSync(file)) parsed = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
       if (!parsed) continue;
       if (parsed.targetYmd && !manifestDate) manifestDate = parsed.targetYmd;
-      const ok = (parsed.results || []).filter(x => x.status && x.status.ok);
+      const ok = (parsed.results || []).filter(x => x.status && x.status.ok && x.status.reason !== 'dry_run');
       if (!ok.length) continue;
       bookings[r.id] = ok.map(x => ({
         kind: x.plan.kind,

@@ -362,7 +362,11 @@ function spawnStaggerMs(index, stepMs = 1500, capMs = 12000) {
 // caller can still alert before 09:00. noWait (manual --now / tests) has no
 // deadline, so use the full budget.
 function navRetryPlan(msRemaining, { noWait = false, perAttemptMs = 22000, maxAttempts = 3, backoffMs = 1000, reserveMs = 8000 } = {}) {
-  if (noWait || msRemaining == null) return { attempts: maxAttempts, perAttemptMs, backoffMs };
+  // Negative msRemaining = 09:00 already passed, i.e. a recovery/manual run.
+  // There is no sprint left to protect, so fail-fast only hurts — the
+  // 2026-06-10 09:07 recovery run got a single attempt and died on one slow
+  // goto. Treat it like noWait: full budget.
+  if (noWait || msRemaining == null || msRemaining < 0) return { attempts: maxAttempts, perAttemptMs, backoffMs };
   const usable = Math.max(0, msRemaining - reserveMs);
   const fit = Math.floor(usable / perAttemptMs);
   const attempts = Math.max(1, Math.min(maxAttempts, fit));
@@ -373,10 +377,18 @@ function navRetryPlan(msRemaining, { noWait = false, perAttemptMs = 22000, maxAt
 // retry after a setup failure. noWait has no deadline. Otherwise we need enough
 // headroom (marginMs) to redo setup AND still book before 09:00 — below that we
 // fail fast so Yash gets alerted instead of a silent miss past the deadline.
+// A NEGATIVE msRemaining means 09:00 already passed (recovery/manual run):
+// nothing left to protect, so retry freely. The attempt cap still applies.
 function canRetrySetup({ attempt, maxAttempts, msRemaining, marginMs = 75000, noWait = false }) {
   if (attempt >= maxAttempts) return false;
-  return noWait || msRemaining > marginMs;
+  return noWait || msRemaining < 0 || msRemaining > marginMs;
 }
+
+// Printed by book.js (via log) the moment setup — browser, auth, pre-flight —
+// is staged. book-all.js gates the NEXT child's spawn on this line, so the
+// fleet sets up one user at a time (peak load = ONE browser launch) while the
+// 09:00 sprint still fires for everyone simultaneously.
+const SETUP_COMPLETE_MARKER = 'SETUP_STAGED: ready for next user';
 
 // Validate a Playwright storageState file before handing it to newContext.
 // 2026-06-10: melissa.json had trailing bytes after the JSON ("non-whitespace
@@ -433,6 +445,7 @@ function decideAuthAction({ haveCachedAuth, loggedOut, bearerOk = null }) {
 module.exports = {
   isInventoryRowRace,
   spawnStaggerMs,
+  SETUP_COMPLETE_MARKER,
   navRetryPlan,
   canRetrySetup,
   storageStatePathIfValid,

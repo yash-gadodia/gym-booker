@@ -11,6 +11,7 @@ const {
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming,
   spawnStaggerMs, navRetryPlan, canRetrySetup, decideAuthAction,
+  SETUP_COMPLETE_MARKER,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
 } = require('./lib');
@@ -2838,6 +2839,39 @@ test('canRetrySetup: REPRODUCES the 2026-06-10 early giveup (cap too low, runway
     canRetrySetup({ attempt: 2, maxAttempts: 6, msRemaining: 211735, marginMs: 75000, noWait: false }),
     true,  // fixed: plenty of runway, keep retrying
   );
+});
+
+// ── 2026-06-10 structural fixes (post-9am recovery + serialized setup) ───────
+// Incident #2 of the day: the 09:07 RECOVERY run after the mass-miss got one
+// goto attempt and zero setup retries, because msRemaining was negative
+// (-431994ms) and the fail-fast logic built to protect the 09:00 sprint was
+// applied to a run with no sprint left to protect. Negative budget now means
+// recovery mode: full retry budget, like noWait.
+
+test('navRetryPlan: REPRODUCES the 09:07 recovery starvation (negative budget → full attempts)', () => {
+  const p = navRetryPlan(-431994);  // exact ms-from-now in the failed recovery log
+  assert.equal(p.attempts, 3);
+  assert.equal(navRetryPlan(-1).attempts, 3);
+});
+
+test('navRetryPlan: zero budget still fails fast (deadline imminent, not passed)', () => {
+  assert.equal(navRetryPlan(0).attempts, 1);
+});
+
+test('canRetrySetup: negative msRemaining (post-9am recovery) retries freely', () => {
+  assert.equal(canRetrySetup({ attempt: 1, maxAttempts: 6, msRemaining: -438304, marginMs: 75000, noWait: false }), true);
+});
+
+test('canRetrySetup: attempt cap still binds in recovery mode', () => {
+  assert.equal(canRetrySetup({ attempt: 6, maxAttempts: 6, msRemaining: -438304, marginMs: 75000, noWait: false }), false);
+});
+
+test('SETUP_COMPLETE_MARKER: stable contract between book.js (prints) and book-all.js (gates)', () => {
+  assert.equal(typeof SETUP_COMPLETE_MARKER, 'string');
+  assert.ok(SETUP_COMPLETE_MARKER.length > 10, 'marker must be distinctive enough not to false-match log noise');
+  // book.js emits it through log() (timestamp prefix); book-all matches with .includes().
+  const sampleLogLine = `[2026-06-10T05:30:00.000Z] ${SETUP_COMPLETE_MARKER}\n`;
+  assert.ok(sampleLogLine.includes(SETUP_COMPLETE_MARKER));
 });
 
 // ── storageState corruption self-heal (2026-06-10 melissa.json) ──────────────
