@@ -8,7 +8,8 @@ const {
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming, isInventoryRowRace,
-  navRetryPlan, canRetrySetup, decideAuthAction, shouldRetryPassFetchPreWindow,
+  navRetryPlan, canRetrySetup, storageStatePathIfValid, saveStorageStateAtomic,
+  decideAuthAction, shouldRetryPassFetchPreWindow,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
 } = require('./lib');
@@ -932,13 +933,23 @@ async function attemptFallbackBooking(page, plan, target) {
     // booking). Forcing an ~80s login every morning was eating the pre-09:00
     // budget and starving the post-login nav of retries — the 2026-06-09
     // Dani/Melissa miss. Cached auth hands that budget back.
-    const haveCachedAuth = fs.existsSync(authPath);
+    // A corrupt auth file (2026-06-10: melissa.json had trailing garbage from a
+    // non-atomic write) makes newContext({ storageState }) throw on EVERY setup
+    // attempt. storageStatePathIfValid returns null for missing OR malformed
+    // files, so we fall through to a fresh login (haveCachedAuth=false) and the
+    // run self-heals instead of dying both attempts.
+    const validAuthPath = storageStatePathIfValid(authPath);
+    const haveCachedAuth = validAuthPath !== null;
+    if (fs.existsSync(authPath) && !haveCachedAuth) {
+      log(`auth: cached ${path.basename(authPath)} is corrupt/unreadable — discarding, logging in fresh`);
+      try { fs.unlinkSync(authPath); } catch {}
+    }
     log(`auth: ${haveCachedAuth ? 'using cached auth.json (login only if expired)' : 'no cached auth.json — will log in'}`);
     const localBrowser = await chromium.launch({ headless: true });
     const localCtx = await localBrowser.newContext({
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       viewport: { width: 1440, height: 900 }, locale: 'en-SG', timezoneId: SGT_TZ,
-      storageState: haveCachedAuth ? authPath : undefined,
+      storageState: haveCachedAuth ? validAuthPath : undefined,
     });
     const localPage = await localCtx.newPage();
     let localDidRelogin = false;
@@ -1000,7 +1011,14 @@ async function attemptFallbackBooking(page, plan, target) {
     return { browser: localBrowser, ctx: localCtx, page: localPage, didRelogin: localDidRelogin, myBookings: localMyBookings };
   }
 
-  const MAX_SETUP_ATTEMPTS = 2;
+  // The real limiter on setup retries is the 75s headroom check in
+  // canRetrySetup, NOT this count — it's just a backstop against a pathological
+  // fast-failing loop. 2026-06-10: with the cap at 2, the run gave up at 08:58
+  // with 211s (3.5 min) still on the clock to 09:00 when Mindbody was briefly
+  // slow — well inside the margin, but the attempt-cap killed it first. Sizing
+  // the cap above what the runway can fit lets a transient blip burn its full
+  // recovery budget while a genuinely-dead network still fails fast on margin.
+  const MAX_SETUP_ATTEMPTS = 6;
   for (let attempt = 1; attempt <= MAX_SETUP_ATTEMPTS; attempt++) {
     let attemptBrowser = null, attemptPage = null;
     try {
@@ -1319,7 +1337,7 @@ async function attemptFallbackBooking(page, plan, target) {
     results.push(...settled);
   }
 
-  try { if (ctx) await ctx.storageState({ path: authPath }); } catch {}
+  try { if (ctx) await saveStorageStateAtomic(ctx, authPath); } catch {}
   try { if (browser) await browser.close(); } catch {}
 
   // Build aggregated Telegram message. For single-plan days this is identical

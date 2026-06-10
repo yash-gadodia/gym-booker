@@ -2826,6 +2826,45 @@ test('canRetrySetup: margin is strict (> not >=)', () => {
   assert.equal(canRetrySetup({ attempt: 1, maxAttempts: 2, msRemaining: 75001, marginMs: 75000, noWait: false }), true);
 });
 
+test('canRetrySetup: REPRODUCES the 2026-06-10 early giveup (cap too low, runway left)', () => {
+  // The incident: setup attempt 2/2 failed at 08:58 with 211735ms (3.5 min) to
+  // 09:00 — far above the 75s margin, so a retry was SAFE, but maxAttempts=2
+  // killed it. With the cap raised to 6 the margin gate (not the count) decides.
+  assert.equal(
+    canRetrySetup({ attempt: 2, maxAttempts: 2, msRemaining: 211735, marginMs: 75000, noWait: false }),
+    false, // old behaviour: gave up with 3.5 min left
+  );
+  assert.equal(
+    canRetrySetup({ attempt: 2, maxAttempts: 6, msRemaining: 211735, marginMs: 75000, noWait: false }),
+    true,  // fixed: plenty of runway, keep retrying
+  );
+});
+
+// ── storageState corruption self-heal (2026-06-10 melissa.json) ──────────────
+const { storageStatePathIfValid } = require('./lib');
+
+test('storageStatePathIfValid: valid Playwright state returns the path', () => {
+  const fake = { existsSync: () => true, readFileSync: () => JSON.stringify({ cookies: [], origins: [] }) };
+  assert.equal(storageStatePathIfValid('/x/auth.json', fake), '/x/auth.json');
+});
+
+test('storageStatePathIfValid: missing file returns null (fresh login)', () => {
+  const fake = { existsSync: () => false, readFileSync: () => { throw new Error('nope'); } };
+  assert.equal(storageStatePathIfValid('/x/auth.json', fake), null);
+});
+
+test('storageStatePathIfValid: trailing-garbage corruption returns null (the melissa.json case)', () => {
+  // Exactly the 2026-06-10 shape: valid JSON object then leftover bytes after it.
+  const corrupt = JSON.stringify({ cookies: [], origins: [] }) + '\n}{"stale":1}';
+  const fake = { existsSync: () => true, readFileSync: () => corrupt };
+  assert.equal(storageStatePathIfValid('/x/melissa.json', fake), null);
+});
+
+test('storageStatePathIfValid: wrong-shape JSON (no cookies array) returns null', () => {
+  const fake = { existsSync: () => true, readFileSync: () => JSON.stringify({ foo: 1 }) };
+  assert.equal(storageStatePathIfValid('/x/auth.json', fake), null);
+});
+
 // ── Failure classifier + waitlist watch registry (2026-06-07) ────────────────
 const {
   classifyBookingFailure, parseClockToMinutes, classStartMs,

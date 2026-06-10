@@ -9,7 +9,7 @@
 //
 // Parameterized by { creds, log } so both callers inject their own creds source
 // (keychain) and logger. Logic is otherwise verbatim from book.js's original.
-const { LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, probeLoginButtonInBrowser } = require('./lib');
+const { LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, probeLoginButtonInBrowser, saveStorageStateAtomic } = require('./lib');
 
 async function clickVisible(page, selector) {
   const els = await page.locator(selector).all();
@@ -92,7 +92,7 @@ async function loginAndSave(page, ctx, authPath, { creds, log = () => {} } = {})
     page.click('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Continue")'),
   ]);
   await page.waitForTimeout(3000);
-  await ctx.storageState({ path: authPath });
+  await saveStorageStateAtomic(ctx, authPath);
   log('AUTH: login complete, auth.json refreshed');
 }
 

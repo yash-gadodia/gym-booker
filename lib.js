@@ -378,6 +378,39 @@ function canRetrySetup({ attempt, maxAttempts, msRemaining, marginMs = 75000, no
   return noWait || msRemaining > marginMs;
 }
 
+// Validate a Playwright storageState file before handing it to newContext.
+// 2026-06-10: melissa.json had trailing bytes after the JSON ("non-whitespace
+// after JSON at pos 34566") from a non-atomic storageState write that got
+// raced/interrupted. newContext({ storageState: badFile }) THROWS, which killed
+// BOTH setup attempts because the corrupt file persisted across the retry.
+// Returning null on a missing/corrupt file lets the caller self-heal by logging
+// in fresh (haveCachedAuth=false) instead of dying every attempt.
+function storageStatePathIfValid(authPath, fsmod = fs) {
+  try {
+    if (!authPath || !fsmod.existsSync(authPath)) return null;
+    const j = JSON.parse(fsmod.readFileSync(authPath, 'utf8'));
+    // Playwright state is { cookies: [...], origins: [...] }. A valid-but-empty
+    // session still has the arrays; anything else is garbage we shouldn't trust.
+    if (!j || !Array.isArray(j.cookies) || !Array.isArray(j.origins)) return null;
+    return authPath;
+  } catch {
+    return null;
+  }
+}
+
+// Atomic storageState write: serialise to a temp file on the same directory,
+// then rename over the target (rename is atomic within a filesystem). A direct
+// ctx.storageState({ path }) can leave trailing garbage if a second process
+// writes the same file or the flush is interrupted — exactly the corruption
+// that bricked melissa.json on 2026-06-10. Pid-suffixed temp avoids two of the
+// user's own runs (booker + waitlist watcher) clobbering each other's temp.
+async function saveStorageStateAtomic(ctx, authPath, { fsmod = fs, pid = process.pid } = {}) {
+  const state = await ctx.storageState();
+  const tmp = `${authPath}.tmp.${pid}`;
+  fsmod.writeFileSync(tmp, JSON.stringify(state));
+  fsmod.renameSync(tmp, authPath);
+}
+
 // The 09:00 auth decision, factored out so it is unit-tested in isolation. Auth
 // was the #1 cause of missed bookings: forcing a fresh ~80s login EVERY run ate
 // the pre-09:00 budget (2026-06-09 Dani/Melissa timeouts), so we switched to
@@ -402,6 +435,8 @@ module.exports = {
   spawnStaggerMs,
   navRetryPlan,
   canRetrySetup,
+  storageStatePathIfValid,
+  saveStorageStateAtomic,
   decideAuthAction,
   DAY_SHORT,
   addDays,
