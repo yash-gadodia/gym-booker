@@ -33,6 +33,7 @@ const path = require('path');
 const fs = require('fs');
 const {
   DAY_SHORT, ymd, classPlan, parseBookingCard, isBookingInUpcoming, findBookingInUpcoming,
+  decideWaitlistAlert,
 } = require('./lib');
 const { loginAndSave } = require('./mb-login');
 const { captureBearerToken, fetchScheduleClasses, findClass } = require('./api-client');
@@ -318,57 +319,42 @@ async function main() {
 
   const dayLabel = DAY_SHORT[target.getDay()];
   const name = process.env.WAITLIST_NAME || 'You';
-  if (bookingDetected) {
+  const action = decideWaitlistAlert({
+    bookingDetected,
+    userOnWaitlist,
+    alreadyWaitlisted: state.userWaitlisted,
+    observed,
+    alertCount: state.alertCount,
+    maxNudges: MAX_WAITLIST_NUDGES,
+  });
+
+  if (action === 'booked') {
     state.userBooked = true;
     state.userBookedAt = state.lastChecked;
-    const msg =
+    await tg(
       `🎉 *${name}, you.re in!*\n` +
       `${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}.\n` +
-      `See you there.`;
-    await tg(msg);
+      `See you there.`);
     console.log('USER BOOKED . sent confirmation DM');
-  } else if (userOnWaitlist) {
-    // She has ALREADY joined the Mindbody waitlist — joining is a one-time
-    // action, so STOP nagging her to do it (2026-06-09: Melissa joined and got
-    // pinged "JOIN WAITLIST" every 2 min, reminder 7+). Send ONE warm sign-off
-    // the first time we see her in the queue, then stay silent until she's
-    // actually promoted (bookingDetected → "you're in!").
-    if (!state.userWaitlisted) {
-      state.userWaitlisted = true;
-      await tg(
-        `✅ *${name}, you're on the waitlist* for ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}.\n` +
-        `Sit tight . Mindbody auto-promotes you when a spot frees, and I'll shout the second you're in. ` +
-        `No need to keep the app open . I'll stop pinging now. 💪`);
-      console.log('USER ON WAITLIST . sent one sign-off, going silent');
-    } else {
-      console.log('user already on waitlist . staying silent (no spam)');
-    }
-  } else if (observed === 'BOOK_NOW') {
-    // A real spot freed (someone cancelled) — time-critical, keep nudging. This
-    // is self-limiting: the slot vanishes (back to FULL/WAITLIST) once taken.
+  } else if (action === 'signoff') {
+    // Just confirmed on the Mindbody waitlist. Send ONE warm sign-off, flip the
+    // STICKY userWaitlisted flag, then stay silent until promoted (→ 'booked').
+    state.userWaitlisted = true;
+    await tg(
+      `✅ *${name}, you're on the waitlist* for ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}.\n` +
+      `Sit tight . Mindbody auto-promotes you when a spot frees, and I'll shout the second you're in. ` +
+      `No need to keep the app open . I'll stop pinging now. 💪`);
+    console.log('USER ON WAITLIST . sent one sign-off, going silent');
+  } else if (action === 'nudge_booknow' || action === 'nudge_waitlist') {
     state.alertCount += 1;
     state.lastAlertedAt = state.lastChecked;
     await tg(buildAlertMessage({
       observed, plan, timeArg, dateArg, target,
       name: process.env.WAITLIST_NAME || null, alertCount: state.alertCount,
     }));
-    console.log(`ALERTED BOOK_NOW (count=${state.alertCount})`);
-  } else if (observed === 'WAITLIST') {
-    // Class full, waitlist open, user hasn't joined yet. Nudge a FEW times then
-    // stop — "join the waitlist" is a stable, one-time ask, not a per-minute one.
-    if (state.alertCount < MAX_WAITLIST_NUDGES) {
-      state.alertCount += 1;
-      state.lastAlertedAt = state.lastChecked;
-      await tg(buildAlertMessage({
-        observed, plan, timeArg, dateArg, target,
-        name: process.env.WAITLIST_NAME || null, alertCount: state.alertCount,
-      }));
-      console.log(`ALERTED WAITLIST (count=${state.alertCount}/${MAX_WAITLIST_NUDGES})`);
-    } else {
-      console.log(`WAITLIST nudge cap reached (${state.alertCount}/${MAX_WAITLIST_NUDGES}) . staying silent`);
-    }
+    console.log(`ALERTED ${observed} (count=${state.alertCount})`);
   } else {
-    console.log(`no alert (status=${observed}, userBooked=${state.userBooked})`);
+    console.log(`no alert (action=${action}, status=${observed}, waitlisted=${state.userWaitlisted}, booked=${state.userBooked})`);
   }
 
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));

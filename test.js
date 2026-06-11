@@ -10,7 +10,7 @@ const {
   timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming,
-  spawnStaggerMs, navRetryPlan, canRetrySetup, decideAuthAction,
+  spawnStaggerMs, navRetryPlan, canRetrySetup, decideAuthAction, decideWaitlistAlert,
   SETUP_COMPLETE_MARKER, decideDailyClaim, resolveSprintTarget,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
@@ -2780,6 +2780,46 @@ test('decideAuthAction: cached + logged-in + probe skipped (null) → use cached
 test('decideAuthAction: no-cache takes precedence over a stale bearerOk flag', () => {
   // Defensive: if somehow bearerOk=true but there is no cached session, still login.
   assert.equal(decideAuthAction({ haveCachedAuth: false, loggedOut: false, bearerOk: true }).login, true);
+});
+
+// ── decideWaitlistAlert: the spam logic that bit twice (Melissa, Dani) ───────
+test('decideWaitlistAlert: real booking/promotion → "you\'re in!", stop', () => {
+  assert.equal(decideWaitlistAlert({ bookingDetected: true, observed: 'WAITLIST', alreadyWaitlisted: true }), 'booked');
+});
+
+test('decideWaitlistAlert: first time seen on the waitlist → one sign-off', () => {
+  assert.equal(decideWaitlistAlert({ userOnWaitlist: true, alreadyWaitlisted: false, observed: 'WAITLIST' }), 'signoff');
+});
+
+test('decideWaitlistAlert: STICKY — already signed off + live detection MISSES → silent (the 2026-06-11 Dani bug)', () => {
+  // The exact failure: userWaitlisted was true, but a later poll did not detect
+  // her waitlist card (userOnWaitlist=false) and the class still read WAITLIST.
+  // Pre-fix this fell through to a nudge ("reminder 2"). Must be silent.
+  assert.equal(decideWaitlistAlert({
+    userOnWaitlist: false, alreadyWaitlisted: true, observed: 'WAITLIST', alertCount: 2, maxNudges: 3,
+  }), 'silent');
+});
+
+test('decideWaitlistAlert: already on waitlist stays silent even on a BOOK_NOW blip', () => {
+  assert.equal(decideWaitlistAlert({ userOnWaitlist: false, alreadyWaitlisted: true, observed: 'BOOK_NOW' }), 'silent');
+});
+
+test('decideWaitlistAlert: full + waitlist open + not yet joined → nudge to join, under the cap', () => {
+  assert.equal(decideWaitlistAlert({ userOnWaitlist: false, alreadyWaitlisted: false, observed: 'WAITLIST', alertCount: 0, maxNudges: 3 }), 'nudge_waitlist');
+  assert.equal(decideWaitlistAlert({ userOnWaitlist: false, alreadyWaitlisted: false, observed: 'WAITLIST', alertCount: 2, maxNudges: 3 }), 'nudge_waitlist');
+});
+
+test('decideWaitlistAlert: WAITLIST nudge stops at the cap', () => {
+  assert.equal(decideWaitlistAlert({ alreadyWaitlisted: false, observed: 'WAITLIST', alertCount: 3, maxNudges: 3 }), 'silent');
+  assert.equal(decideWaitlistAlert({ alreadyWaitlisted: false, observed: 'WAITLIST', alertCount: 9, maxNudges: 3 }), 'silent');
+});
+
+test('decideWaitlistAlert: a freed slot (BOOK_NOW) for a not-yet-joined user → grab-it nudge', () => {
+  assert.equal(decideWaitlistAlert({ alreadyWaitlisted: false, observed: 'BOOK_NOW', alertCount: 5 }), 'nudge_booknow');
+});
+
+test('decideWaitlistAlert: FULL (no waitlist yet) → silent', () => {
+  assert.equal(decideWaitlistAlert({ alreadyWaitlisted: false, observed: 'FULL' }), 'silent');
 });
 
 test('navRetryPlan: ample budget allows the full 3 attempts', () => {

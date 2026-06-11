@@ -473,6 +473,29 @@ function decideAuthAction({ haveCachedAuth, loggedOut, bearerOk = null }) {
   return { login: false, reason: 'cached session valid' };
 }
 
+// What the waitlist watcher should do this poll. Pure so it is unit-tested — this
+// spam logic has bitten TWICE (Melissa 2026-06-09, Dani 2026-06-11): both got
+// re-nudged "JOIN WAITLIST" AFTER the "I'll stop pinging" sign-off, because the
+// sign-off gate was not STICKY — a later poll whose live waitlist-detection
+// missed fell straight through to the nudge branch, which never checked that
+// we'd already confirmed her on the waitlist. `alreadyWaitlisted` (persisted
+// state.userWaitlisted) is now the sticky gate.
+//   'booked'         → real booking/promotion; send "you're in!", stop
+//   'signoff'        → just confirmed on the waitlist; send ONE sign-off, then quiet
+//   'silent'         → do nothing (already signed off, or nothing actionable)
+//   'nudge_booknow'  → a real slot freed; nudge to grab it (self-limiting)
+//   'nudge_waitlist' → full + waitlist open + not yet joined; nudge to join (capped)
+function decideWaitlistAlert({ bookingDetected, userOnWaitlist, alreadyWaitlisted, observed, alertCount = 0, maxNudges = 3 }) {
+  if (bookingDetected) return 'booked';
+  // Sticky: once she has EVER been confirmed on the waitlist, stay quiet (a real
+  // booking is handled above). Never re-nudge "join" on a later detection miss.
+  if (alreadyWaitlisted) return 'silent';
+  if (userOnWaitlist) return 'signoff';
+  if (observed === 'BOOK_NOW') return 'nudge_booknow';
+  if (observed === 'WAITLIST') return alertCount < maxNudges ? 'nudge_waitlist' : 'silent';
+  return 'silent';
+}
+
 module.exports = {
   isInventoryRowRace,
   spawnStaggerMs,
@@ -484,6 +507,7 @@ module.exports = {
   storageStatePathIfValid,
   saveStorageStateAtomic,
   decideAuthAction,
+  decideWaitlistAlert,
   DAY_SHORT,
   addDays,
   ymd,
