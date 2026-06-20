@@ -268,12 +268,24 @@ async function attemptRow(page, plan, time) {
   return { ...hit, status, time };
 }
 
+// Precise wait to targetMs. macOS App Nap / timer coalescing can delay a single
+// long setTimeout by 1-3s; the old 400ms busy-wait cushion couldn't absorb that,
+// so the 9am fire landed up to 3.5s late (drift logs, 06-17..06-20). Fix: re-arm
+// in <=1s chunks (short timers aren't heavily coalesced), then busy-wait the final
+// 3s for sub-ms precision. Paired with caffeinate in run-daily.sh.
+async function spinWaitTo(targetMs) {
+  const SPIN_MS = 3000;
+  while (targetMs - Date.now() > SPIN_MS) {
+    await new Promise(r => setTimeout(r, Math.min(targetMs - Date.now() - SPIN_MS, 1000)));
+  }
+  while (Date.now() < targetMs) {}
+}
+
 async function busyWaitUntil(targetMs) {
   const delta = targetMs - Date.now();
   if (delta <= 0) return;
   log(`sleeping ${delta}ms to target`);
-  if (delta > 500) await new Promise(r => setTimeout(r, delta - 400));
-  while (Date.now() < targetMs) {}
+  await spinWaitTo(targetMs);
 }
 
 // Light refresh: re-click the day tab. Cheap (~1.5s). Used at T-10s to sanity-
@@ -533,8 +545,7 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
     const ms = t9.getTime() - Date.now();
     log(`api-direct: pass-fetch missed pre-window (${passErr.message.slice(0, 80)}); waiting ${ms}ms to 09:00 then retrying`);
     try { await tg(personality.standby(user, { planLine: `${plan.kind} @ ${plan.primaryTime}`, secs: Math.round(ms / 1000), mode: 'api' })); } catch {}
-    if (ms > 500) await new Promise(r => setTimeout(r, ms - 400));
-    while (Date.now() < t9.getTime()) {}
+    await spinWaitTo(t9.getTime());
     log(`api-direct: drift ${Date.now() - t9.getTime()}ms (window now open, retrying pass-fetch)`);
     try {
       const fresh = await fetchScheduleClasses(bearer, { fromIso, toIso });
@@ -565,8 +576,7 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
         mode: 'api',
       }));
       log(`api-direct: waiting ${ms}ms to 09:00:00.000 SGT`);
-      if (ms > 500) await new Promise(r => setTimeout(r, ms - 400));
-      while (Date.now() < t9.getTime()) {}
+      await spinWaitTo(t9.getTime());
       log(`api-direct: drift ${Date.now() - t9.getTime()}ms`);
     }
   }
