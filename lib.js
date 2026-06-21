@@ -466,10 +466,28 @@ async function saveStorageStateAtomic(ctx, authPath, { fsmod = fs, pid = process
 //   - cached, UI logged-in, Bearer present (or not probed) → use cached
 // bearerOk: true / false after probing, or null when the probe was skipped
 // (i.e. we already knew we must log in, so didn't bother probing).
-function decideAuthAction({ haveCachedAuth, loggedOut, bearerOk = null }) {
+//
+// PROACTIVE LOGIN (re-added 2026-06-21): a cached session that LOOKS valid at
+// startup (UI logged-in, Bearer capturable) can still be DEAD by 09:00 — the
+// Bearer is captured once at startup and held ~20min through the spin-wait, and
+// a carried-over session's cookies/token can expire inside that window. On
+// 2026-06-21 Yash + Chew Yien both passed the startup probe yet got HTTP 401
+// ("Invalid bearer token") at 09:00 AND the UI fallback redirected to login —
+// the whole session had died during the wait. Dani/Melissa (re-logged in, fresh
+// session) succeeded with the same 20min hold. So when there is ample headroom
+// to 09:00, force a fresh login regardless of the probe — a freshly-minted
+// session is young enough to survive to 09:00. The startup probe can't see
+// future expiry; only a fresh login guarantees it. Skip when headroom is tight
+// (a ~80s login would blow the 09:00 deadline) — there the cached fast-path is
+// the only option. msToNine null/undefined disables the proactive trigger
+// (legacy callers + tests that don't pass it keep the old probe-only behavior).
+function decideAuthAction({ haveCachedAuth, loggedOut, bearerOk = null, msToNine = null, proactiveThresholdMs = 180000 }) {
   if (!haveCachedAuth) return { login: true, reason: 'no cached session' };
   if (loggedOut) return { login: true, reason: 'cached session expired' };
   if (bearerOk === false) return { login: true, reason: 'zombie session (logged-in UI but no Bearer)' };
+  if (msToNine != null && msToNine >= proactiveThresholdMs) {
+    return { login: true, reason: `proactive fresh login (${Math.round(msToNine/1000)}s headroom; cached session may expire before 09:00)` };
+  }
   return { login: false, reason: 'cached session valid' };
 }
 

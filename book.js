@@ -991,14 +991,14 @@ async function attemptFallbackBooking(page, plan, target) {
   // fresh browser only when we have >75s headroom to 9am SGT (fresh login ~50s
   // + book ~3s + buffer). noWait mode (testing) skips the headroom check.
   async function attemptSetup() {
-    // Use the cached session if we have one; log in only when it's missing or
-    // expired (isLoggedOut, below). The 2026-04-23 "force fresh login every run"
-    // was for the OLD UI-click flow, where a stale session only surfaced on the
-    // BOOK NOW click (too late). The api-direct flow captures the real Bearer
-    // from the page, so a stale session fails SAFE (401 → alert, never a wrong
-    // booking). Forcing an ~80s login every morning was eating the pre-09:00
-    // budget and starving the post-login nav of retries — the 2026-06-09
-    // Dani/Melissa miss. Cached auth hands that budget back.
+    // Auth: decideAuthAction (lib.js) decides login-vs-cached. A cached session
+    // that LOOKS valid at startup can still die before 09:00 (the Bearer is held
+    // ~20min through the spin-wait) — 2026-06-21 Yash + Chew Yien both 401'd at
+    // 09:00 on a probe-clean cached session while fresh-login users succeeded. So
+    // when there's ample headroom we now force a PROACTIVE fresh login (re-adds
+    // the 2026-04-23 behavior, but only when there's time — tight/--now runs keep
+    // the cached fast-path). The 2026-06-09 budget concern (login starving nav
+    // retries) is covered by MAX_SETUP_ATTEMPTS=6 + the 75s headroom check below.
     // A corrupt auth file (2026-06-10: melissa.json had trailing garbage from a
     // non-atomic write) makes newContext({ storageState }) throw on EVERY setup
     // attempt. storageStatePathIfValid returns null for missing OR malformed
@@ -1038,7 +1038,7 @@ async function attemptFallbackBooking(page, plan, target) {
       try { await captureBearerToken(localPage, { timeoutMs: 12000 }); bearerOk = true; }
       catch { bearerOk = false; }
     }
-    const auth = decideAuthAction({ haveCachedAuth, loggedOut, bearerOk });
+    const auth = decideAuthAction({ haveCachedAuth, loggedOut, bearerOk, msToNine: noWait ? null : t9.getTime() - Date.now() });
     if (auth.login) {
       log(`AUTH: ${auth.reason} — logging in`);
       localDidRelogin = true;

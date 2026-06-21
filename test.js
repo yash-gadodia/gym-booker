@@ -2782,6 +2782,31 @@ test('decideAuthAction: no-cache takes precedence over a stale bearerOk flag', (
   assert.equal(decideAuthAction({ haveCachedAuth: false, loggedOut: false, bearerOk: true }).login, true);
 });
 
+test('decideAuthAction: PROACTIVE — probe-clean cached session + ample headroom → fresh login (2026-06-21 Yash/Chew 401)', () => {
+  // The 2026-06-21 fix: Yash + Chew passed the startup probe (logged-in UI,
+  // Bearer present) yet their session died during the ~20min hold → 401 at 09:00.
+  // With ample headroom, force a fresh login despite the clean probe.
+  const a = decideAuthAction({ haveCachedAuth: true, loggedOut: false, bearerOk: true, msToNine: 1200000 });
+  assert.equal(a.login, true);
+  assert.match(a.reason, /proactive/i);
+});
+
+test('decideAuthAction: PROACTIVE skipped on tight headroom → use cached (no time to log in)', () => {
+  // Recovery/near-9am runs: a ~80s login would blow the deadline, so keep cached.
+  const a = decideAuthAction({ haveCachedAuth: true, loggedOut: false, bearerOk: true, msToNine: 20000 });
+  assert.equal(a.login, false);
+  assert.match(a.reason, /valid/);
+});
+
+test('decideAuthAction: PROACTIVE disabled when msToNine omitted (legacy callers unchanged)', () => {
+  assert.equal(decideAuthAction({ haveCachedAuth: true, loggedOut: false, bearerOk: true }).login, false);
+});
+
+test('decideAuthAction: PROACTIVE threshold boundary is inclusive', () => {
+  assert.equal(decideAuthAction({ haveCachedAuth: true, loggedOut: false, bearerOk: true, msToNine: 180000 }).login, true);
+  assert.equal(decideAuthAction({ haveCachedAuth: true, loggedOut: false, bearerOk: true, msToNine: 179999 }).login, false);
+});
+
 // ── decideWaitlistAlert: the spam logic that bit twice (Melissa, Dani) ───────
 test('decideWaitlistAlert: real booking/promotion → "you\'re in!", stop', () => {
   assert.equal(decideWaitlistAlert({ bookingDetected: true, observed: 'WAITLIST', alreadyWaitlisted: true }), 'booked');
