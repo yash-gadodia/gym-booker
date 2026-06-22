@@ -24,6 +24,31 @@ function matchCancelCard(flat, { dayOfMonth, kindArg, timeArg }) {
   return { dayMatch, kindMatch, timeMatch, match: dayMatch && kindMatch && timeMatch };
 }
 
+// Wait for the UPCOMING schedule list to finish loading before enumerating
+// Cancel buttons. The old fixed 3500ms wait captured the page mid-load, so
+// bookings a few days out (still showing "Loading...") were missing from the
+// DOM and reschedule/cancel falsely reported not-found (2026-06-22: couldn't
+// find Yash's confirmed FIT 6:30am two days out). Poll until the Cancel-button
+// count is stable with no spinner, scrolling to nudge any lazy list.
+async function waitForScheduleSettled(page, { maxMs = 15000, log = () => {} } = {}) {
+  const start = Date.now();
+  let lastCount = -1;
+  let stable = 0;
+  while (Date.now() - start < maxMs) {
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await page.waitForTimeout(700);
+    const loading = await page.locator('text=/loading/i').count().catch(() => 0);
+    const count = await page.locator('button:has-text("Cancel"), a:has-text("Cancel")').count().catch(() => 0);
+    if (!loading && count > 0 && count === lastCount) {
+      if (++stable >= 2) { log(`schedule settled: ${count} Cancel buttons, no spinner`); return; }
+    } else {
+      stable = 0;
+    }
+    lastCount = count;
+  }
+  log(`schedule settle timeout after ${maxMs}ms (lastCount=${lastCount}) — proceeding with what's loaded`);
+}
+
 // Export FIRST so test.js can `require('./cancel-booking')` without triggering
 // argv parsing or the Playwright IIFE. Bail before any CLI side-effects.
 if (require.main !== module) {
@@ -70,10 +95,13 @@ function emit(payload) {
 
   log(`target: ${kindArg} @ ${timeArg} on ${dateArg} (dryRun=${dryRun})`);
   await page.goto('https://www.mindbodyonline.com/explore/account/schedule', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(3500);
+  await page.waitForTimeout(2000);
 
   const cookieBtn = await page.$('button:has-text("AGREE AND PROCEED")');
   if (cookieBtn) { try { await cookieBtn.click(); } catch {} await page.waitForTimeout(800); }
+
+  // Let the UPCOMING list fully render so far-out bookings aren't missed.
+  await waitForScheduleSettled(page, { log });
 
   // Day-of-month, used to pick the right card.
   const dayOfMonth = String(parseInt(dateArg.split('-')[2], 10));
