@@ -117,4 +117,4 @@ async function loginAndSave(page, ctx, authPath, { creds, log = () => {} } = {})
   log('AUTH: login complete, auth.json refreshed');
 }
 
-module.exports = { clickVisible, ensureLoginUnblocked, loginAndSave };
+module.exports = { clickVisible, ensureLoginUnblocked, clearSessionAndReload, loginAndSave };
