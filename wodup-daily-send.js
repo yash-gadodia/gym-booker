@@ -19,7 +19,7 @@ const path = require('path');
 const { loadUsers } = require('./users');
 const {
   DOW_SHORT,
-  reformatBodyViaClaude,
+  formatBody,
   assembleDM,
   sanitizeAssertions,
 } = require('./wodup-formatter');
@@ -166,13 +166,11 @@ async function main() {
       }
 
       if (!formattedByKind[kind]) {
-        console.log(`reformatting ${kind} via claude-cli ...`);
-        try {
-          formattedByKind[kind] = reformatBodyViaClaude(raw, kind);
-        } catch (e) {
-          console.error(`claude reformat failed for ${kind}: ${e.message}`);
-          continue;
-        }
+        // Never skip on reformat failure: formatBody falls back to the cleaned
+        // raw workout when claude-cli is down, so the DM still goes out.
+        const { body, source } = formatBody(raw, kind);
+        formattedByKind[kind] = body;
+        console.log(`formatted ${kind} via ${source}`);
       }
 
       const dm = assembleDM({

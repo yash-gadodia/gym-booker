@@ -100,6 +100,44 @@ ${rawWorkout}`;
   return r.stdout.trim();
 }
 
+// Deterministic, no-LLM cleanup of the raw Wodup text. Used as the fallback
+// when claude-cli is unavailable (auth wedge / outage) or returns an error
+// string — so the night-before workout DM ALWAYS goes out instead of being
+// silently skipped (the 2026-06-22 "not really working" symptom: the reformat
+// depended on the same claude-cli that was 401'ing). The raw is already quite
+// readable; we just strip UI noise and em-dashes.
+const WODUP_NOISE = /^(view warm up|view cool down|show less|show full workout|show more|log result|leaderboard|scoring|score|time \(lower is better\)|view results?|results?|comments?|like|share)$/i;
+function cleanRawBody(raw) {
+  return String(raw || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !WODUP_NOISE.test(l))
+    .join('\n')
+    .replace(/—/g, '-')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// True if the "formatted" text is actually a claude-cli error leaking through
+// (it can exit 0 yet print "API Error: 401" / "Overloaded" to stdout) or is
+// implausibly short to be a real workout.
+function looksLikeError(text) {
+  const t = String(text || '').trim();
+  if (t.length < 20) return true;
+  return /(api error|failed to authenticate|invalid authentication|overloaded|usage limit|rate limit|\b401\b|\b429\b|\b529\b)/i.test(t);
+}
+
+// Format a workout body for the DM: try claude-cli for the pretty version, but
+// fall back to the cleaned raw on any failure or error-looking output. Returns
+// { body, source }. Never throws.
+function formatBody(raw, kind, opts = {}) {
+  try {
+    const out = reformatBodyViaClaude(raw, kind, opts);
+    if (!looksLikeError(out)) return { body: out, source: 'claude' };
+  } catch (_) { /* fall through to deterministic fallback */ }
+  return { body: cleanRawBody(raw), source: 'raw-fallback' };
+}
+
 function assembleDM({ dateYmd, kind, formattedBody, rawWorkoutForPacking }) {
   const header = buildHeader(dateYmd, kind);
   const packing = buildPackingBlock(rawWorkoutForPacking || formattedBody);
@@ -134,6 +172,9 @@ module.exports = {
   extractPackingList,
   buildPackingBlock,
   reformatBodyViaClaude,
+  cleanRawBody,
+  looksLikeError,
+  formatBody,
   assembleDM,
   sanitizeAssertions,
   formatWorkoutDM,
