@@ -23,6 +23,7 @@ const {
   assembleDM,
   sanitizeAssertions,
 } = require('./wodup-formatter');
+const { buildTip, dateSeed } = require('./wodup-tips');
 
 const YASH_CHAT_ID = 166637821;
 
@@ -126,6 +127,7 @@ async function main() {
 
   const users = loadUsers();
   const formattedByKind = {};
+  const tipByKind = {};
 
   for (const user of users) {
     if (!user.telegramChatId) {
@@ -173,12 +175,20 @@ async function main() {
         console.log(`formatted ${kind} via ${source}`);
       }
 
+      if (!tipByKind[kind]) {
+        // Movement-specific daily coaching cue. LLM when available, curated
+        // library fallback — never blocks the send.
+        const { tip, source: tipSource } = buildTip(raw, kind, { genericIndex: dateSeed(dateYmd) });
+        tipByKind[kind] = tip;
+        console.log(`tip ${kind} via ${tipSource}: ${tip.slice(0, 80)}`);
+      }
+
       const dm = assembleDM({
         dateYmd,
         kind,
         formattedBody: formattedByKind[kind],
         rawWorkoutForPacking: raw,
-      });
+      }) + `\n\n💡 *Coach's cue:* _${tipByKind[kind]}_`;
 
       const issues = sanitizeAssertions(dm);
       if (issues.length) {
