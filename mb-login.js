@@ -58,6 +58,20 @@ async function ensureLoginUnblocked(page, { maxWaitMs = 8000, log = () => {} } =
   return { ok: false, blocker: lastBlocker, attempts };
 }
 
+// A proactive/zombie re-login (decideAuthAction 2026-06-21) can run while the
+// cached session still renders the logged-IN UI (user's name top-right, NO Login
+// button). loginAndSave must mint a FRESH session, so when there is no Login
+// button we first tear down the old session (cookies + web storage) and reload —
+// that surfaces the Login button. Without this, proactive login dies with
+// "no visible Login button found" (2026-06-22: Yash + Chew Yien missed bookings).
+async function clearSessionAndReload(page, ctx, { log = () => {} } = {}) {
+  const url = page.url();
+  try { await ctx.clearCookies(); } catch {}
+  try { await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch {} }); } catch {}
+  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+  await page.waitForTimeout(1500);
+}
+
 async function loginAndSave(page, ctx, authPath, { creds, log = () => {} } = {}) {
   log('AUTH: re-login starting');
   if (!creds || !creds.email || !creds.password) {
@@ -65,7 +79,14 @@ async function loginAndSave(page, ctx, authPath, { creds, log = () => {} } = {})
   }
   // Confirm the Login button is on top of the z-stack before clicking. Handles
   // cookie banner, modals, or any other late-arriving overlay generically.
-  const unblock = await ensureLoginUnblocked(page, { maxWaitMs: 8000, log });
+  let unblock = await ensureLoginUnblocked(page, { maxWaitMs: 8000, log });
+  if (unblock.reason === 'no-login-button') {
+    // Already logged in (cached session still valid) but we need a fresh one.
+    // Clear the session so the Login button appears, then re-probe.
+    log('AUTH: no Login button — still logged in on cached session; clearing it to force a fresh login');
+    await clearSessionAndReload(page, ctx, { log });
+    unblock = await ensureLoginUnblocked(page, { maxWaitMs: 8000, log });
+  }
   if (!unblock.ok) log(`AUTH: proceeding to click despite blocker (${unblock.blocker}) — Playwright may still recover`);
   let clicked = await clickVisible(page, 'button[data-name="NavigationBar.Login.Button"]');
   if (clicked.ok) log(`AUTH: clicked Login button (${clicked.rect.width}x${clicked.rect.height}) via data-name`);
