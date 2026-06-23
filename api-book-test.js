@@ -10,7 +10,7 @@ const fs = require('fs');
 const { spawnSync } = require('child_process');
 const {
   captureBearerToken, fetchScheduleClasses, findClass,
-  fetchPaymentPassUuid, bookViaApi, generateRecaptchaToken,
+  fetchPaymentPassUuid, createOrder, warmConnection, bookViaApi, generateRecaptchaToken,
 } = require('./api-client');
 
 const args = process.argv.slice(2);
@@ -81,9 +81,18 @@ function parseTime(t) {
     const paymentMethodUuid = await fetchPaymentPassUuid(bearer, target);
     log(`  pass UUID: ${paymentMethodUuid} (${Date.now() - tPay0}ms)`);
 
-    log('STEP 5: fire booking pipeline (orders → booking_items → payments → process)');
+    log('STEP 4b: pre-create order off critical path + warm socket (mirrors the 9am sprint)');
+    const tPre0 = Date.now();
+    let preOrderId = null;
+    try { preOrderId = await createOrder(bearer); log(`  pre-created order ${preOrderId} (${Date.now() - tPre0}ms)`); }
+    catch (e) { log(`  pre-create failed (${e.message.slice(0,120)}) — pipeline will create inline`); }
+    const tWarm0 = Date.now();
+    await warmConnection(bearer, preOrderId);
+    log(`  socket warmed (${Date.now() - tWarm0}ms)`);
+
+    log('STEP 5: fire booking pipeline (booking_items → compute → payments → compute → process)');
     const tBook0 = Date.now();
-    result = await bookViaApi(bearer, { classMeta: target, paymentMethodUuid, recaptchaToken: '' });
+    result = await bookViaApi(bearer, { classMeta: target, paymentMethodUuid, recaptchaToken: '', orderId: preOrderId });
     log(`  result: ${JSON.stringify(result)}`);
     log(`  e2e ${Date.now() - tBook0}ms; per-step: ${JSON.stringify(result.timing || {})}`);
 

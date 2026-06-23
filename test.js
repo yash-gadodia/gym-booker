@@ -3206,3 +3206,87 @@ test('buildWatchCandidates: tolerates malformed/empty runs', () => {
   assert.deepEqual(buildWatchCandidates([{ id: 'x', targetYmd: '2026-06-09' }], { nowMs: ENROLL_NOW }), []); // no results array
   assert.deepEqual(buildWatchCandidates([{ id: 'x', results: [] }], { nowMs: ENROLL_NOW }), []); // no targetYmd
 });
+
+// ─── api-client: pre-created order + warm socket (2026-06-23 Dani-miss fix) ───
+const apiClient = require('./api-client');
+
+test('createOrder: POSTs /v1/orders and returns the order id', async () => {
+  const calls = [];
+  const orig = global.fetch;
+  global.fetch = async (url, opts) => {
+    calls.push({ url, method: opts.method });
+    return { status: 201, ok: true, text: async () => JSON.stringify({ data: { id: 'ord-123' } }) };
+  };
+  try {
+    const id = await apiClient.createOrder('Bearer x');
+    assert.equal(id, 'ord-123');
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].url, /\/v1\/orders$/);
+    assert.equal(calls[0].method, 'POST');
+  } finally { global.fetch = orig; }
+});
+
+test('createOrder: throws on a response with no order id', async () => {
+  const orig = global.fetch;
+  global.fetch = async () => ({ status: 500, ok: false, text: async () => 'boom' });
+  try {
+    await assert.rejects(() => apiClient.createOrder('Bearer x'), /createOrder 500/);
+  } finally { global.fetch = orig; }
+});
+
+test('warmConnection: GETs the pre-created order, swallows errors', async () => {
+  const calls = [];
+  const orig = global.fetch;
+  global.fetch = async (url, opts) => { calls.push({ url, method: opts.method }); throw new Error('reset'); };
+  try {
+    await apiClient.warmConnection('Bearer x', 'ord-9'); // must not throw
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].url, /\/v1\/orders\/ord-9$/);
+    assert.equal(calls[0].method, 'GET');
+  } finally { global.fetch = orig; }
+});
+
+test('bookViaApi: a pre-created orderId skips the /orders POST (starts at booking_items)', async () => {
+  const posted = [];
+  const orig = global.fetch;
+  global.fetch = async (url, opts) => {
+    posted.push(url);
+    // booking_items returns the bookingItem uuid; everything else 202-OK.
+    const body = /\/booking_items$/.test(url)
+      ? { data: { relationships: { bookingItems: { data: [{ id: 'bi-1' }] } } } }
+      : { data: { attributes: { status: { code: 10, title: 'processing_requested' } } } };
+    return { status: 202, ok: true, text: async () => JSON.stringify(body) };
+  };
+  try {
+    const res = await apiClient.bookViaApi('Bearer x', {
+      classMeta: { mb_class_id: 1, mb_class_schedule_id: 2, mb_class_description_id: 3 },
+      paymentMethodUuid: 'pm-1', recaptchaToken: '', orderId: 'ord-pre',
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.timing.orders, 0, 'orders leg is zero when pre-created');
+    assert.equal(posted.some(u => /\/v1\/orders$/.test(u)), false, 'must NOT create a new order');
+    assert.ok(posted.some(u => /\/orders\/ord-pre\/booking_items$/.test(u)), 'uses the pre-created order id');
+  } finally { global.fetch = orig; }
+});
+
+test('bookViaApi: without orderId still creates the order inline (back-compat)', async () => {
+  const posted = [];
+  const orig = global.fetch;
+  global.fetch = async (url, opts) => {
+    posted.push(url);
+    let body;
+    if (/\/v1\/orders$/.test(url)) body = { data: { id: 'ord-inline' } };
+    else if (/\/booking_items$/.test(url)) body = { data: { relationships: { bookingItems: { data: [{ id: 'bi-1' }] } } } };
+    else body = { data: { attributes: { status: { code: 10, title: 'processing_requested' } } } };
+    return { status: 201, ok: true, text: async () => JSON.stringify(body) };
+  };
+  try {
+    const res = await apiClient.bookViaApi('Bearer x', {
+      classMeta: { mb_class_id: 1, mb_class_schedule_id: 2, mb_class_description_id: 3 },
+      paymentMethodUuid: 'pm-1', recaptchaToken: '',
+    });
+    assert.equal(res.ok, true);
+    assert.ok(posted.some(u => /\/v1\/orders$/.test(u)), 'creates the order inline');
+    assert.ok(res.timing.orders >= 0);
+  } finally { global.fetch = orig; }
+});

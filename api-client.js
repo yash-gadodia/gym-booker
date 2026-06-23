@@ -134,12 +134,46 @@ async function fetchPaymentPassUuid(bearer, classMeta) {
   return pass.id;
 }
 
+// Create an empty order (cart). Class- and window-independent — the body is
+// just locationRefJson — so it can be fired BEFORE the 09:00 booking window
+// opens to hoist its latency off the critical path. The /orders POST is the
+// slowest, most variable leg (0.5–6.4s on 2026-06-23, the 6.4s spike cost Dani
+// her slot), so pre-creating it is the single biggest 9am-sprint speedup.
+async function createOrder(bearer) {
+  const r = await fetch(`${MB_HOST}/v1/orders`, {
+    method: 'POST',
+    headers: { ...MB_HEADERS_BASE, authorization: bearer },
+    body: JSON.stringify({ locationRefJson: LOCATION_REF }),
+  });
+  const txt = await r.text();
+  let json = null; try { json = JSON.parse(txt); } catch {}
+  const id = json && json.data && json.data.id;
+  if (!id) throw new Error(`createOrder ${r.status}: ${txt.slice(0, 200)}`);
+  return id;
+}
+
+// Cheap request to heat the undici connection pool to MB_HOST right before the
+// 09:00 sprint, so booking_items reuses a warm TCP/TLS socket instead of paying
+// cold-start handshake latency. Any request to the origin warms the pool; we GET
+// the pre-created order when we have one (also confirms it's still alive). Errors
+// are swallowed — the only goal is an open socket.
+async function warmConnection(bearer, orderId) {
+  const url = orderId ? `${MB_HOST}/v1/orders/${orderId}` : `${MB_HOST}/v1/orders`;
+  const method = orderId ? 'GET' : 'HEAD';
+  try { await fetch(url, { method, headers: { ...MB_HEADERS_BASE, authorization: bearer } }); }
+  catch { /* socket warmth is the only objective; response is irrelevant */ }
+}
+
 // 6-step booking pipeline. After /booking_items and after /payments the order
 // status reverts to "requires_compute" — Mindbody's /process refuses to commit
 // until a /compute_total flips it back to "computed". So the actual minimum
 // flow is: orders → booking_items → compute_total → payments → compute_total → process.
 // First live test (2026-04-27): each leg ~250ms, total ~1.3s.
-async function bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken }) {
+//
+// orderId (optional): a pre-created order from createOrder(). When supplied we
+// skip the /orders POST and start at booking_items — the order is already in the
+// cart, so the 9am critical path is just the seat-grab + commit legs.
+async function bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken, orderId: preOrderId }) {
   const t0 = Date.now();
   const timing = {};
   const headers = { ...MB_HEADERS_BASE, authorization: bearer };
@@ -152,12 +186,17 @@ async function bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken
     return { ok: r.ok || r.status === 201 || r.status === 202, status: r.status, json, txt };
   };
 
-  // 1. Create order.
-  const r1 = await post('orders', '/v1/orders', { locationRefJson: LOCATION_REF });
-  if (!r1.ok || !(r1.json && r1.json.data && r1.json.data.id)) {
-    return { ok: false, step: 'orders', status: r1.status, body: r1.txt.slice(0, 400), timing };
+  // 1. Create order — unless one was pre-created off the critical path.
+  let orderId = preOrderId;
+  if (orderId) {
+    timing.orders = 0;
+  } else {
+    const r1 = await post('orders', '/v1/orders', { locationRefJson: LOCATION_REF });
+    if (!r1.ok || !(r1.json && r1.json.data && r1.json.data.id)) {
+      return { ok: false, step: 'orders', status: r1.status, body: r1.txt.slice(0, 400), timing };
+    }
+    orderId = r1.json.data.id;
   }
-  const orderId = r1.json.data.id;
 
   // 2. Add booking item.
   const r2 = await post('booking_items', `/v1/orders/${orderId}/booking_items`, {
@@ -283,6 +322,8 @@ module.exports = {
   fetchScheduleClasses,
   findClass,
   fetchPaymentPassUuid,
+  createOrder,
+  warmConnection,
   bookViaApi,
   joinWaitlistViaApi,
   generateRecaptchaToken,

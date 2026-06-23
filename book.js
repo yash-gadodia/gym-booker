@@ -16,7 +16,7 @@ const {
 } = require('./lib');
 const {
   captureBearerToken, fetchScheduleClasses, findClass,
-  fetchPaymentPassUuid, bookViaApi, generateRecaptchaToken,
+  fetchPaymentPassUuid, createOrder, warmConnection, bookViaApi, generateRecaptchaToken,
 } = require('./api-client');
 const usersLib = require('./users');
 const personality = require('./personality');
@@ -562,10 +562,14 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
   if (passErr) return { ok: false, reason: 'pass-fetch-failed', detail: passErr.message, time: plan.primaryTime };
   log(`api-direct: pass ${paymentMethodUuid}`);
 
-  // 4. Wait to 09:00:00.000 SGT.
+  // 4. Wait to 09:00:00.000 SGT — pre-creating the order and warming the socket
+  //    on the way down so the 9am sprint starts at booking_items (the seat-grab),
+  //    not a cold /orders POST. On 2026-06-23 that POST spiked to 6.4s and pushed
+  //    Dani's pipeline to 10.6s — the 6:30am class filled in ~6s and she missed.
   const usedTime = classMeta.startTime
     ? (() => { const d = new Date(classMeta.startTime); return `${(d.getHours()%12||12)}:${String(d.getMinutes()).padStart(2,'0')}${d.getHours()<12?'am':'pm'}`; })()
     : plan.primaryTime;
+  let preOrderId = null;
   if (!noWait) {
     const ms = t9.getTime() - Date.now();
     if (ms > 0) {
@@ -576,15 +580,26 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
         mode: 'api',
       }));
       log(`api-direct: waiting ${ms}ms to 09:00:00.000 SGT`);
+      // T-15s: pre-create the order off the critical path (15s buffer absorbs
+      // even a 6s spike). Skipped on near-9am recovery runs (<16s headroom).
+      if (ms > 16000) {
+        await spinWaitTo(t9.getTime() - 15000);
+        try { preOrderId = await createOrder(bearer); log(`api-direct: pre-created order ${preOrderId} (off critical path)`); }
+        catch (e) { log(`api-direct: pre-create order failed (${e.message.slice(0,100)}) — pipeline will create it inline`); }
+      }
+      // T-1.2s: warm the TCP/TLS socket so booking_items hits a hot connection.
+      await spinWaitTo(t9.getTime() - 1200);
+      await warmConnection(bearer, preOrderId);
+      log(`api-direct: socket warmed${preOrderId ? ' (via pre-created order)' : ''}`);
       await spinWaitTo(t9.getTime());
       log(`api-direct: drift ${Date.now() - t9.getTime()}ms`);
     }
   }
 
-  // 5. Fire the booking pipeline.
-  log('api-direct: firing booking pipeline');
+  // 5. Fire the booking pipeline (starts at booking_items when preOrderId is set).
+  log(`api-direct: firing booking pipeline${preOrderId ? ' (order pre-created)' : ''}`);
   let result;
-  try { result = await bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken: '' }); }
+  try { result = await bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken: '', orderId: preOrderId }); }
   catch (e) { return { ok: false, reason: 'pipeline-exception', detail: e.message, time: plan.primaryTime }; }
   log(`api-direct: result ${JSON.stringify(result)}`);
 
@@ -699,7 +714,10 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
     const targetYmd = ymd(target);
     let match = null;       // matched /account/schedule card (has .waitlisted), or null
     let fetched = false;    // did at least one schedule fetch succeed?
-    for (const waitMs of [3500, 3500]) {
+    // 3 tries (~10s): the async commit can land just after 7s (Yash, 2026-06-23,
+    // whose booking succeeded but was wrongly flagged "silently dropped" and
+    // bounced to the UI flow because the 2-try/7s window expired a beat early).
+    for (const waitMs of [3500, 3500, 3000]) {
       await new Promise(r => setTimeout(r, waitMs));
       let upcoming;
       try { upcoming = await fetchMyUpcomingBookings(page); fetched = true; }
@@ -733,7 +751,7 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
       return {
         ok: false,
         reason: 'api-process-silently-dropped',
-        detail: `Mindbody returned processing_requested (orderId=${result.orderId}) but ${plan.kind} @ ${usedTime} on ${targetYmd} did not appear on /account/schedule after 7s — class likely at max capacity, async commit was rejected. Class status at fetch was: ${classMeta.statusText || 'unknown'}.`,
+        detail: `Mindbody returned processing_requested (orderId=${result.orderId}) but ${plan.kind} @ ${usedTime} on ${targetYmd} did not appear on /account/schedule after 10s — class likely at max capacity, async commit was rejected. Class status at fetch was: ${classMeta.statusText || 'unknown'}.`,
         time: usedTime,
         timing: result.timing,
       };
