@@ -570,6 +570,7 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
     ? (() => { const d = new Date(classMeta.startTime); return `${(d.getHours()%12||12)}:${String(d.getMinutes()).padStart(2,'0')}${d.getHours()<12?'am':'pm'}`; })()
     : plan.primaryTime;
   let preOrderId = null;
+  let backupOrderId = null;  // single-use spare for the inventory-race retry
   if (!noWait) {
     const ms = t9.getTime() - Date.now();
     if (ms > 0) {
@@ -586,6 +587,13 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
         await spinWaitTo(t9.getTime() - 15000);
         try { preOrderId = await createOrder(bearer); log(`api-direct: pre-created order ${preOrderId} (off critical path)`); }
         catch (e) { log(`api-direct: pre-create order failed (${e.message.slice(0,100)}) — pipeline will create it inline`); }
+        // Second spare order for the RecordNotUnique retry path. 06-07-2026
+        // (Chew Yien, Wed FIT 6:30): the race retry rebuilt the whole pipeline
+        // including a fresh ~1s /orders POST and landed at T+6.7s — the class
+        // filled inside that window. With a spare, the retry starts at
+        // booking_items. Unused spares are just abandoned carts; harmless.
+        try { backupOrderId = await createOrder(bearer); log(`api-direct: pre-created backup order ${backupOrderId} (spare for race retry)`); }
+        catch (e) { log(`api-direct: backup order pre-create failed (${e.message.slice(0,100)}) — race retry will create inline`); }
       }
       // T-1.2s: warm the TCP/TLS socket so booking_items hits a hot connection.
       await spinWaitTo(t9.getTime() - 1200);
@@ -633,9 +641,11 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
   while (isInventoryRowRace(result) && inventoryRetries < 2) {
     inventoryRetries += 1;
     const backoff = 150 + inventoryRetries * 100;
-    log(`api-direct: booking_items RecordNotUnique (inventory row INSERT race) — retry ${inventoryRetries}/2 after ${backoff}ms`);
+    const retryOrderId = backupOrderId;  // spare order skips the ~1s /orders leg
+    backupOrderId = null;                // single-use: a failed attempt may dirty it
+    log(`api-direct: booking_items RecordNotUnique (inventory row INSERT race) — retry ${inventoryRetries}/2 after ${backoff}ms${retryOrderId ? ` (using backup order ${retryOrderId})` : ''}`);
     await new Promise(r => setTimeout(r, backoff));
-    try { result = await bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken: '' }); }
+    try { result = await bookViaApi(bearer, { classMeta, paymentMethodUuid, recaptchaToken: '', orderId: retryOrderId || undefined }); }
     catch (e) { log(`api-direct: retry ${inventoryRetries} exception (${e.message.slice(0,140)})`); break; }
     log(`api-direct: retry ${inventoryRetries} result ${JSON.stringify(result)}`);
   }
