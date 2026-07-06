@@ -112,9 +112,13 @@ async function fetchWorkouts(dateYmd) {
     
     const url = `${WODUP_TIMELINE_URL}?date=${dateYmd}`;
     console.log(`wodup-client: fetching ${url}...`);
-    
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await page.waitForTimeout(1500);
+
+    await page.goto(url, { waitUntil: 'commit', timeout: 30000 });
+    await page.waitForFunction(() => {
+      const lines = document.body.innerText.split('\n').map((l) => l.trim());
+      const kinds = ['FIT', 'BURN', 'LIFT', 'STEAM', 'GYMNASTICS', 'RUN', 'CONDITIONING'];
+      return kinds.some((k) => lines.includes(k)) || document.body.innerText.includes('Choose which programs');
+    }, { timeout: 30000 });
     
     // Click "Show full workout" to expand full content
     const fullWorkoutButtons = await page.$$('text=Show full workout');

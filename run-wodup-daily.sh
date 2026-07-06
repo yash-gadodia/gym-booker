@@ -25,6 +25,14 @@ echo "=== wodup-daily $(date) ==="
 echo "log: $LOG_FILE"
 echo "pwd: $REPO_DIR"
 
+# Self-heal missing deps. node_modules is gitignored and has been wiped out from
+# under the cron at least once (2026-06-20), silently breaking every gym job that
+# shares it. Reinstall + ensure the playwright browser before doing real work.
+if [[ ! -d "$REPO_DIR/node_modules/playwright" ]]; then
+  echo "node_modules/playwright missing — running npm ci + playwright install"
+  npm ci && npx playwright install chromium
+fi
+
 # DM-on-failure trap: any non-zero exit pings Yash so a silent cron drop
 # doesn't go unnoticed for days (which is exactly how this bug was spotted).
 # Reads TG creds from .env (loaded after this trap is wired).

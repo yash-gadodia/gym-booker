@@ -57,14 +57,31 @@ function manifestClasses(user, dateYmd) {
   return entries.map(e => ({ kind: e.kind, primaryTime: e.time }));
 }
 
-// Merge static schedule + manifest. Manifest wins on conflicts (it reflects
-// reality). De-dupe on `${kind}|${time}`.
+// Read the waitlist registry (runs/waitlist-registry.json) and return
+// {kind, primaryTime} entries where `user` is actively waitlisted on dateYmd.
+// Waitlisted users haven't secured a booking, but they still train if a slot
+// opens — so they get the WOD too (Yash 2026-06-23).
+function waitlistClasses(user, dateYmd) {
+  if (!user) return [];
+  const file = path.join(__dirname, 'runs', 'waitlist-registry.json');
+  if (!fs.existsSync(file)) return [];
+  let reg;
+  try { reg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return []; }
+  const watches = (reg && reg.watches) || [];
+  return watches
+    .filter(w => w && w.user === user.id && w.date === dateYmd && w.kind)
+    .map(w => ({ kind: w.kind, primaryTime: w.time }));
+}
+
+// Merge static schedule + manifest + waitlist. Manifest wins on conflicts (it
+// reflects reality). De-dupe on `${kind}|${time}`.
 function classesFor(user, dateYmd) {
   const fromManifest = manifestClasses(user, dateYmd);
   const fromSchedule = scheduledClasses(user, dateYmd);
+  const fromWaitlist = waitlistClasses(user, dateYmd);
   const seen = new Set();
   const out = [];
-  for (const c of [...fromManifest, ...fromSchedule]) {
+  for (const c of [...fromManifest, ...fromSchedule, ...fromWaitlist]) {
     if (!c || !c.kind) continue;
     const key = `${String(c.kind).toUpperCase()}|${c.primaryTime || ''}`;
     if (seen.has(key)) continue;
@@ -74,19 +91,28 @@ function classesFor(user, dateYmd) {
   return out;
 }
 
-async function sendTg(chatId, text, token) {
+async function sendTg(chatId, text, token, opts = {}) {
+  const body = {
+    chat_id: chatId,
+    text,
+    disable_web_page_preview: true,
+  };
+  if (!opts.plain) body.parse_mode = 'Markdown';
   const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: 'Markdown',
-      disable_web_page_preview: true,
-    }),
+    body: JSON.stringify(body),
   });
   const j = await r.json().catch(() => null);
-  return { ok: r.ok && j && j.ok, status: r.status, body: j };
+  const ok = r.ok && j && j.ok;
+  // LLM-generated bodies/tips can contain unbalanced Markdown (`_ * [ ` `),
+  // which legacy Markdown rejects with 400 "can't parse entities". Rather than
+  // drop the night-before DM, resend once as plain text so the WOD still lands.
+  if (!ok && !opts.plain && j && /can't parse entities/i.test(j.description || '')) {
+    console.log(`  markdown parse failed, retrying plain text for ${chatId}`);
+    return sendTg(chatId, text, token, { plain: true });
+  }
+  return { ok, status: r.status, body: j };
 }
 
 async function main() {
@@ -248,7 +274,7 @@ function isAllExpectedSent(state, users, dateYmd) {
 
 // Export the resolution helpers so the test suite can exercise the
 // schedule-vs-manifest precedence without spawning the full sender.
-module.exports = { scheduledClasses, manifestClasses, classesFor, dayOfWeekFor, isAllExpectedSent };
+module.exports = { scheduledClasses, manifestClasses, waitlistClasses, classesFor, dayOfWeekFor, isAllExpectedSent };
 
 if (require.main === module) {
   main().catch(e => {
