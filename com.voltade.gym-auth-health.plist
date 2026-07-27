@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.voltade.gym-auth-health</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/node</string>
+		<string>/Users/yash/gym-booker/auth-health.js</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/yash/gym-booker</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>21</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/yash</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>TZ</key>
+		<string>Asia/Singapore</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/yash/gym-booker/runs/auth-health-stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/yash/gym-booker/runs/auth-health-stderr.log</string>
+</dict>
+</plist>
