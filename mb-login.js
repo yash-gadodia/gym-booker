@@ -105,7 +105,33 @@ async function loginAndSave(page, ctx, authPath, { creds, log = () => {} } = {})
   await emailInput.waitFor({ state: 'visible', timeout: 15000 });
   await emailInput.fill(creds.email);
   await page.click('button:has-text("Continue"), button:has-text("Next"), button[type="submit"]');
-  await page.waitForSelector('input[type="password"]', { timeout: 20000 });
+  // Google/SSO-linked accounts (2026-07-27: Dani): after the email step Mindbody
+  // routes to signin/external with "Continue with Google" and NO password field,
+  // so waitForSelector('input[type=password]') would just time out opaquely for
+  // 20s and retry 6x. Detect it fast and throw an ACTIONABLE error the alert +
+  // per-user notify can act on, instead of a generic selector timeout.
+  const ssoRace = await Promise.race([
+    page.waitForSelector('input[type="password"]', { timeout: 20000 }).then(() => 'password').catch(() => 'timeout'),
+    page.waitForFunction(() => {
+      const t = document.body ? document.body.innerText : '';
+      return /Continue with Google|used Google to login|Continue with Facebook|Continue with Apple/i.test(t)
+        ? (/Facebook/i.test(t) ? 'facebook' : /Apple/i.test(t) ? 'apple' : 'google')
+        : false;
+    }, { timeout: 20000 }).then(h => String(h)).catch(() => 'timeout'),
+  ]);
+  if (ssoRace && ssoRace !== 'password' && ssoRace !== 'timeout') {
+    const err = new Error(
+      `Mindbody account is ${ssoRace.toUpperCase()}-SSO linked (no password login). ` +
+      `Password-based auto-login is impossible; user must re-book manually or re-link a password in Mindbody.`
+    );
+    err.code = 'SSO_LINKED';
+    err.provider = ssoRace;
+    throw err;
+  }
+  if (ssoRace === 'timeout') {
+    // Preserve the original diagnostic for the genuinely-slow case.
+    await page.waitForSelector('input[type="password"]', { timeout: 5000 });
+  }
   await page.waitForTimeout(800);
   await page.fill('input[type="password"]', creds.password);
   await Promise.all([

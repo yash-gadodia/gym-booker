@@ -1130,6 +1130,13 @@ async function attemptFallbackBooking(page, plan, target) {
       try { if (attemptBrowser) await attemptBrowser.close(); } catch {}
       browser = null; ctx = null; page = null;
       setupError = e;
+      // Google/Facebook/Apple-SSO accounts can NEVER complete a headless password
+      // login — retrying 6x is pointless and just delays the alert. Fail fast so
+      // the user is told to book manually / re-link. (2026-07-27: Dani.)
+      if (e && e.code === 'SSO_LINKED') {
+        log(`SETUP ABORT: account is ${e.provider}-SSO linked — password login impossible, no retry`);
+        break;
+      }
       const msRemaining = t9.getTime() - Date.now();
       const canRetry = canRetrySetup({ attempt, maxAttempts: MAX_SETUP_ATTEMPTS, msRemaining, marginMs: 75000, noWait });
       if (canRetry) {
