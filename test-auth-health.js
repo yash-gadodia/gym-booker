@@ -153,3 +153,47 @@ test('backoff caps at 24h', () => {
   assert.strictEqual(d.backoffMs, 24 * 3600000, 'never backs off beyond a day');
   assert.strictEqual(d.alert, true);
 });
+
+// --- the probed day must be the day the NEXT booker run fills ---------------
+//
+// Found 28-07 while stress-testing durability. The booker runs 08:40 SGT and
+// targets day+2. auth-health runs 21:00 SGT, and e2e-check's own default is
+// "day+2 from now" — at 21:00 that is the day BEFORE what tomorrow morning's
+// run books. Gating the eve-of-booking warning on that off-by-one day would
+// silently skip any user with no class on D+2 but a class on D+3: the exact
+// miss this alerting path exists to prevent.
+
+const { nextBookingTargetYmd } = require('./lib');
+const sgt = (iso) => new Date(iso).getTime(); // iso carries +08:00
+
+test('THE OFF-BY-ONE: 21:00 evening probe targets what TOMORROW morning books', () => {
+  // 21:00 SGT Tue 28-07 → next run is Wed 29-07 08:40 → it books Fri 31-07.
+  assert.strictEqual(nextBookingTargetYmd(sgt('2026-07-28T21:00:00+08:00')), '2026-07-31');
+});
+
+test('before the 08:40 run, the target is TODAY\'s run (+2)', () => {
+  // 07:00 SGT Wed 29-07 → today's 08:40 run has not fired yet → books 31-07.
+  assert.strictEqual(nextBookingTargetYmd(sgt('2026-07-29T07:00:00+08:00')), '2026-07-31');
+});
+
+test('after the 08:40 run, the target rolls to tomorrow\'s run', () => {
+  // 09:00 SGT Wed 29-07 → today's run is done → next is 30-07, booking 01-08.
+  assert.strictEqual(nextBookingTargetYmd(sgt('2026-07-29T09:00:00+08:00')), '2026-08-01');
+});
+
+test('boundary: 08:39 is still today\'s run, 08:41 is tomorrow\'s', () => {
+  assert.strictEqual(nextBookingTargetYmd(sgt('2026-07-29T08:39:00+08:00')), '2026-07-31');
+  assert.strictEqual(nextBookingTargetYmd(sgt('2026-07-29T08:41:00+08:00')), '2026-08-01');
+});
+
+test('rolls across month and year boundaries', () => {
+  assert.strictEqual(nextBookingTargetYmd(sgt('2026-07-30T21:00:00+08:00')), '2026-08-02');
+  assert.strictEqual(nextBookingTargetYmd(sgt('2026-12-30T21:00:00+08:00')), '2027-01-02');
+});
+
+test('a user with NO class on D+2 but a class on D+3 still gets warned', () => {
+  // Dani is off on 2026-08-05 (per overrides) but books on 2026-08-06. The old
+  // code probed D+2 and would have gone quiet; the target must be D+3.
+  const evening = sgt('2026-08-03T21:00:00+08:00');
+  assert.strictEqual(nextBookingTargetYmd(evening), '2026-08-06', 'gates on the real at-risk day');
+});

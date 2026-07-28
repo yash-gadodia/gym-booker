@@ -514,6 +514,24 @@ function decideWaitlistAlert({ bookingDetected, userOnWaitlist, alreadyWaitliste
   return 'silent';
 }
 
+// Which booking day is the NEXT booker run going to fill?
+//
+// The booker fires at 08:40 SGT and targets day+2. auth-health runs at 21:00
+// SGT, and e2e-check's own default is "day+2 from now" — which at 21:00 is the
+// day BEFORE what tomorrow morning's run will actually book. Gating the
+// eve-of-booking warning on that off-by-one day means a user with no class on
+// D+2 but a class on D+3 gets silently skipped: exactly the miss this whole
+// alerting path exists to prevent. So compute it from the next actual run.
+//
+// Next run = next occurrence of 08:40 SGT; its target = that run's date + 2.
+function nextBookingTargetYmd(nowMs = Date.now(), { hour = 8, minute = 40 } = {}) {
+  const sgt = new Date(nowMs + 8 * 3600 * 1000); // UTC getters now read as SGT wall clock
+  const runsLaterToday = (sgt.getUTCHours() * 60 + sgt.getUTCMinutes()) < (hour * 60 + minute);
+  const d = new Date(sgt);
+  d.setUTCDate(d.getUTCDate() + (runsLaterToday ? 0 : 1) + 2);
+  return d.toISOString().slice(0, 10);
+}
+
 // A single ERROR poll is noise (transient nav/timeout) and rightly stays silent.
 // A STREAK of them means the watch is dead and nobody knows. On 2026-07-28
 // Dani's Lift@7:15am watch polled 637 times, every one `status=ERROR,
@@ -541,6 +559,7 @@ function decideWatchErrorEscalation({
 }
 
 module.exports = {
+  nextBookingTargetYmd,
   decideWatchErrorEscalation,
   isInventoryRowRace,
   spawnStaggerMs,

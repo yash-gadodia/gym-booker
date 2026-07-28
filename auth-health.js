@@ -29,7 +29,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { loadUsers } = require('./users');
-const { resolveBookingsForDate, loadOverrides } = require('./lib');
+const { resolveBookingsForDate, loadOverrides, nextBookingTargetYmd } = require('./lib');
 
 const DIR = __dirname;
 const STATE = path.join(DIR, 'runs', 'auth-health-state.json');
@@ -104,11 +104,16 @@ function classesOn(userId, targetYmd) {
   } catch (e) { log(`classesOn(${userId}) failed: ${e.message}`); return null; }
 }
 
-function runProbe() {
+function runProbe(target) {
+  // Probe the day the NEXT booker run will actually book, not e2e-check's own
+  // "day+2 from now" default — at 21:00 those differ by one day (see
+  // nextBookingTargetYmd). Everything downstream keys off parsed.target, so
+  // passing it explicitly keeps the gating and the message wording honest.
+  //
   // e2e-check exits 1 when any user is not-ok; execFileSync throws on non-zero
   // but still gives us stdout, so read it either way.
   try {
-    return execFileSync('node', ['e2e-check.js', '--all', '--json'], { cwd: DIR, timeout: 300000 }).toString();
+    return execFileSync('node', ['e2e-check.js', target, '--all', '--json'], { cwd: DIR, timeout: 300000 }).toString();
   } catch (e) {
     if (e.stdout) return e.stdout.toString();
     throw e;
@@ -118,7 +123,7 @@ function runProbe() {
 (function main() {
   let parsed;
   try {
-    const out = runProbe();
+    const out = runProbe(nextBookingTargetYmd());
     const line = out.trim().split('\n').filter(Boolean).pop();
     parsed = JSON.parse(line);
   } catch (e) {
