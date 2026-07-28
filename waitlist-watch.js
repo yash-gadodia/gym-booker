@@ -33,7 +33,7 @@ const path = require('path');
 const fs = require('fs');
 const {
   DAY_SHORT, ymd, classPlan, parseBookingCard, isBookingInUpcoming, findBookingInUpcoming,
-  decideWaitlistAlert,
+  decideWaitlistAlert, decideWatchErrorEscalation, sendYashAlert,
 } = require('./lib');
 const { loginAndSave } = require('./mb-login');
 const { captureBearerToken, fetchScheduleClasses, findClass } = require('./api-client');
@@ -355,6 +355,37 @@ async function main() {
     console.log(`ALERTED ${observed} (count=${state.alertCount})`);
   } else {
     console.log(`no alert (action=${action}, status=${observed}, waitlisted=${state.userWaitlisted}, booked=${state.userBooked})`);
+  }
+
+  // A dead watch must not stay quiet. Track the ERROR streak and page Yash once
+  // it is clearly not transient, with exponential backoff so it never becomes
+  // STILL-DOWN spam. (2026-07-28: 637 consecutive silent ERROR polls on Dani's
+  // watch while her Mindbody login was broken — see decideWatchErrorEscalation.)
+  if (state.lastStatus === 'ERROR') {
+    state.errorStreak = (state.errorStreak || 0) + 1;
+    const esc = decideWatchErrorEscalation({
+      errorStreak: state.errorStreak,
+      lastErrorAlertAt: state.lastErrorAlertAt || null,
+      errorAlertCount: state.errorAlertCount || 0,
+    });
+    if (esc.alert) {
+      state.errorAlertCount = (state.errorAlertCount || 0) + 1;
+      state.lastErrorAlertAt = state.lastChecked;
+      const who = process.env.WAITLIST_USER || 'unknown';
+      await sendYashAlert(
+        `🚨 Waitlist watch is DEAD — ${who}: ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}\n` +
+        `${state.errorStreak} consecutive failed polls. This watch is NOT protecting them.\n` +
+        `Last error: ${String(observedText || '').slice(0, 200)}`
+      ).catch(() => {});
+      console.log(`ESCALATED dead watch (streak=${state.errorStreak}, alert #${state.errorAlertCount})`);
+    } else {
+      console.log(`error streak=${state.errorStreak} (${esc.reason})`);
+    }
+  } else if (state.errorStreak) {
+    console.log(`error streak cleared after ${state.errorStreak} (now ${state.lastStatus})`);
+    state.errorStreak = 0;
+    state.lastErrorAlertAt = null;
+    state.errorAlertCount = 0;
   }
 
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));

@@ -514,7 +514,34 @@ function decideWaitlistAlert({ bookingDetected, userOnWaitlist, alreadyWaitliste
   return 'silent';
 }
 
+// A single ERROR poll is noise (transient nav/timeout) and rightly stays silent.
+// A STREAK of them means the watch is dead and nobody knows. On 2026-07-28
+// Dani's Lift@7:15am watch polled 637 times, every one `status=ERROR,
+// action=silent`, because her Mindbody login was broken — the watch that was
+// supposed to be her safety net after the missed booking was itself dead all
+// morning, silently.
+//
+// Escalate once a streak is established, then back off exponentially
+// (1h → 2h → 4h … capped at 24h) so a known-broken watch never turns into
+// fixed-interval "STILL DOWN" spam.
+function decideWatchErrorEscalation({
+  errorStreak,
+  lastErrorAlertAt = null,
+  errorAlertCount = 0,
+  nowMs = Date.now(),
+  minStreak = 5,
+} = {}) {
+  if (!errorStreak || errorStreak < minStreak) return { alert: false, reason: 'below-streak' };
+  if (!lastErrorAlertAt) return { alert: true, reason: 'first-escalation' };
+  const backoffMs = Math.min(3600000 * Math.pow(2, Math.max(0, errorAlertCount - 1)), 24 * 3600000);
+  const due = nowMs - new Date(lastErrorAlertAt).getTime() >= backoffMs;
+  return due
+    ? { alert: true, reason: 'backoff-elapsed', backoffMs }
+    : { alert: false, reason: 'backoff-pending', backoffMs };
+}
+
 module.exports = {
+  decideWatchErrorEscalation,
   isInventoryRowRace,
   spawnStaggerMs,
   SETUP_COMPLETE_MARKER,
