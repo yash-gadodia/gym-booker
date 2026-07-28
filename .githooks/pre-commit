@@ -1,0 +1,21 @@
+#!/bin/sh
+# Run the suite before every commit.
+#
+# Why this exists: on 27-07-2026 the Google-SSO guard was added to mb-login.js
+# and landed with 2 of 4 test-mb-login tests already failing (the fakes had no
+# waitForFunction). Nothing ran the tests, so nobody noticed for a full day —
+# and the very next morning Dani missed FIT @ 6:30am Thu 30-07. Tests that
+# nothing executes are documentation, not a safety net.
+#
+# The whole suite is ~6s and needs no browser or network, so there is no excuse
+# to skip it. Genuine emergency override: git commit --no-verify.
+set -e
+
+echo "pre-commit: running gym-booker test suite..."
+if ! npm test --silent; then
+  echo ""
+  echo "✖ pre-commit BLOCKED: tests are failing."
+  echo "  Fix them, or use 'git commit --no-verify' if this is a real emergency."
+  exit 1
+fi
+echo "✔ pre-commit: tests green"
