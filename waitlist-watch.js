@@ -33,8 +33,26 @@ const path = require('path');
 const fs = require('fs');
 const {
   DAY_SHORT, ymd, classPlan, parseBookingCard, isBookingInUpcoming, findBookingInUpcoming,
-  decideWaitlistAlert, decideWatchErrorEscalation, sendYashAlert,
+  decideWaitlistAlert, decideWatchErrorEscalation, isTerminalWatchError, sendYashAlert,
 } = require('./lib');
+
+// Terminal causes are a property of the USER's account, not of one watch. Dani
+// had two watches armed and both paged for the same SSO break 10 minutes apart
+// (28-07). Dedup across every watch for that user via a shared file so one
+// root cause produces exactly one page.
+const TERMINAL_FILE = path.join(__dirname, 'runs', 'watch-terminal-alerts.json');
+function readTerminal() {
+  try { return JSON.parse(fs.readFileSync(TERMINAL_FILE, 'utf8')); } catch { return {}; }
+}
+function markTerminal(key, detail) {
+  const j = readTerminal();
+  j[key] = { at: new Date().toISOString(), detail: String(detail || '').slice(0, 300) };
+  try { fs.writeFileSync(TERMINAL_FILE, JSON.stringify(j, null, 2)); } catch {}
+}
+function clearTerminal(key) {
+  const j = readTerminal();
+  if (j[key]) { delete j[key]; try { fs.writeFileSync(TERMINAL_FILE, JSON.stringify(j, null, 2)); } catch {} }
+}
 const { loginAndSave } = require('./mb-login');
 const { captureBearerToken, fetchScheduleClasses, findClass } = require('./api-client');
 
@@ -361,28 +379,46 @@ async function main() {
   // it is clearly not transient, with exponential backoff so it never becomes
   // STILL-DOWN spam. (2026-07-28: 637 consecutive silent ERROR polls on Dani's
   // watch while her Mindbody login was broken — see decideWatchErrorEscalation.)
+  const who = process.env.WAITLIST_USER || 'unknown';
+  const terminalKey = `${who}:terminal`;
   if (state.lastStatus === 'ERROR') {
     state.errorStreak = (state.errorStreak || 0) + 1;
+    const terminal = isTerminalWatchError(observedText);
     const esc = decideWatchErrorEscalation({
       errorStreak: state.errorStreak,
       lastErrorAlertAt: state.lastErrorAlertAt || null,
       errorAlertCount: state.errorAlertCount || 0,
+      terminal,
+      terminalAlerted: terminal && !!readTerminal()[terminalKey],
     });
     if (esc.alert) {
       state.errorAlertCount = (state.errorAlertCount || 0) + 1;
       state.lastErrorAlertAt = state.lastChecked;
-      const who = process.env.WAITLIST_USER || 'unknown';
+      if (terminal) markTerminal(terminalKey, observedText);
       await sendYashAlert(
-        `🚨 Waitlist watch is DEAD — ${who}: ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}\n` +
-        `${state.errorStreak} consecutive failed polls. This watch is NOT protecting them.\n` +
-        `Last error: ${String(observedText || '').slice(0, 200)}`
+        terminal
+          // Blocked on a human, so say so and say it once. No "investigate this"
+          // framing for something that cannot be investigated further.
+          ? `⛔ Waitlist watch parked — ${who}: ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}\n` +
+            `Blocked by a known account issue, not a bug. All of ${who}'s watches are inert until it clears, ` +
+            `and they have been told what to do.\n` +
+            `Cause: ${String(observedText || '').slice(0, 200)}\n` +
+            `This is the only ping for this — it will confirm automatically when it recovers.`
+          : `🚨 Waitlist watch is DEAD — ${who}: ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)}\n` +
+            `${state.errorStreak} consecutive failed polls. This watch is NOT protecting them.\n` +
+            `Last error: ${String(observedText || '').slice(0, 200)}`
       ).catch(() => {});
-      console.log(`ESCALATED dead watch (streak=${state.errorStreak}, alert #${state.errorAlertCount})`);
+      console.log(`ESCALATED dead watch (streak=${state.errorStreak}, alert #${state.errorAlertCount}, ${esc.reason})`);
     } else {
       console.log(`error streak=${state.errorStreak} (${esc.reason})`);
     }
   } else if (state.errorStreak) {
     console.log(`error streak cleared after ${state.errorStreak} (now ${state.lastStatus})`);
+    // Recovery is worth exactly one note if we had parked the user.
+    if (readTerminal()[terminalKey]) {
+      clearTerminal(terminalKey);
+      await sendYashAlert(`✅ ${who}'s watches are live again — login recovered, ${plan.kind} @ ${timeArg} on ${dayLabel} ${fmtDmy(dateArg)} is being watched properly.`).catch(() => {});
+    }
     state.errorStreak = 0;
     state.lastErrorAlertAt = null;
     state.errorAlertCount = 0;

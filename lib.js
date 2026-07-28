@@ -542,14 +542,32 @@ function nextBookingTargetYmd(nowMs = Date.now(), { hour = 8, minute = 40 } = {}
 // Escalate once a streak is established, then back off exponentially
 // (1h → 2h → 4h … capped at 24h) so a known-broken watch never turns into
 // fixed-interval "STILL DOWN" spam.
+// Some watch failures are TERMINAL: a known, correctly-diagnosed cause that no
+// retry and no amount of paging can clear, because the fix is blocked on a
+// human doing something (e.g. the account is SSO-linked and only the owner can
+// unlink it). Re-paging every 1h/2h/4h for one of these is pure noise — the
+// recipient learns nothing new and can do nothing. Alert once, then go quiet
+// until it actually recovers.
+function isTerminalWatchError(text) {
+  return /SSO[- ]linked|Password-based auto-login is impossible|creds not available|keychain miss/i.test(String(text || ''));
+}
+
 function decideWatchErrorEscalation({
   errorStreak,
   lastErrorAlertAt = null,
   errorAlertCount = 0,
   nowMs = Date.now(),
   minStreak = 5,
+  terminal = false,
+  terminalAlerted = false,
 } = {}) {
   if (!errorStreak || errorStreak < minStreak) return { alert: false, reason: 'below-streak' };
+  // Terminal causes page exactly once, then stay silent regardless of streak.
+  if (terminal) {
+    return terminalAlerted
+      ? { alert: false, reason: 'terminal-already-alerted' }
+      : { alert: true, reason: 'terminal-first-alert', terminal: true };
+  }
   if (!lastErrorAlertAt) return { alert: true, reason: 'first-escalation' };
   const backoffMs = Math.min(3600000 * Math.pow(2, Math.max(0, errorAlertCount - 1)), 24 * 3600000);
   const due = nowMs - new Date(lastErrorAlertAt).getTime() >= backoffMs;
@@ -560,6 +578,7 @@ function decideWatchErrorEscalation({
 
 module.exports = {
   nextBookingTargetYmd,
+  isTerminalWatchError,
   decideWatchErrorEscalation,
   isInventoryRowRace,
   spawnStaggerMs,

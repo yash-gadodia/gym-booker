@@ -197,3 +197,51 @@ test('a user with NO class on D+2 but a class on D+3 still gets warned', () => {
   const evening = sgt('2026-08-03T21:00:00+08:00');
   assert.strictEqual(nextBookingTargetYmd(evening), '2026-08-06', 'gates on the real at-risk day');
 });
+
+// --- terminal causes page once, not on a ladder -----------------------------
+//
+// 28-07: Dani's SSO break made BOTH her watches dead. Each escalated on its own
+// 1h/2h/4h ladder, so one root cause — already diagnosed, already communicated,
+// fixable only by Dani — was set to page Yash twice an hour indefinitely. A
+// cause that a human is already blocked on teaches nothing on repeat.
+
+const { isTerminalWatchError } = require('./lib');
+
+test('the SSO break is classified terminal, a nav timeout is not', () => {
+  assert.ok(isTerminalWatchError('Mindbody account is GOOGLE-SSO linked (no password login). Password-based auto-login is impossible'));
+  assert.ok(isTerminalWatchError('auth expired but Mindbody creds not available (keychain miss?)'));
+  assert.ok(!isTerminalWatchError('page.goto: Timeout 30000ms exceeded'));
+  assert.ok(!isTerminalWatchError(''));
+});
+
+test('a terminal cause pages exactly once, then stays silent forever', () => {
+  const first = decideWatchErrorEscalation({ errorStreak: 5, terminal: true, terminalAlerted: false });
+  assert.strictEqual(first.alert, true);
+  assert.strictEqual(first.reason, 'terminal-first-alert');
+  // Every subsequent poll, at any streak length, must stay quiet.
+  for (const streak of [6, 50, 642]) {
+    const again = decideWatchErrorEscalation({ errorStreak: streak, terminal: true, terminalAlerted: true });
+    assert.strictEqual(again.alert, false, `streak ${streak} must not re-page`);
+    assert.strictEqual(again.reason, 'terminal-already-alerted');
+  }
+});
+
+test('terminal silence is NOT time-based — it survives any elapsed backoff', () => {
+  // The old ladder would fire again after 1h. A terminal cause must not.
+  const now = Date.now();
+  const d = decideWatchErrorEscalation({
+    errorStreak: 99, terminal: true, terminalAlerted: true,
+    lastErrorAlertAt: new Date(now - 48 * 3600000).toISOString(), errorAlertCount: 1, nowMs: now,
+  });
+  assert.strictEqual(d.alert, false, 'two days later, still nothing new to say');
+});
+
+test('a NON-terminal failure still uses the backoff ladder', () => {
+  // Regression guard: parking terminal causes must not mute genuine outages.
+  assert.strictEqual(decideWatchErrorEscalation({ errorStreak: 5, terminal: false }).alert, true);
+  const now = Date.now();
+  assert.strictEqual(decideWatchErrorEscalation({
+    errorStreak: 9, terminal: false, lastErrorAlertAt: new Date(now - 61 * 60000).toISOString(),
+    errorAlertCount: 1, nowMs: now,
+  }).alert, true, 'real outages still re-page after backoff');
+});
