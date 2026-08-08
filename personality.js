@@ -271,6 +271,26 @@ const OUTCOME = {
     ],
   },
   // User explicitly skipped this single date.
+  // Public holiday, gym published no classes. Not a failure, nothing to
+  // book, tell the user to enjoy the day off. detail carries the holiday
+  // name (e.g. "National Day (observed), no FIT on the schedule").
+  holiday: {
+    // No `detail` here: on holidays detail carries the "running instead: …"
+    // list, which outcome() already appends as the want-in offer block;
+    // using it in a template would print the lineup twice.
+    chaotic: [
+      ({ planLine, dayLabel }) => `🎈 *Stand down, it's a public holiday.* ${dayLabel} has no ${planLine} on the schedule. Nothing to snipe. Enjoy the day off.`,
+      ({ planLine, dayLabel }) => `🎈 *Mission scrubbed (good reason).* ${dayLabel} is a public holiday and ${planLine} isn't on. The calendar wins this round.`,
+    ],
+    wholesome: [
+      ({ planLine, dayLabel }) => `🎈 ${dayLabel} is a public holiday, no ${planLine} on the schedule, so there's nothing to book. Enjoy your day off! 💛`,
+      ({ planLine, dayLabel }) => `🌞 No ${planLine} on ${dayLabel}, it's a public holiday. Rest up and enjoy! 💛`,
+    ],
+    gymbro: [
+      ({ planLine, dayLabel }) => `🎈 *Rest day, champ.* ${dayLabel} is a public holiday, no ${planLine} on the schedule. Even the bar takes PH off.`,
+      ({ planLine, dayLabel }) => `🎈 *Scheduled deload.* ${dayLabel} is a public holiday, no ${planLine} today. Recovery is part of the program.`,
+    ],
+  },
   dateSkip: {
     chaotic: [
       ({ dayLabel }) => `⏭️ *Skipped on request.* ${dayLabel}, you said no, Lawrence said cool.`,
@@ -349,6 +369,9 @@ const OUTCOME = {
 // reason still produces a message instead of crashing.
 function _bucket(status) {
   const r = String(status.reason || '').toLowerCase();
+  // holiday_no_class is emitted ok:true by book.js, but match it in either
+  // branch so a future refactor can't regress it into a scary exception DM.
+  if (r === 'holiday_no_class') return 'holiday';
   if (!status.ok) {
     if (r === 'opt_out_day') return 'optOut';
     if (/exception/.test(r)) return 'exception';
@@ -379,11 +402,19 @@ function outcome(user, status, ctx) {
     ms,
     first: firstName(user),
   });
+  // Holiday with a reduced lineup: whatever template got picked, always
+  // append the day's actual classes and ask if the user wants in; the offer
+  // must land regardless of vibe/template.
+  let body = hero;
+  if (bucket === 'holiday' && Array.isArray(status.available) && status.available.length) {
+    const alts = status.available.map(c => `• ${safe(c.kind)} @ ${safe(c.time)}`).join('\n');
+    body += `\n\nThe gym IS running these on ${safe(ctx.dayLabel)}:\n${alts}\nWant in on one? Reply here and I'll get you booked.`;
+  }
   // Footnote: relogin marker (subtle) + run id (for debugging). Both small.
   const tail = [];
   if (ctx.didRelogin) tail.push(`_(auth refreshed mid-flow)_`);
   if (ctx.runId) tail.push(`run: \`${safe(ctx.runId)}\``);
-  return tail.length ? `${hero}\n${tail.join('  ')}` : hero;
+  return tail.length ? `${body}\n${tail.join('  ')}` : body;
 }
 
 module.exports = {

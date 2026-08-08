@@ -295,7 +295,8 @@ function stripFlag(args, name) {
       try { if (fs.existsSync(file)) parsed = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
       if (!parsed) continue;
       if (parsed.targetYmd && !manifestDate) manifestDate = parsed.targetYmd;
-      const ok = (parsed.results || []).filter(x => x.status && x.status.ok && x.status.reason !== 'dry_run');
+      const ok = (parsed.results || []).filter(x => x.status && x.status.ok
+        && x.status.reason !== 'dry_run' && x.status.reason !== 'holiday_no_class');
       if (!ok.length) continue;
       bookings[r.id] = ok.map(x => ({
         kind: x.plan.kind,

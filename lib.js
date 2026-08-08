@@ -8,6 +8,34 @@ function ymd(d) {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
+// Singapore gazetted public holidays, actual + observed (Monday-in-lieu) dates.
+// The gym publishes no classes on these days, so "no row found" is the
+// EXPECTED outcome, not a failure — 2026-08-10 (National Day observed) fired
+// a 🚨 every-user-failed alert for what was just a holiday.
+// Extend this table when MOM announces the next year's holidays
+// (https://www.mom.gov.sg/employment-practices/public-holidays); unknown
+// dates simply fall back to normal failure handling.
+const SG_PUBLIC_HOLIDAYS = {
+  '2026-01-01': "New Year's Day",
+  '2026-02-17': 'Chinese New Year',
+  '2026-02-18': 'Chinese New Year',
+  '2026-03-21': 'Hari Raya Puasa',
+  '2026-04-03': 'Good Friday',
+  '2026-05-01': 'Labour Day',
+  '2026-05-27': 'Hari Raya Haji',
+  '2026-05-31': 'Vesak Day',
+  '2026-06-01': 'Vesak Day (observed)',
+  '2026-08-09': 'National Day',
+  '2026-08-10': 'National Day (observed)',
+  '2026-11-08': 'Deepavali',
+  '2026-11-09': 'Deepavali (observed)',
+  '2026-12-25': 'Christmas Day',
+};
+
+function publicHolidayName(ymdStr) {
+  return SG_PUBLIC_HOLIDAYS[String(ymdStr || '')] || null;
+}
+
 function classPlan(targetDate) {
   const dow = targetDate.getDay();
   if (dow === 0) return { kind: 'Gymnastics', primaryTime: '1:00pm',  fallback: null };
@@ -594,6 +622,8 @@ module.exports = {
   DAY_SHORT,
   addDays,
   ymd,
+  SG_PUBLIC_HOLIDAYS,
+  publicHolidayName,
   classPlan,
   normalize,
   rowMatches,
@@ -715,11 +745,26 @@ function buildDailySummary({ runs, runId, dayLabel }) {
   // toward the overall header — Melissa/Geraldine/Cheryl on Sun is success, not 🚨.
   const isSkipped = (r) => !!r.skipReason && !r.setupErrored;
   const activeRuns = runs.filter(r => !isSkipped(r));
-  const allOk = activeRuns.every(r => !r.setupErrored && r.results.every(p => p.status.ok));
+
+  // Public holiday: the gym publishes no classes, so a missing row is the
+  // expected outcome and must not trip 🚨 (2026-08-10 National Day observed
+  // false alarm). Covers both the new ok:true 'holiday_no_class' status from
+  // book.js and — belt-and-braces — any legacy ok:false not_found failure
+  // that slips through on a holiday date.
+  const ymdMatch = /\d{4}-\d{2}-\d{2}/.exec(String(dayLabel || ''));
+  const holiday = ymdMatch ? publicHolidayName(ymdMatch[0]) : null;
+  const isHolidayNoClass = (p) => p.status.reason === 'holiday_no_class'
+    || (!!holiday && !p.status.ok && classifyBookingFailure(p.status).category === 'not_found');
+  const planOk = (p) => p.status.ok || isHolidayNoClass(p);
+
+  const allOk = activeRuns.every(r => !r.setupErrored && r.results.every(planOk));
   const allFailed = activeRuns.length > 0
-    && activeRuns.every(r => r.setupErrored || r.results.every(p => !p.status.ok));
+    && activeRuns.every(r => r.setupErrored || r.results.every(p => !planOk(p)));
+  const allHolidayNoClass = activeRuns.length > 0 && activeRuns.every(r =>
+    !r.setupErrored && r.results.length > 0 && r.results.every(isHolidayNoClass));
   let header;
   if (activeRuns.length === 0) header = '✅ BOOKER DAILY — no bookings scheduled today';
+  else if (allHolidayNoClass) header = `🎈 BOOKER DAILY — ${holiday || 'public holiday'}: gym has no classes, nothing to book`;
   else if (allOk) header = '✅ BOOKER DAILY — all bookings landed';
   else if (allFailed) header = '🚨 BOOKER DAILY — every user failed';
   else header = '⚠️ BOOKER DAILY — partial';
@@ -728,6 +773,15 @@ function buildDailySummary({ runs, runId, dayLabel }) {
 
   const fmtPlanLine = (r) => {
     const time = r.status.time || r.plan.primaryTime;
+    if (isHolidayNoClass(r)) {
+      // holiday_no_class detail is clean prose (incl. any "running instead:"
+      // lineup) — show it; legacy not_found detail is a raw exception string,
+      // so use generic wording for that shape.
+      const d = r.status.reason === 'holiday_no_class' && r.status.detail
+        ? r.status.detail.replace(/\s+/g, ' ').slice(0, 160)
+        : `no class (public holiday${holiday ? `: ${holiday}` : ''})`;
+      return `   🎈 ${r.plan.kind} @ ${time} — ${d}`;
+    }
     if (r.status.ok) {
       if (r.status.reason === 'already_booked') return `   ↪ ${r.plan.kind} @ ${time} (already booked)`;
       return `   ✅ ${r.plan.kind} @ ${time}`;
@@ -749,10 +803,11 @@ function buildDailySummary({ runs, runId, dayLabel }) {
   for (const run of runs) {
     if (isSkipped(run)) { lines.push(fmtSkipLine(run)); continue; }
     const label = run.user.label || run.user.id;
-    const okCount = run.results.filter(p => p.status.ok).length;
+    const okCount = run.results.filter(planOk).length;
     const total = run.results.length;
     let userHeader;
     if (run.setupErrored) userHeader = `🚨 ${label} — setup failed (alerted)`;
+    else if (total > 0 && run.results.every(isHolidayNoClass)) userHeader = `🎈 ${label} — no classes (public holiday)`;
     else if (okCount === total) userHeader = `✅ ${label} (${okCount}/${total})`;
     else if (okCount === 0)     userHeader = `❌ ${label} (0/${total})`;
     else                        userHeader = `⚠️ ${label} (${okCount}/${total})`;

@@ -13,6 +13,7 @@ const {
   decideAuthAction, shouldRetryPassFetchPreWindow,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
+  publicHolidayName,
 } = require('./lib');
 const {
   captureBearerToken, fetchScheduleClasses, findClass,
@@ -525,7 +526,17 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
       classMeta = findClass(classes, { kindNeedle: plan.kind, sgtDate, sgtHHMM: fbHHMM });
       if (classMeta) log(`api-direct: primary ${plan.primaryTime} not in schedule; using fallback ${plan.fallback}`);
     }
-    if (!classMeta) return { ok: false, reason: 'class-not-found', detail: `${plan.kind} ${sgtHHMM} not in schedule (${classes.length} classes)`, time: plan.primaryTime };
+    if (!classMeta) {
+      // Expose what IS on the schedule so the holiday path can offer
+      // alternatives (public holidays often run a reduced lineup, e.g.
+      // "Public Holiday Open Gym", instead of the regular classes).
+      const available = classes.map(c => ({
+        kind: c.courseName,
+        time: new Date(c.startTime).toLocaleTimeString('en-SG', { timeZone: 'Asia/Singapore', hour: 'numeric', minute: '2-digit', hour12: true }).replace(/\s/g, '').toLowerCase(),
+        bookable: !!c.bookable,
+      }));
+      return { ok: false, reason: 'class-not-found', detail: `${plan.kind} ${sgtHHMM} not in schedule (${classes.length} classes)`, time: plan.primaryTime, available };
+    }
   }
   log(`api-direct: class mb_class_id=${classMeta.mb_class_id} schedule_id=${classMeta.mb_class_schedule_id} status=${classMeta.statusText}`);
 
@@ -1163,6 +1174,9 @@ async function attemptFallbackBooking(page, plan, target) {
   // the other.
   async function bookOnePlan(plan, planIndex, page) {
     let status = { ok: false, reason: 'unknown', detail: '', time: null };
+    // Day's full schedule, captured off api-direct's class-not-found result.
+    // Only consumed by the public-holiday branch to offer alternatives.
+    let holidayAlternatives = null;
     const planTag = plans.length > 1 ? `[plan ${planIndex + 1}/${plans.length}] ` : '';
     try {
       log(`${planTag}booking: ${plan.kind} @ ${plan.primaryTime}` + (plan.fallback ? ` (fallback ${plan.fallback})` : ''));
@@ -1188,6 +1202,7 @@ async function attemptFallbackBooking(page, plan, target) {
       if (apiDirect && !dryRun) {
         try {
           const apiResult = await executeApiDirect(page, plan, target, t9, noWait);
+          if (Array.isArray(apiResult.available)) holidayAlternatives = apiResult.available;
           if (apiResult.ok) {
             status = apiResult;
             return status;
@@ -1239,7 +1254,23 @@ async function attemptFallbackBooking(page, plan, target) {
       }
 
       let chosen = await pickRow('pre-stage');
-      if (chosen.notFound) throw new Error(`no ${plan.kind} row found on ${ymd(target)} (tried ${plan.primaryTime}${plan.fallback ? ` + ${plan.fallback}`:''})`);
+      if (chosen.notFound) {
+        // On a public holiday the gym publishes no classes — a missing row is
+        // the expected outcome, not an error (2026-08-10 National Day observed
+        // fired a 🚨 all-users-failed alert for an empty holiday schedule).
+        const holiday = publicHolidayName(ymd(target));
+        if (holiday) {
+          // The gym may still run a reduced holiday lineup (e.g. "Public
+          // Holiday Open Gym") — surface it so the user DM can offer those
+          // instead of a bare "no class".
+          const alts = (holidayAlternatives || []).filter(c => c.kind && c.time);
+          const altText = alts.length ? `; running instead: ${alts.map(c => `${c.kind} @ ${c.time}`).join(', ')}` : '';
+          log(`${planTag}no ${plan.kind} row on ${ymd(target)} — ${holiday}, public holiday: treating as no-class day${altText}`);
+          status = { ok: true, reason: 'holiday_no_class', detail: `${holiday} — no ${plan.kind} on the schedule${altText}`, time: null, available: alts };
+          return status;
+        }
+        throw new Error(`no ${plan.kind} row found on ${ymd(target)} (tried ${plan.primaryTime}${plan.fallback ? ` + ${plan.fallback}`:''})`);
+      }
       log(`${planTag}chosen: ${plan.kind} @ ${chosen.time} — status=${chosen.status}`);
 
       if (chosen.status === 'BOOKED') {

@@ -2209,7 +2209,10 @@ test('book.js writes BOOKER_RESULT_FILE on synthetic setup failure', async () =>
       '--now',
     ], {
       env: { ...process.env, BOOKER_RESULT_FILE: tmp, TELEGRAM_BOT_TOKEN: 'TEST_TOKEN_INVALID_DO_NOT_SEND' },
-      timeout: 30000,
+      // 6 setup retry attempts at ~6s each ≈ 36s wall clock since the retry
+      // cap was raised (2026-06-10 early-giveup fix); the old 30s timeout
+      // killed the child before it could write the result file.
+      timeout: 90000,
     });
     assert.ok(fs.existsSync(tmp), `result file not written: stderr=${res.stderr}`);
     const parsed = JSON.parse(fs.readFileSync(tmp, 'utf8'));
@@ -3289,4 +3292,118 @@ test('bookViaApi: without orderId still creates the order inline (back-compat)',
     assert.ok(posted.some(u => /\/v1\/orders$/.test(u)), 'creates the order inline');
     assert.ok(res.timing.orders >= 0);
   } finally { global.fetch = orig; }
+});
+
+// ---------- public holidays: calm handling instead of 🚨 (2026-08-10 false alarm) ----------
+const { publicHolidayName } = require('./lib');
+
+test('publicHolidayName: knows SG 2026 holidays incl. observed Mondays', () => {
+  assert.equal(publicHolidayName('2026-08-09'), 'National Day');
+  assert.equal(publicHolidayName('2026-08-10'), 'National Day (observed)');
+  assert.equal(publicHolidayName('2026-12-25'), 'Christmas Day');
+  assert.equal(publicHolidayName('2026-08-11'), null);
+  assert.equal(publicHolidayName(null), null);
+});
+
+test('buildDailySummary: legacy not-found failures on a holiday downgrade 🚨 to 🎈', () => {
+  // Exact shape of the 2026-08-10 (National Day observed) false alarm: every
+  // user "failed" with a no-row exception because the gym had no classes.
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [failPlan('FIT', '6:30am', 'exception', 'no FIT row found on 2026-08-10 (tried 6:30am + 7:30am)')]),
+      fakeRun('melissa', 'Melissa', [
+        failPlan('FIT', '7:30pm', 'exception', 'no FIT row found on 2026-08-10 (tried 7:30pm)'),
+        failPlan('BURN', '6:30pm', 'exception', 'no BURN row found on 2026-08-10 (tried 6:30pm)'),
+      ]),
+    ],
+    runId: 'R-ph', dayLabel: 'Mon 2026-08-10',
+  });
+  assert.ok(out.startsWith('🎈 BOOKER DAILY — National Day (observed): gym has no classes, nothing to book\n'), `header was: ${out.split('\n')[0]}`);
+  assert.ok(!out.includes('🚨'), 'no alarm emoji anywhere');
+  assert.ok(!out.includes('❌'), 'no failure emoji anywhere');
+  assert.ok(out.includes('🎈 Yash — no classes (public holiday)'));
+  assert.ok(out.includes('🎈 Melissa — no classes (public holiday)'));
+  assert.ok(out.includes('🎈 FIT @ 6:30am — no class (public holiday: National Day (observed))'));
+});
+
+test('buildDailySummary: holiday_no_class status renders detail incl. alternatives', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [{
+        plan: { kind: 'FIT', primaryTime: '6:30am', fallback: null },
+        status: { ok: true, reason: 'holiday_no_class', time: null,
+          detail: 'National Day (observed) — no FIT on the schedule; running instead: Public Holiday Open Gym @ 8:30am, Public Holiday Open Gym @ 10:30am' },
+      }]),
+    ],
+    runId: 'R-ph2', dayLabel: 'Mon 2026-08-10',
+  });
+  assert.ok(out.startsWith('🎈 BOOKER DAILY — National Day (observed)'), `header was: ${out.split('\n')[0]}`);
+  assert.ok(out.includes('running instead: Public Holiday Open Gym @ 8:30am'));
+});
+
+test('buildDailySummary: same not-found failure on a NON-holiday still alarms', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [failPlan('FIT', '6:30am', 'exception', 'no FIT row found on 2026-08-11 (tried 6:30am + 7:30am)')]),
+    ],
+    runId: 'R-nonph', dayLabel: 'Tue 2026-08-11',
+  });
+  assert.ok(out.startsWith('🚨 BOOKER DAILY — every user failed\n'), `header was: ${out.split('\n')[0]}`);
+});
+
+test('buildDailySummary: real failure on a holiday is NOT masked', () => {
+  // Only not-found gets the holiday downgrade; an auth blowup on a holiday is
+  // still a real problem (e.g. the gym DID run classes and we broke).
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [failPlan('FIT', '6:30am', 'exception', 'login failed: sign in wall')]),
+    ],
+    runId: 'R-ph3', dayLabel: 'Mon 2026-08-10',
+  });
+  assert.ok(out.startsWith('🚨 BOOKER DAILY — every user failed\n'), `header was: ${out.split('\n')[0]}`);
+});
+
+test('buildDailySummary: holiday no-class mixed with a real booking stays ✅', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [okPlan('Gymnastics', '12:30pm')]),
+      fakeRun('dani', 'Dani', [{
+        plan: { kind: 'FIT', primaryTime: '6:30am', fallback: null },
+        status: { ok: true, reason: 'holiday_no_class', time: null, detail: 'National Day (observed) — no FIT on the schedule' },
+      }]),
+    ],
+    runId: 'R-ph4', dayLabel: 'Mon 2026-08-10',
+  });
+  assert.ok(out.startsWith('✅ BOOKER DAILY — all bookings landed\n'), `header was: ${out.split('\n')[0]}`);
+  assert.ok(out.includes('🎈 Dani — no classes (public holiday)'));
+});
+
+test('personality: holiday_no_class buckets to holiday and offers alternatives', () => {
+  assert.equal(personality._bucket({ ok: true, reason: 'holiday_no_class' }), 'holiday');
+  assert.equal(personality._bucket({ ok: false, reason: 'holiday_no_class' }), 'holiday');
+  personality._setRng(() => 0);
+  try {
+    const msg = personality.outcome(
+      { id: 'yash', label: 'Yash', vibe: 'gymbro' },
+      { ok: true, reason: 'holiday_no_class', detail: 'National Day (observed) — no FIT on the schedule',
+        available: [{ kind: 'Public Holiday Open Gym', time: '8:30am' }, { kind: 'Public Holiday Open Gym', time: '10:30am' }] },
+      { planLine: 'FIT @ 6:30am', dayLabel: 'Mon 2026-08-10', runId: 'R-ph5' },
+    );
+    assert.ok(/public holiday/i.test(msg), `msg was: ${msg}`);
+    assert.ok(msg.includes('• Public Holiday Open Gym @ 8:30am'));
+    assert.ok(msg.includes("Reply here and I'll get you booked"));
+    assert.ok(!/💥|❌|💀/.test(msg), 'no failure vibes in a holiday message');
+  } finally { personality._resetRng(); }
+});
+
+test('personality: holiday with NO alternatives skips the offer block', () => {
+  personality._setRng(() => 0);
+  try {
+    const msg = personality.outcome(
+      { id: 'dani', label: 'Dani', vibe: 'wholesome' },
+      { ok: true, reason: 'holiday_no_class', detail: 'Christmas Day — no FIT on the schedule', available: [] },
+      { planLine: 'FIT @ 6:30am', dayLabel: 'Fri 2026-12-25' },
+    );
+    assert.ok(!msg.includes('Want in on one?'), `msg was: ${msg}`);
+  } finally { personality._resetRng(); }
 });
