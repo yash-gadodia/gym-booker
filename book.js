@@ -8,9 +8,9 @@ const {
   classifyButtonStates, parseBookingCard, timeToHHMM, resolveSchedule,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming, isInventoryRowRace,
-  navRetryPlan, canRetrySetup, storageStatePathIfValid, saveStorageStateAtomic,
+  navRetryPlan, canRetrySetup, setupRetryDelayMs, storageStatePathIfValid, saveStorageStateAtomic,
   SETUP_COMPLETE_MARKER, resolveSprintTarget,
-  decideAuthAction, shouldRetryPassFetchPreWindow,
+  decideAuthAction, shouldRetryPassFetchPreWindow, isSuspendedStatus, isSuspendedResult,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButtonInBrowser, buildSetupFailureAlert, sendYashAlert,
   publicHolidayName,
@@ -540,6 +540,20 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
   }
   log(`api-direct: class mb_class_id=${classMeta.mb_class_id} schedule_id=${classMeta.mb_class_schedule_id} status=${classMeta.statusText}`);
 
+  // Account suspended (membership hold / freeze / billing). Terminal: there is
+  // no pass to fetch and the UI row never turns into BOOK NOW, so both the API
+  // and the UI paths are dead ends. Bail now with an honest reason instead of
+  // burning the 9am window on a fallback that cannot succeed.
+  if (isSuspendedStatus(classMeta.statusText)) {
+    return {
+      ok: false,
+      reason: 'client-suspended',
+      detail: `Mindbody reports this account as "${classMeta.statusText}" for ${plan.kind} @ ${plan.primaryTime}`,
+      time: plan.primaryTime,
+      terminal: true,
+    };
+  }
+
   // 3. Pre-fetch payment pass. If the eligible-pass list misses BEFORE the
   //    booking window opens (Geraldine, 2026-06-07: empty list at 08:59 while
   //    Dani's populated, status "Outside booking window"), do NOT bail to the
@@ -549,6 +563,10 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
   log('api-direct: fetching payment pass UUID');
   let paymentMethodUuid;
   let passErr = null;
+  // Whether we already retried the pass fetch AFTER 09:00. Before the window
+  // opens an empty pass list is a normal timing artifact; after it opens, it
+  // means the account genuinely has no pass and the UI flow cannot help.
+  let retriedAfterWindow = false;
   try { paymentMethodUuid = await fetchPaymentPassUuid(bearer, classMeta); }
   catch (e) { passErr = e; }
 
@@ -563,14 +581,40 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
       const freshMeta = findClass(fresh, { kindNeedle: plan.kind, sgtDate, sgtHHMM })
         || (plan.fallback ? findClass(fresh, { kindNeedle: plan.kind, sgtDate, sgtHHMM: timeToHHMM(plan.fallback) }) : null);
       if (freshMeta) { classMeta = freshMeta; log(`api-direct: refreshed class status=${classMeta.statusText}`); }
+      if (isSuspendedStatus(classMeta.statusText)) {
+        return {
+          ok: false,
+          reason: 'client-suspended',
+          detail: `Mindbody reports this account as "${classMeta.statusText}" for ${plan.kind} @ ${plan.primaryTime}`,
+          time: plan.primaryTime,
+          terminal: true,
+        };
+      }
       paymentMethodUuid = await fetchPaymentPassUuid(bearer, classMeta);
       passErr = null;
+      retriedAfterWindow = true;
     } catch (e2) {
       passErr = e2;
+      retriedAfterWindow = true;
       log(`api-direct: pass-fetch still failing after window open (${e2.message.slice(0, 80)})`);
     }
   }
-  if (passErr) return { ok: false, reason: 'pass-fetch-failed', detail: passErr.message, time: plan.primaryTime };
+  // Terminal once the window is open: the gym returns no payment method for
+  // this account at all, so the UI flow would just stall on a disabled Buy
+  // button and report a useless "locator.click: Timeout" that masks the real
+  // cause (Geraldine, 2026-09-09 — a lapsed monthly membership reported as a
+  // Playwright error). Pass availability is independent of seat availability:
+  // an active member gets a pass even for a full class, so an empty list is
+  // always account-side, never a lost race.
+  if (passErr) return {
+    ok: false,
+    reason: 'pass-fetch-failed',
+    detail: retriedAfterWindow
+      ? `${passErr.message} (still failing after the 09:00 window opened — the account has no active pass/membership for this class)`
+      : passErr.message,
+    time: plan.primaryTime,
+    terminal: retriedAfterWindow,
+  };
   log(`api-direct: pass ${paymentMethodUuid}`);
 
   // 4. Wait to 09:00:00.000 SGT — pre-creating the order and warming the socket
@@ -743,6 +787,23 @@ async function executeApiDirect(page, plan, target, t9, noWait) {
       let upcoming;
       try { upcoming = await fetchMyUpcomingBookings(page); fetched = true; }
       catch (e) { log(`api-direct: confirm fetch failed (${e.message.slice(0,140)})`); break; }
+      // An empty list from a DEAD SESSION looks exactly like "you have no
+      // bookings" — /account/schedule just renders no Cancel buttons when
+      // logged out. On 2026-10-11 Yash's cached session expired between the
+      // 202 and this poll, so a booking that HAD landed read as 0 upcoming,
+      // bounced to the UI flow ("redirected to login") and DM'd a failure for
+      // a class he was actually booked into. Zero cards while logged out is
+      // unverifiable, not negative: drop to the !fetched path, which trusts
+      // the 202 rather than inventing a silent drop.
+      if (upcoming.length === 0) {
+        let loggedOut = false;
+        try { loggedOut = await isLoggedOut(page); } catch {}
+        if (loggedOut) {
+          log('api-direct: confirm inconclusive — /account/schedule is logged out, trusting the 202');
+          fetched = false;
+          break;
+        }
+      }
       match = findBookingInUpcoming(upcoming, { targetYmd, kind: plan.kind, time: usedTime });
       if (match) {
         log(`api-direct: ${match.waitlisted ? 'WAITLISTED (NOT booked)' : 'confirmed'} ${plan.kind} @ ${usedTime} on ${targetYmd} in /account/schedule`);
@@ -1010,11 +1071,26 @@ async function attemptFallbackBooking(page, plan, target) {
   // failure falls back to a private launch so a dead/dying server can never
   // strand a user. browser.close() on a connected browser only disconnects
   // this child (and its contexts) — the server and other users live on.
+  //
+  // A connect() that SUCCEEDS is not proof the server is alive. On 2026-10-11
+  // Yash connected fine at 00:40:11, the server's Chromium (pid 73793) died
+  // mid-navigation, and every newContext() after that threw "Target page,
+  // context or browser has been closed". All 6 setup attempts happily
+  // reconnected to the same corpse and burned in 20ms — with 19 minutes of
+  // runway left. The 7 users who ran later got a clean ECONNREFUSED, took the
+  // private fallback, and every one of them staged fine. So the fallback has
+  // to trigger on a POISONED server too, not just an unreachable one: a setup
+  // failure while we were on the shared server marks it dead for this child
+  // and every later attempt launches privately.
+  let sharedPoisoned = false;
+  let usedSharedServer = false;
   async function acquireBrowser() {
     const ws = process.env.BOOKER_WS_ENDPOINT;
-    if (ws) {
+    usedSharedServer = false;
+    if (ws && !sharedPoisoned) {
       try {
         const b = await chromium.connect(ws, { timeout: 15000 });
+        usedSharedServer = true;
         log('browser: connected to shared server');
         return b;
       } catch (e) {
@@ -1141,6 +1217,13 @@ async function attemptFallbackBooking(page, plan, target) {
       try { if (attemptBrowser) await attemptBrowser.close(); } catch {}
       browser = null; ctx = null; page = null;
       setupError = e;
+      // Were we on the fleet's shared Chromium? Then it — not this user's
+      // auth or the site — is the prime suspect, and reconnecting to it is
+      // how 2026-10-11 wasted all 6 attempts. Drop to private launches.
+      if (usedSharedServer) {
+        sharedPoisoned = true;
+        log('browser: shared server poisoned by this failure — remaining attempts launch privately');
+      }
       // Google/Facebook/Apple-SSO accounts can NEVER complete a headless password
       // login — retrying 6x is pointless and just delays the alert. Fail fast so
       // the user is told to book manually / re-link. (2026-07-27: Dani.)
@@ -1151,7 +1234,14 @@ async function attemptFallbackBooking(page, plan, target) {
       const msRemaining = t9.getTime() - Date.now();
       const canRetry = canRetrySetup({ attempt, maxAttempts: MAX_SETUP_ATTEMPTS, msRemaining, marginMs: 75000, noWait });
       if (canRetry) {
-        log(`SETUP RETRY: ${msRemaining}ms to 9am, relaunching fresh browser (attempt ${attempt + 1}/${MAX_SETUP_ATTEMPTS})`);
+        // Pause before retrying. Without this the whole retry budget evaporates
+        // in milliseconds (2026-10-11: attempts 1-6 spanned 20ms), so nothing
+        // transient — a respawning server, a momentary host stall — ever gets
+        // the chance to clear. The delay is skipped when it would eat into the
+        // 9am safety margin.
+        const delayMs = setupRetryDelayMs({ attempt, msRemaining, marginMs: 75000, noWait });
+        log(`SETUP RETRY: ${msRemaining}ms to 9am, waiting ${delayMs}ms then relaunching fresh browser (attempt ${attempt + 1}/${MAX_SETUP_ATTEMPTS})`);
+        if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
         continue;
       }
       if (attempt < MAX_SETUP_ATTEMPTS) {
@@ -1213,6 +1303,15 @@ async function attemptFallbackBooking(page, plan, target) {
           // the UI flow: it can't book a full class, it would only burn ~30s and
           // re-throw FULL. classifyBookingFailure arms the watcher off this.
           if (apiResult.waitlisted) {
+            status = apiResult;
+            return status;
+          }
+          // Terminal, non-recoverable account state (e.g. suspended from
+          // booking). The UI flow shares the same account and would only stall
+          // ~25s on a row that never offers BOOK NOW, then report a misleading
+          // timeout. Return the honest reason instead.
+          if (apiResult.terminal) {
+            log(`${planTag}api-direct terminal (${apiResult.reason}) — no UI fallback, this cannot be booked`);
             status = apiResult;
             return status;
           }
@@ -1513,6 +1612,9 @@ async function attemptFallbackBooking(page, plan, target) {
   }
 
   flushLog();
-  const allOk = results.every(r => r.status.ok);
+  // A gym-side membership hold is an expected non-booking, not a run failure:
+  // exit 0 so book-all reports ⏸️ rather than FAIL and Yash isn't paged for
+  // something only the gym can lift (Cheryl, 2026-08-23/24).
+  const allOk = results.every(r => r.status.ok || isSuspendedResult(r.status));
   process.exit(allOk ? 0 : 1);
 })();

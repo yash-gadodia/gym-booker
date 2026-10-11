@@ -412,6 +412,24 @@ function canRetrySetup({ attempt, maxAttempts, msRemaining, marginMs = 75000, no
   return noWait || msRemaining < 0 || msRemaining > marginMs;
 }
 
+// Backoff between setup attempts. The 2026-10-11 wipeout burned all six
+// attempts in 20ms against a dead shared browser server, so "6 attempts" was
+// really one attempt repeated — nothing transient could recover in between.
+// Linear 2s/attempt capped at 10s, and never so long that it eats the 9am
+// safety margin (that check is what keeps a late failure failing fast).
+// noWait (testing) skips waiting entirely.
+function setupRetryDelayMs({ attempt, msRemaining, marginMs = 75000, maxDelayMs = 10000, noWait = false }) {
+  if (noWait) return 0;
+  const want = Math.min(2000 * attempt, maxDelayMs);
+  // No live deadline to protect: waitlist / catch-up runs fire after 9am and
+  // canRetrySetup deliberately keeps retrying them, so they get the full delay
+  // rather than inheriting the zero-gap storm.
+  if (!Number.isFinite(msRemaining) || msRemaining < 0) return want;
+  const spare = msRemaining - marginMs;
+  if (spare <= 0) return 0;
+  return Math.max(0, Math.min(want, spare));
+}
+
 // Resolve the 9am sprint target. GYM_T9_OVERRIDE_ISO (dress rehearsals) wins;
 // an invalid override throws so a typo'd rehearsal dies loudly instead of
 // sprinting at a NaN instant; no override → the caller's real nine-am value.
@@ -529,15 +547,40 @@ function decideAuthAction({ haveCachedAuth, loggedOut, bearerOk = null, msToNine
 //   'booked'         → real booking/promotion; send "you're in!", stop
 //   'signoff'        → just confirmed on the waitlist; send ONE sign-off, then quiet
 //   'silent'         → do nothing (already signed off, or nothing actionable)
-//   'nudge_booknow'  → a real slot freed; nudge to grab it (self-limiting)
+//   'nudge_booknow'  → a real slot freed; nudge to grab it (exponential backoff)
 //   'nudge_waitlist' → full + waitlist open + not yet joined; nudge to join (capped)
-function decideWaitlistAlert({ bookingDetected, userOnWaitlist, alreadyWaitlisted, observed, alertCount = 0, maxNudges = 3 }) {
+//
+// BOOK_NOW backoff (Yash 2026-08-15, after Geraldine's slot stayed open for
+// 160+ every-minute reminders): first nudge immediately, then 1m → 2m → 4m …
+// capped at 30m while the SAME opening persists. The caller resets the
+// bookNow counters when the slot closes, so a fresh opening pings instantly.
+//   'nudge_no_pass'  → seat is free but the account has no pass for it; say it ONCE
+//
+// A `no_pass` watch is not waiting for a seat. Lynette, 2026-09-20: her Staff
+// Pass covers FIT and Burn but not Open Gym, so Open Gym @ 2pm sat at
+// "Bookable" from the very first poll and the watcher read that as a freed
+// slot — 9 "Someone just canceled, BOOK NOW" DMs for a class that was never
+// full and that she could not have booked in the app either. Capacity was
+// never the blocker, so a capacity nudge is both false and useless. Say the
+// true thing once, then go quiet.
+function decideWaitlistAlert({
+  bookingDetected, userOnWaitlist, alreadyWaitlisted, observed, alertCount = 0, maxNudges = 3,
+  bookNowAlertCount = 0, lastBookNowAlertAt = null, nowMs = Date.now(),
+  bookNowBaseMs = 60000, bookNowCapMs = 30 * 60000, reason = null,
+}) {
   if (bookingDetected) return 'booked';
   // Sticky: once she has EVER been confirmed on the waitlist, stay quiet (a real
   // booking is handled above). Never re-nudge "join" on a later detection miss.
   if (alreadyWaitlisted) return 'silent';
   if (userOnWaitlist) return 'signoff';
-  if (observed === 'BOOK_NOW') return 'nudge_booknow';
+  if (observed === 'BOOK_NOW') {
+    // The seat is open; the pass is the blocker. Telling her to "book now"
+    // sends her at the one door that cannot open. One honest DM, then silence.
+    if (reason === 'no_pass') return bookNowAlertCount ? 'silent' : 'nudge_no_pass';
+    if (!bookNowAlertCount || !lastBookNowAlertAt) return 'nudge_booknow';
+    const backoffMs = Math.min(bookNowBaseMs * Math.pow(2, bookNowAlertCount - 1), bookNowCapMs);
+    return nowMs - new Date(lastBookNowAlertAt).getTime() >= backoffMs ? 'nudge_booknow' : 'silent';
+  }
   if (observed === 'WAITLIST') return alertCount < maxNudges ? 'nudge_waitlist' : 'silent';
   return 'silent';
 }
@@ -576,6 +619,46 @@ function nextBookingTargetYmd(nowMs = Date.now(), { hour = 8, minute = 40 } = {}
 // unlink it). Re-paging every 1h/2h/4h for one of these is pure noise — the
 // recipient learns nothing new and can do nothing. Alert once, then go quiet
 // until it actually recovers.
+// Mindbody shows "Continue with Google"/"Continue with Apple" as an OPTION
+// alongside the password field on the normal login page. That is NOT an
+// SSO-linked account, and racing those buttons against the password field is
+// what made the 2026-07-31 detection fire false SSO_LINKED on every re-login
+// (reverted the same day).
+//
+// The HARD-linked screen is a different page entirely: after the email step
+// Mindbody drops the password field and renders
+//   "Apple Account / You originally used Apple to login to this account under
+//    <email>. You can proceed with Apple."  + "Disconnect here"
+// On that screen no password exists to type, so the booker can never log in
+// until the owner disconnects the provider and sets one. Match on that
+// sentence only, and only after the password field has already failed to
+// appear, so the happy path can never reach this check (Melissa, 2026-09-20).
+function detectSsoInterstitial(bodyText) {
+  const t = String(bodyText || '').replace(/\s+/g, ' ');
+  const m = /you originally used\s+([A-Za-z]+)\s+to log\s?in to this account/i.exec(t);
+  if (!m) return null;
+  const em = /under\s+(\S+@\S+\.\S+?)[.,\s]/i.exec(t);
+  return { provider: m[1], email: em ? em[1] : null };
+}
+
+// The one place that turns a detected SSO interstitial into the error string
+// the rest of the pipeline keys off. Must keep matching isTerminalWatchError
+// (park the watch) and classifyBookingFailure's auth branch (never arm a watch
+// on an auth break) — the test suite locks both.
+function ssoLinkedError(sso) {
+  const who = (sso && sso.provider) || 'an external provider';
+  const email = sso && sso.email ? ` (${sso.email})` : '';
+  const e = new Error(
+    `SSO-linked account: Mindbody says this login was created with ${who}${email}, ` +
+    `so it shows no password field. Password-based auto-login is impossible until the ` +
+    `owner opens the Mindbody login, taps "Disconnect here" on the ${who} screen and sets a password.`);
+  // book.js:1191 already aborts setup (no 6× retry) on this typed shape; it has
+  // been dead code since the 2026-07-31 revert removed the only thrower.
+  e.code = 'SSO_LINKED';
+  e.provider = String(who).toLowerCase();
+  return e;
+}
+
 function isTerminalWatchError(text) {
   return /SSO[- ]linked|Password-based auto-login is impossible|creds not available|keychain miss/i.test(String(text || ''));
 }
@@ -606,6 +689,8 @@ function decideWatchErrorEscalation({
 
 module.exports = {
   nextBookingTargetYmd,
+  detectSsoInterstitial,
+  ssoLinkedError,
   isTerminalWatchError,
   decideWatchErrorEscalation,
   isInventoryRowRace,
@@ -615,6 +700,7 @@ module.exports = {
   resolveSprintTarget,
   navRetryPlan,
   canRetrySetup,
+  setupRetryDelayMs,
   storageStatePathIfValid,
   saveStorageStateAtomic,
   decideAuthAction,
@@ -682,10 +768,26 @@ const YASH_ALERT_CHAT_ID = 166637821;
 //   covered    — something is on top of the button, blocker descriptor returned
 //   clear      — button (or its ancestor/descendant) is on top → safe to click
 function probeLoginButtonInBrowser(selector) {
-  const btn = document.querySelector(selector);
-  if (!btn) return { state: 'no-button' };
+  // Mindbody renders the nav login button TWICE — once in a mobile container
+  // (div.is-hidden-tablet, display:none at desktop widths, so 0x0) and once in
+  // the desktop bar. querySelector returned the hidden mobile copy first, so the
+  // probe reported 'invisible' forever: ensureLoginUnblocked burned its whole
+  // 8s budget clicking the cookie banner, then returned ok:false and the run was
+  // logged as "login failed (password rejected or page changed)". Nothing was
+  // wrong with the password. Pick the first VISIBLE match, like clickVisible
+  // already does. (2026-10-02: reported 7/7 users broken while the 09:00 booker
+  // was booking all 7 successfully.)
+  const all = (typeof document.querySelectorAll === 'function'
+    ? Array.prototype.slice.call(document.querySelectorAll(selector))
+    : [document.querySelector(selector)]).filter(Boolean);
+  if (!all.length) return { state: 'no-button' };
+  const btn = all.find(function (e) {
+    const b = e.getBoundingClientRect();
+    return b.width > 0 && b.height > 0;
+  });
+  // Every copy is collapsed: genuinely not rendered (not an overlay problem).
+  if (!btn) return { state: 'invisible' };
   const r = btn.getBoundingClientRect();
-  if (r.width === 0 || r.height === 0) return { state: 'invisible' };
   const cx = r.left + r.width / 2;
   const cy = r.top + r.height / 2;
   const top = document.elementFromPoint(cx, cy);
@@ -755,16 +857,25 @@ function buildDailySummary({ runs, runId, dayLabel }) {
   const holiday = ymdMatch ? publicHolidayName(ymdMatch[0]) : null;
   const isHolidayNoClass = (p) => p.status.reason === 'holiday_no_class'
     || (!!holiday && !p.status.ok && classifyBookingFailure(p.status).category === 'not_found');
-  const planOk = (p) => p.status.ok || isHolidayNoClass(p);
+  // Gym-side membership hold: nothing was bookable and nothing was broken, so
+  // it counts as "expected non-booking" rather than a failure (Cheryl,
+  // 2026-08-23/24). Rendered ⏸️ per plan and per user so it stays visible.
+  const isSuspendedPlan = (p) => isSuspendedResult(p.status);
+  const planOk = (p) => p.status.ok || isHolidayNoClass(p) || isSuspendedPlan(p);
+  const runAllSuspended = (r) => !r.setupErrored && r.results.length > 0 && r.results.every(isSuspendedPlan);
+  const suspendedLabels = activeRuns.filter(runAllSuspended).map(r => r.user.label || r.user.id);
 
   const allOk = activeRuns.every(r => !r.setupErrored && r.results.every(planOk));
   const allFailed = activeRuns.length > 0
     && activeRuns.every(r => r.setupErrored || r.results.every(p => !planOk(p)));
   const allHolidayNoClass = activeRuns.length > 0 && activeRuns.every(r =>
     !r.setupErrored && r.results.length > 0 && r.results.every(isHolidayNoClass));
+  const allSuspended = activeRuns.length > 0 && activeRuns.every(runAllSuspended);
   let header;
   if (activeRuns.length === 0) header = '✅ BOOKER DAILY — no bookings scheduled today';
   else if (allHolidayNoClass) header = `🎈 BOOKER DAILY — ${holiday || 'public holiday'}: gym has no classes, nothing to book`;
+  else if (allSuspended) header = '⏸️ BOOKER DAILY — gym account on hold, nothing bookable';
+  else if (allOk && suspendedLabels.length) header = `✅ BOOKER DAILY — all bookings landed (${suspendedLabels.join(', ')} on hold at the gym)`;
   else if (allOk) header = '✅ BOOKER DAILY — all bookings landed';
   else if (allFailed) header = '🚨 BOOKER DAILY — every user failed';
   else header = '⚠️ BOOKER DAILY — partial';
@@ -781,6 +892,9 @@ function buildDailySummary({ runs, runId, dayLabel }) {
         ? r.status.detail.replace(/\s+/g, ' ').slice(0, 160)
         : `no class (public holiday${holiday ? `: ${holiday}` : ''})`;
       return `   🎈 ${r.plan.kind} @ ${time} — ${d}`;
+    }
+    if (isSuspendedPlan(r)) {
+      return `   ⏸️ ${r.plan.kind} @ ${time} — gym has this account suspended from booking (membership hold/billing)`;
     }
     if (r.status.ok) {
       if (r.status.reason === 'already_booked') return `   ↪ ${r.plan.kind} @ ${time} (already booked)`;
@@ -808,6 +922,7 @@ function buildDailySummary({ runs, runId, dayLabel }) {
     let userHeader;
     if (run.setupErrored) userHeader = `🚨 ${label} — setup failed (alerted)`;
     else if (total > 0 && run.results.every(isHolidayNoClass)) userHeader = `🎈 ${label} — no classes (public holiday)`;
+    else if (runAllSuspended(run)) userHeader = `⏸️ ${label} — gym account on hold, nothing bookable`;
     else if (okCount === total) userHeader = `✅ ${label} (${okCount}/${total})`;
     else if (okCount === 0)     userHeader = `❌ ${label} (0/${total})`;
     else                        userHeader = `⚠️ ${label} (${okCount}/${total})`;
@@ -881,12 +996,44 @@ Object.assign(module.exports, {
 // status = { ok, reason, detail, time }. We read BOTH reason and detail because
 // FULL arrives as detail ("FIT FULL (primary and fallback)") off a thrown error
 // whose reason is the generic "exception".
+// Mindbody stamps every schedule entry with a per-client status. When the
+// client's membership is on hold / frozen / in billing arrears the gateway
+// returns "Client is suspended from booking" INSTEAD of the usual "Bookable" /
+// "Outside booking window" — and it does so even outside the booking window,
+// which makes it a reliable pre-9am signal. Cheryl, 2026-08-23/24: a membership
+// hold made every class unbookable; api-direct's pass-fetch failed (an account
+// on hold has no eligible passes), we fell through to the UI flow, and the run
+// died 25s later on the useless "BOOK NOW never appeared" timeout. Detect the
+// status up front so the failure is terminal and honestly reported.
+// A booking result that failed only because the gym has the member suspended.
+// Not an automation failure and not a lost race, so it must not count toward
+// the daily summary's failure arithmetic (same treatment as holiday_no_class).
+function isSuspendedResult(status) {
+  return String((status && status.reason) || '') === 'client-suspended';
+}
+
+function isSuspendedStatus(statusText) {
+  return /suspended from booking|client is suspended/i.test(String(statusText || ''));
+}
+
 function classifyBookingFailure(status) {
   if (status && status.ok) return { category: 'ok', cause: 'booked', autoWatch: false };
   const reason = String((status && status.reason) || '').toLowerCase();
   const detail = String((status && status.detail) || '').toLowerCase();
   const blob = `${reason} ${detail}`;
 
+  // Account is hard-linked to Apple/Google, so there is no password to type.
+  // Checked FIRST: the raw Playwright text is a bare selector timeout, which
+  // otherwise lands in the `infra` fallthrough and arms a watch that shares the
+  // same dead login — 1440 futile Chromium relogins a day, plus "watch is DEAD"
+  // pages nobody can act on (Melissa, 2026-09-20).
+  if (/SSO[- ]linked|Password-based auto-login is impossible/i.test(blob)) {
+    return {
+      category: 'auth',
+      cause: 'Mindbody account is linked to an Apple/Google sign-in, so there is no password to log in with. The owner has to disconnect it and set a password before the booker can work.',
+      autoWatch: false,
+    };
+  }
   // Class full / waitlist-only — lost the 09:00 race. A cancellation may free a
   // slot, which is exactly what the watcher is for.
   if (/\bfull\b|max capacity|on waitlist|waitlist required|waitlist — manual/.test(blob)) {
@@ -895,8 +1042,47 @@ function classifyBookingFailure(status) {
   // No eligible pass at booking time. Either a pre-window timing artifact (the
   // eligible-pass list had not populated when we fetched it pre-09:00) or the
   // user is low on class credits. Watch either way; the DM hints to check passes.
+  // Gym-side account suspension (membership hold/freeze/billing). Nothing the
+  // bot can do and nothing a waitlist watcher can rescue — the seat is not the
+  // problem, the account is. Must be checked BEFORE the pass-fetch branch: a
+  // suspended account also reports "no eligible pass", which would otherwise
+  // misfile it as a credits problem and arm a futile watcher.
+  if (reason === 'client-suspended' || /suspended from booking/.test(blob)) {
+    return {
+      category: 'suspended',
+      cause: 'Gym account is suspended from booking (membership hold/freeze or billing) — no booking is possible until the gym lifts it.',
+      autoWatch: false,
+    };
+  }
+  // "No eligible pass" almost never means "low on credits" — that wording sent
+  // the 2026-09-07 Geraldine diagnosis down the wrong path twice, including
+  // telling a monthly member to top up a class pack she does not have. The pass
+  // list is independent of seat availability (an active member gets a pass even
+  // for a full class), so an empty list is an account/billing problem.
+  // `terminal` is set by book.js only when the fetch still failed AFTER the
+  // 09:00 window opened; before that an empty list is a normal timing artifact
+  // and a watch is still worth arming.
   if (reason === 'pass-fetch-failed' || /no eligible pass/.test(blob)) {
-    return { category: 'no_pass', cause: 'No eligible class pass at booking time (pre-window timing, or low on class credits).', autoWatch: true };
+    if (status && status.terminal) {
+      return {
+        category: 'no_pass',
+        // 2026-09-20 (Lynette): "lapsed membership" was still too confident a
+        // read. Her pass was live and covered FIT and Burn that same day; it
+        // just did not cover Open Gym, so only that class returned an empty
+        // list. Empty-for-every-class and empty-for-one-class are different
+        // problems with the same API response, and guessing between them is
+        // how the Geraldine diagnosis went wrong twice. State the fact, name
+        // both causes, let the gym say which.
+        cause: 'The gym returns no pass that covers this class for this account. Either the membership has lapsed/expired, or the current pass does not include this class type (Open Gym, Steam and intro classes are commonly excluded). The gym can confirm which in one message.',
+        // Still worth watching (Yash, 2026-09-07): the watcher does not book, it
+        // only DMs "a seat opened, grab it in the app". Membership problems are
+        // usually fixed the same day, and then a freed seat is exactly what the
+        // user wants to hear about. Nothing here re-hits the pass API, so a
+        // lapsed account cannot make the watcher fail or loop.
+        autoWatch: true,
+      };
+    }
+    return { category: 'no_pass', cause: 'No eligible class pass at booking time (likely pre-window timing — retrying).', autoWatch: true };
   }
   // Class never appeared on the schedule — nothing for a watcher to poll.
   if (reason === 'class-not-found' || /not in schedule|row disappeared|no .* row found/.test(blob)) {
@@ -1031,6 +1217,8 @@ function shouldRetryPassFetchPreWindow(passResult, msToNine, waitEnabled) {
 
 Object.assign(module.exports, {
   classifyBookingFailure,
+  isSuspendedStatus,
+  isSuspendedResult,
   parseClockToMinutes,
   classStartMs,
   watchRegistryKey,

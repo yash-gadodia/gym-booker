@@ -10,7 +10,7 @@ const {
   timeToHHMM, matchesScheduleEntry, resolveSchedule, resolveSchedulePlans,
   loadOverrides, resolveBookingForDate, resolveBookingsForDate,
   isBookingInUpcoming, findBookingInUpcoming,
-  spawnStaggerMs, navRetryPlan, canRetrySetup, decideAuthAction, decideWaitlistAlert,
+  spawnStaggerMs, navRetryPlan, canRetrySetup, setupRetryDelayMs, decideAuthAction, decideWaitlistAlert,
   SETUP_COMPLETE_MARKER, decideDailyClaim, resolveSprintTarget,
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
@@ -1512,9 +1512,11 @@ function makeNode({ tagName = 'BUTTON', id = '', className = '', rect = null, pa
   return node;
 }
 
-function makeDoc({ button = null, topmost = null } = {}) {
+function makeDoc({ button = null, topmost = null, buttons = null } = {}) {
+  const list = buttons || (button ? [button] : []);
   return {
-    querySelector: () => button,
+    querySelector: () => list[0] || null,
+    querySelectorAll: () => list,
     elementFromPoint: () => topmost,
   };
 }
@@ -2846,6 +2848,51 @@ test('decideWaitlistAlert: a freed slot (BOOK_NOW) for a not-yet-joined user →
   assert.equal(decideWaitlistAlert({ alreadyWaitlisted: false, observed: 'BOOK_NOW', alertCount: 5 }), 'nudge_booknow');
 });
 
+// ── BOOK_NOW exponential backoff (2026-08-15: 160+ every-minute reminders) ───
+test('decideWaitlistAlert: BOOK_NOW first alert fires immediately (no prior bookNow state)', () => {
+  assert.equal(decideWaitlistAlert({
+    alreadyWaitlisted: false, observed: 'BOOK_NOW', bookNowAlertCount: 0, lastBookNowAlertAt: null,
+  }), 'nudge_booknow');
+});
+
+test('decideWaitlistAlert: BOOK_NOW backs off 1m → 2m → 4m between reminders', () => {
+  const t0 = Date.parse('2026-08-15T00:00:00Z');
+  const base = { alreadyWaitlisted: false, observed: 'BOOK_NOW', lastBookNowAlertAt: new Date(t0).toISOString() };
+  // After alert #1: due at +1m
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 1, nowMs: t0 + 59000 }), 'silent');
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 1, nowMs: t0 + 60000 }), 'nudge_booknow');
+  // After alert #2: due at +2m
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 2, nowMs: t0 + 60000 }), 'silent');
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 2, nowMs: t0 + 120000 }), 'nudge_booknow');
+  // After alert #3: due at +4m
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 3, nowMs: t0 + 180000 }), 'silent');
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 3, nowMs: t0 + 240000 }), 'nudge_booknow');
+});
+
+test('decideWaitlistAlert: BOOK_NOW backoff caps at 30m no matter how many alerts', () => {
+  const t0 = Date.parse('2026-08-15T00:00:00Z');
+  const base = { alreadyWaitlisted: false, observed: 'BOOK_NOW', lastBookNowAlertAt: new Date(t0).toISOString(), bookNowAlertCount: 20 };
+  assert.equal(decideWaitlistAlert({ ...base, nowMs: t0 + 29 * 60000 }), 'silent');
+  assert.equal(decideWaitlistAlert({ ...base, nowMs: t0 + 30 * 60000 }), 'nudge_booknow');
+});
+
+test('decideWaitlistAlert: the 160-reminder incident — one hour open now yields ~7 pings, not 60', () => {
+  // Replay a 60s poll loop against a slot that stays BOOK_NOW for an hour.
+  const t0 = Date.parse('2026-08-15T00:00:00Z');
+  let count = 0, lastAt = null;
+  for (let poll = 0; poll < 60; poll++) {
+    const nowMs = t0 + poll * 60000;
+    const action = decideWaitlistAlert({
+      alreadyWaitlisted: false, observed: 'BOOK_NOW',
+      bookNowAlertCount: count, lastBookNowAlertAt: lastAt, nowMs,
+    });
+    if (action === 'nudge_booknow') { count += 1; lastAt = new Date(nowMs).toISOString(); }
+  }
+  // Alerts at 0, 1m, 3m, 7m, 15m, 31m (16m gap), then 30m-capped gaps.
+  assert.ok(count <= 7, `expected ≤7 alerts in an hour, got ${count}`);
+  assert.ok(count >= 5, `expected ≥5 alerts in an hour, got ${count}`);
+});
+
 test('decideWaitlistAlert: FULL (no waitlist yet) → silent', () => {
   assert.equal(decideWaitlistAlert({ alreadyWaitlisted: false, observed: 'FULL' }), 'silent');
 });
@@ -2888,6 +2935,46 @@ test('canRetrySetup: with adequate budget the retry now fires', () => {
 test('canRetrySetup: noWait always retries; no retries left at max attempt', () => {
   assert.equal(canRetrySetup({ attempt: 1, maxAttempts: 2, msRemaining: 1000, marginMs: 75000, noWait: true }), true);
   assert.equal(canRetrySetup({ attempt: 2, maxAttempts: 2, msRemaining: 999999, marginMs: 75000, noWait: false }), false);
+});
+
+// ── 2026-10-11 dead-shared-server wipeout (setupRetryDelayMs) ──
+// Yash's 08:40 run connected to the fleet's shared Chromium, that Chromium
+// died mid-navigation, and all 6 setup attempts reconnected to the corpse and
+// failed inside 20ms with 19 minutes of runway unused. Two fixes: book.js
+// poisons the shared endpoint after any setup failure that used it, and
+// attempts are now spaced apart.
+
+test('setupRetryDelayMs: REPRODUCES the 2026-10-11 zero-gap retry storm', () => {
+  // The six attempts spanned 00:40:17.024 -> .044 with ~1.18e6 ms to 9am.
+  // Every attempt must now buy real recovery time instead of none.
+  const msRemaining = 1182976;
+  const delays = [1, 2, 3, 4, 5].map(attempt =>
+    setupRetryDelayMs({ attempt, msRemaining, marginMs: 75000, noWait: false }));
+  assert.deepEqual(delays, [2000, 4000, 6000, 8000, 10000]);
+  // Total spacing stays trivial against the runway — the retries still all fit.
+  assert.ok(delays.reduce((a, b) => a + b, 0) < msRemaining - 75000);
+});
+
+test('setupRetryDelayMs: never eats into the 9am safety margin', () => {
+  // 80s left, 75s margin -> at most 5s of waiting is affordable.
+  assert.equal(setupRetryDelayMs({ attempt: 3, msRemaining: 80000, marginMs: 75000 }), 5000);
+  // At/below the margin we wait not at all; canRetrySetup is what stops the
+  // retry, but a delay here must never be the thing that misses 9am.
+  assert.equal(setupRetryDelayMs({ attempt: 1, msRemaining: 75000, marginMs: 75000 }), 0);
+  assert.equal(setupRetryDelayMs({ attempt: 1, msRemaining: 1000, marginMs: 75000 }), 0);
+});
+
+test('setupRetryDelayMs: capped at 10s, and noWait skips the wait entirely', () => {
+  assert.equal(setupRetryDelayMs({ attempt: 99, msRemaining: 9e6, marginMs: 75000 }), 10000);
+  assert.equal(setupRetryDelayMs({ attempt: 3, msRemaining: 9e6, marginMs: 75000, noWait: true }), 0);
+});
+
+test('setupRetryDelayMs: a past-9am run (negative remaining) still waits', () => {
+  // canRetrySetup intentionally allows retries when msRemaining < 0 (waitlist /
+  // catch-up runs). Clamping on spare would hand those runs a 0ms gap -- i.e.
+  // the exact storm we are fixing -- so a dead deadline means full delay.
+  assert.equal(setupRetryDelayMs({ attempt: 2, msRemaining: -60000, marginMs: 75000 }), 4000);
+  assert.equal(setupRetryDelayMs({ attempt: 2, msRemaining: Infinity, marginMs: 75000 }), 4000);
 });
 
 test('canRetrySetup: margin is strict (> not >=)', () => {
@@ -3026,7 +3113,7 @@ test('storageStatePathIfValid: wrong-shape JSON (no cookies array) returns null'
 
 // ── Failure classifier + waitlist watch registry (2026-06-07) ────────────────
 const {
-  classifyBookingFailure, parseClockToMinutes, classStartMs,
+  classifyBookingFailure, isSuspendedStatus, isSuspendedResult, parseClockToMinutes, classStartMs,
   watchRegistryKey, upsertWatch, pruneWatchRegistry, shouldRetryPassFetchPreWindow,
 } = require('./lib');
 
@@ -3058,6 +3145,42 @@ test('classifyBookingFailure: pass-fetch-failed → no_pass/watch (the Geraldine
   const v = classifyBookingFailure({ ok: false, reason: 'pass-fetch-failed', detail: 'no eligible pass found for this class' });
   assert.equal(v.category, 'no_pass');
   assert.equal(v.autoWatch, true);
+});
+
+// ── Account suspension (Cheryl, 2026-08-23/24) ──────────────────────────────
+// A membership hold made every class report "Client is suspended from booking".
+// api-direct's pass-fetch failed (a held account has no eligible passes), the
+// UI fallback stalled on a row that never offers BOOK NOW, and both days ended
+// with a misleading "BOOK NOW never appeared" timeout plus a futile waitlist
+// watcher. These lock in the honest classification.
+test('isSuspendedStatus: matches the Mindbody status text, ignores the healthy ones', () => {
+  assert.equal(isSuspendedStatus('Client is suspended from booking'), true);
+  assert.equal(isSuspendedStatus('client is suspended from booking'), true);
+  assert.equal(isSuspendedStatus('Outside booking window'), false);
+  assert.equal(isSuspendedStatus('Bookable'), false);
+  assert.equal(isSuspendedStatus(null), false);
+  assert.equal(isSuspendedStatus(undefined), false);
+});
+
+test('classifyBookingFailure: client-suspended → suspended, NO watch', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'client-suspended', detail: 'Mindbody reports this account as "Client is suspended from booking" for FIT @ 7:30am' });
+  assert.equal(v.category, 'suspended');
+  assert.equal(v.autoWatch, false);
+  assert.match(v.cause, /suspended from booking/i);
+});
+
+test('classifyBookingFailure: suspension beats the pass-fetch branch (a held account also reports no eligible pass)', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'pass-fetch-failed', detail: 'no eligible pass found for this class (Client is suspended from booking)' });
+  assert.equal(v.category, 'suspended');
+  assert.equal(v.autoWatch, false);
+});
+
+test('personality: client-suspended gets its own DM, not a scary exception one', () => {
+  const msg = personality.outcome({ id: 'cheryllee', label: 'Cheryl' },
+    { ok: false, reason: 'client-suspended', detail: 'suspended' },
+    { planLine: 'FIT @ 7:30am', dayLabel: 'Wed 26 Aug' });
+  assert.match(msg, /suspended/i);
+  assert.doesNotMatch(msg, /BOOK NOW/);
 });
 
 test('classifyBookingFailure: the masked tab-click symptom lands in infra/watch', () => {
@@ -3363,6 +3486,54 @@ test('buildDailySummary: real failure on a holiday is NOT masked', () => {
   assert.ok(out.startsWith('🚨 BOOKER DAILY — every user failed\n'), `header was: ${out.split('\n')[0]}`);
 });
 
+// ── Suspension is an expected non-booking, not a failure ────────────────────
+const suspendedPlan = (kind, time) => ({
+  plan: { kind, primaryTime: time, fallback: null },
+  status: { ok: false, reason: 'client-suspended', time, detail: 'Mindbody reports this account as "Client is suspended from booking"' },
+});
+
+test('buildDailySummary: a suspended user alone reads ⏸️, not 🚨', () => {
+  const out = buildDailySummary({
+    runs: [fakeRun('cheryllee', 'Cheryl Lee', [suspendedPlan('FIT', '7:30am')])],
+    runId: 'R-susp1', dayLabel: 'Wed 2026-08-26',
+  });
+  assert.ok(out.startsWith('⏸️ BOOKER DAILY — gym account on hold, nothing bookable\n'), `header was: ${out.split('\n')[0]}`);
+  assert.ok(out.includes('⏸️ Cheryl Lee — gym account on hold, nothing bookable'));
+  assert.ok(!out.includes('🚨'));
+  assert.ok(!out.includes('❌'));
+});
+
+test('buildDailySummary: suspension mixed with real bookings keeps ✅ and names the held user', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [okPlan('Lift', '7:15am')]),
+      fakeRun('cheryllee', 'Cheryl Lee', [suspendedPlan('FIT', '7:30am')]),
+    ],
+    runId: 'R-susp2', dayLabel: 'Wed 2026-08-26',
+  });
+  assert.ok(out.startsWith('✅ BOOKER DAILY — all bookings landed (Cheryl Lee on hold at the gym)\n'), `header was: ${out.split('\n')[0]}`);
+  assert.ok(out.includes('suspended from booking'));
+});
+
+test('buildDailySummary: a genuine failure alongside a suspension still alarms', () => {
+  const out = buildDailySummary({
+    runs: [
+      fakeRun('yash', 'Yash', [failPlan('FIT', '6:30am', 'exception', 'login failed: sign in wall')]),
+      fakeRun('cheryllee', 'Cheryl Lee', [suspendedPlan('FIT', '7:30am')]),
+    ],
+    runId: 'R-susp3', dayLabel: 'Wed 2026-08-26',
+  });
+  assert.ok(out.startsWith('⚠️ BOOKER DAILY — partial'), `header was: ${out.split('\n')[0]}`);
+  assert.ok(out.includes('❌ Yash (0/1)'));
+});
+
+test('isSuspendedResult: only the client-suspended reason counts', () => {
+  assert.equal(isSuspendedResult({ ok: false, reason: 'client-suspended' }), true);
+  assert.equal(isSuspendedResult({ ok: false, reason: 'pass-fetch-failed' }), false);
+  assert.equal(isSuspendedResult({ ok: true, reason: 'booked' }), false);
+  assert.equal(isSuspendedResult(null), false);
+});
+
 test('buildDailySummary: holiday no-class mixed with a real booking stays ✅', () => {
   const out = buildDailySummary({
     runs: [
@@ -3406,4 +3577,115 @@ test('personality: holiday with NO alternatives skips the offer block', () => {
     );
     assert.ok(!msg.includes('Want in on one?'), `msg was: ${msg}`);
   } finally { personality._resetRng(); }
+});
+
+// ── SSO-linked accounts + no_pass watch semantics (2026-09-20) ──────────────
+// Two failures from the same morning's booker run:
+//   Melissa  — her Mindbody login is hard-linked to Apple, so the login page
+//              never renders a password field. The raw error was a bare
+//              `waitForSelector` timeout, which classified as `infra`, armed a
+//              waitlist watch on the same dead login, and turned into 64
+//              failed Chromium relogins plus repeated "watch is DEAD" pages.
+//   Lynette  — her Staff Pass covers FIT and Burn but not Open Gym. Open Gym
+//              @ 2pm was "Bookable" on every poll, so the watcher read an
+//              always-open class as a freed slot and sent 9 "Someone just
+//              canceled, BOOK NOW" DMs for a class she could never book.
+const { detectSsoInterstitial, ssoLinkedError, isTerminalWatchError } = require('./lib');
+
+test('detectSsoInterstitial: reads provider + email off the hard-linked screen', () => {
+  const v = detectSsoInterstitial(
+    'Apple Account You originally used Apple to login to this account under ' +
+    'mcwy2807@gmail.com. You can proceed with Apple. Prefer not to sign-in with Apple? Disconnect here');
+  assert.ok(v);
+  assert.equal(v.provider, 'Apple');
+  assert.equal(v.email, 'mcwy2807@gmail.com');
+});
+
+test('detectSsoInterstitial: handles the "log in" spelling and Google', () => {
+  const v = detectSsoInterstitial('You originally used Google to log in to this account under a@b.com.');
+  assert.equal(v.provider, 'Google');
+});
+
+// The 2026-07-31 revert: SSO shown as an OPTION next to a password field is a
+// NORMAL login. Misreading it broke every re-login, so lock it out.
+test('detectSsoInterstitial: an SSO *option* alongside password is NOT a linked account', () => {
+  assert.equal(detectSsoInterstitial('Sign in Email Password Continue with Google Continue with Apple Forgot password?'), null);
+  assert.equal(detectSsoInterstitial('Continue with Apple'), null);
+  assert.equal(detectSsoInterstitial(''), null);
+  assert.equal(detectSsoInterstitial(null), null);
+});
+
+test('ssoLinkedError text is TERMINAL for the watcher (park it, do not ladder)', () => {
+  const e = ssoLinkedError({ provider: 'Apple', email: 'mcwy2807@gmail.com' });
+  assert.equal(isTerminalWatchError(e.message), true);
+});
+
+test('classifyBookingFailure: SSO-linked → auth, NO watch (never arm on a dead login)', () => {
+  const e = ssoLinkedError({ provider: 'Apple', email: 'mcwy2807@gmail.com' });
+  const v = classifyBookingFailure({ ok: false, reason: 'exception', detail: e.message });
+  assert.equal(v.category, 'auth');
+  assert.equal(v.autoWatch, false);
+  assert.match(v.cause, /disconnect/i);
+});
+
+test('decideWaitlistAlert: a no_pass watch on an open class says it ONCE, then goes quiet', () => {
+  const base = { bookingDetected: false, userOnWaitlist: false, alreadyWaitlisted: false, observed: 'BOOK_NOW', reason: 'no_pass' };
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 0 }), 'nudge_no_pass');
+  // Every later poll, however long the slot stays open, stays silent. This is
+  // the 9-DM storm: with the old code each of these returned 'nudge_booknow'.
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 1, lastBookNowAlertAt: new Date(Date.now() - 6 * 3600000).toISOString() }), 'silent');
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 9, lastBookNowAlertAt: new Date(Date.now() - 24 * 3600000).toISOString() }), 'silent');
+});
+
+test('decideWaitlistAlert: a real capacity watch still nudges with backoff (no_pass fix is scoped)', () => {
+  const base = { bookingDetected: false, userOnWaitlist: false, alreadyWaitlisted: false, observed: 'BOOK_NOW', reason: 'full' };
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 0 }), 'nudge_booknow');
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 1, lastBookNowAlertAt: new Date(Date.now() - 5000).toISOString() }), 'silent');
+  assert.equal(decideWaitlistAlert({ ...base, bookNowAlertCount: 1, lastBookNowAlertAt: new Date(Date.now() - 120000).toISOString() }), 'nudge_booknow');
+  // and an absent reason (hand-armed watches) behaves exactly as before
+  assert.equal(decideWaitlistAlert({ ...base, reason: undefined, bookNowAlertCount: 0 }), 'nudge_booknow');
+});
+
+test('classifyBookingFailure: terminal no_pass does not assert "lapsed membership"', () => {
+  const v = classifyBookingFailure({ ok: false, reason: 'pass-fetch-failed', detail: 'no eligible pass found for this class', terminal: true });
+  assert.equal(v.category, 'no_pass');
+  // Lynette's pass was live and worked for FIT the same day, so a flat
+  // "renew your membership" was simply false.
+  assert.doesNotMatch(v.cause, /^The gym returns no eligible pass for this account — the membership has lapsed/);
+  assert.match(v.cause, /class type|lapsed\/expired/i);
+});
+
+// --- duplicate nav login button (2026-10-02 false "7/7 users broken") ---------
+// Mindbody renders the login button twice: a display:none mobile copy (0x0) and
+// the real desktop one. querySelector picked the hidden copy, so the probe said
+// 'invisible' forever, ensureLoginUnblocked timed out, and auth-health told all
+// 7 users "Mindbody is rejecting your saved password" while the 09:00 booker was
+// booking all 7 of them successfully.
+
+test('probeLoginButton: skips the hidden mobile copy and probes the visible one', () => {
+  const hidden = makeNode({ rect: { left: 0, top: 0, width: 0, height: 0 } });
+  const real = makeNode({ rect: { left: 100, top: 10, width: 81, height: 56 } });
+  const r = probeLoginButton(makeDoc({ buttons: [hidden, real], topmost: real }), LOGIN_BUTTON_SEL);
+  assert.equal(r.state, 'clear');
+});
+
+test('probeLoginButton: hidden copy first still reports a real overlay blocker', () => {
+  const hidden = makeNode({ rect: { left: 0, top: 0, width: 0, height: 0 } });
+  const real = makeNode({ rect: { left: 100, top: 10, width: 81, height: 56 } });
+  const banner = makeNode({ tagName: 'DIV', id: 'cookie-banner' });
+  const r = probeLoginButton(makeDoc({ buttons: [hidden, real], topmost: banner }), LOGIN_BUTTON_SEL);
+  assert.equal(r.state, 'covered');
+  assert.match(r.blocker, /cookie-banner/);
+});
+
+test('probeLoginButton: invisible only when EVERY copy is collapsed', () => {
+  const a = makeNode({ rect: { left: 0, top: 0, width: 0, height: 0 } });
+  const b = makeNode({ rect: { left: 0, top: 0, width: 0, height: 0 } });
+  const r = probeLoginButton(makeDoc({ buttons: [a, b] }), LOGIN_BUTTON_SEL);
+  assert.deepEqual(r, { state: 'invisible' });
+});
+
+test('probeLoginButton: no-button when there are no matches at all', () => {
+  const r = probeLoginButton(makeDoc({ buttons: [] }), LOGIN_BUTTON_SEL);
+  assert.deepEqual(r, { state: 'no-button' });
 });
