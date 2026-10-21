@@ -383,7 +383,7 @@ const OUTCOME = {
 
 STARTED.flirty = [
   ({ planLine, dayLabel, first }) => `🚀 *Morning, gorgeous.* Grabbing you ${planLine} on ${dayLabel}. Anything for you, ${first}.`,
-  ({ planLine, dayLabel, secs }) => `🚀 *Warming up for you.* ${planLine} on ${dayLabel}, T-${secs}s. Not the only thing getting warm 😏`,
+  ({ planLine, dayLabel, secs }) => `🚀 *Warming up for you.* ${planLine} on ${dayLabel}, T-${secs}s. Couldn't let anyone else have your spot 😉`,
   ({ planLine, dayLabel }) => `🚀 *On it, beautiful.* ${planLine} on ${dayLabel}. A spot this good deserves someone this fit.`,
   ({ planLine, dayLabel, first }) => `🚀 *Up early just for you, ${first}.* ${planLine} on ${dayLabel}. Don't tell the others.`,
   ({ planLine, dayLabel }) => `🚀 *Your favourite spotter's here.* Locking ${planLine} on ${dayLabel}. You'll thank me later 😉`,
@@ -413,7 +413,7 @@ Object.assign(OUTCOME.bookedFast, { flirty: [
 ] });
 Object.assign(OUTCOME.bookedSlow, { flirty: [
   ({ planLine, dayLabel, first }) => `✅ *Done, ${first}.* ${planLine} on ${dayLabel}. Took the long way, but you're worth it.`,
-  ({ planLine, dayLabel }) => `💘 *Booked.* ${planLine} on ${dayLabel}. Slow and steady, just how you like it 😏`,
+  ({ planLine, dayLabel }) => `💘 *Booked.* ${planLine} on ${dayLabel}. Took my time, worth it for you 😉`,
   ({ planLine, dayLabel }) => `✅ *Got it, gorgeous.* ${planLine} on ${dayLabel}. See you there looking unreal.`,
 ] });
 Object.assign(OUTCOME.alreadyBooked, { flirty: [

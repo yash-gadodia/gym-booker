@@ -367,9 +367,9 @@ function stripFlag(args, name) {
           if (!c.userChatId) continue;
           const dmy = c.date.split('-').reverse().join('-');
           await sendTelegram(c.userChatId,
-            `🔁 ${c.name}, I couldn't lock in your ${c.kind} @ ${c.time} on ${dmy}.\n` +
+            `🔁 Sorry ${c.name}, I couldn't lock in your ${c.kind} @ ${c.time} on ${dmy} for you.\n` +
             `Reason: ${c.cause}\n` +
-            `You're on the waitlist watcher now and I'll ping you the second a spot frees. 🦞`);
+            `I'm watching the waitlist for you and I'll ping you the second a spot frees. Not letting you miss out on my watch 😉`);
         }
         await sendYashAlert(note);
       }
