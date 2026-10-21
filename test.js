@@ -15,6 +15,9 @@ const {
   LOGIN_BUTTON_SEL, OVERLAY_DISMISS_SELS, YASH_ALERT_CHAT_ID,
   probeLoginButton, buildSetupFailureAlert, buildDailySummary, sendYashAlert,
 } = require('./lib');
+// Namespace handle alongside the destructure above: the auto-pause helpers are
+// referenced as lib.* so adding one later does not mean touching this list.
+const lib = require('./lib');
 const { getTelegramTarget } = require('./users');
 const personality = require('./personality');
 
@@ -595,17 +598,17 @@ const YASH_LIKE = null;  // book.js passes null for the legacy default user
 const DANI_LIKE = { id: 'dani', label: 'Dani', vibe: 'wholesome' };
 const MYSTERY = { id: 'someone', label: 'Someone' };  // unknown user → default vibe
 
-test('vibeFor: yash (no user) → gymbro default', () => {
-  assert.equal(personality.vibeFor(YASH_LIKE), 'gymbro');
+test('vibeFor: yash (no user) → flirty default', () => {
+  assert.equal(personality.vibeFor(YASH_LIKE), 'flirty');
 });
 test('vibeFor: dani via explicit vibe field still honors override', () => {
   assert.equal(personality.vibeFor(DANI_LIKE), 'wholesome');
 });
 test('vibeFor: dani via id-mapping with no vibe field falls back to default', () => {
-  assert.equal(personality.vibeFor({ id: 'dani', label: 'Dani' }), 'gymbro');
+  assert.equal(personality.vibeFor({ id: 'dani', label: 'Dani' }), 'flirty');
 });
-test('vibeFor: unknown user → gymbro default', () => {
-  assert.equal(personality.vibeFor(MYSTERY), 'gymbro');
+test('vibeFor: unknown user → flirty default', () => {
+  assert.equal(personality.vibeFor(MYSTERY), 'flirty');
 });
 test('vibeFor: explicit gymbro vibe field returns gymbro', () => {
   assert.equal(personality.vibeFor({ id: 'melissa', vibe: 'gymbro' }), 'gymbro');
@@ -2244,13 +2247,25 @@ test('book.js writes BOOKER_RESULT_FILE with skipReason on opt_out_day', async (
   // → 2026-05-17 (Sun) is an opt_out_day.
   const { spawnSync } = require('node:child_process');
   const tmp = path.join(os.tmpdir(), `booker-skip-test-${process.pid}-${Date.now()}.json`);
+  // Pin an EMPTY overrides file. Previously this read the real (gitignored)
+  // overrides.json, so the test broke on 15-10-2026 the moment Melissa was
+  // paused: `target <= pauseUntil` makes every past date resolve to 'paused',
+  // and the assertion wants 'opt_out_day'. The contract under test is about the
+  // weekly schedule, not about who is on leave today.
+  const emptyOverrides = path.join(os.tmpdir(), `booker-skip-ovr-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(emptyOverrides, JSON.stringify({ version: 1, users: {} }));
   try {
     const res = spawnSync(process.execPath, [
       path.join(__dirname, 'book.js'),
       '--user', 'melissa',
       '2026-05-17',
     ], {
-      env: { ...process.env, BOOKER_RESULT_FILE: tmp, TELEGRAM_BOT_TOKEN: 'TEST_TOKEN_INVALID_DO_NOT_SEND' },
+      env: {
+        ...process.env,
+        BOOKER_RESULT_FILE: tmp,
+        BOOKER_OVERRIDES_FILE: emptyOverrides,
+        TELEGRAM_BOT_TOKEN: 'TEST_TOKEN_INVALID_DO_NOT_SEND',
+      },
       timeout: 30000,
     });
     assert.equal(res.status, 0, `book.js should exit 0 on opt-out, got ${res.status}; stderr=${res.stderr}`);
@@ -2263,6 +2278,7 @@ test('book.js writes BOOKER_RESULT_FILE with skipReason on opt_out_day', async (
     assert.equal(parsed.targetYmd, '2026-05-17');
   } finally {
     try { fs.unlinkSync(tmp); } catch {}
+    try { fs.unlinkSync(emptyOverrides); } catch {}
   }
 });
 
@@ -3688,4 +3704,68 @@ test('probeLoginButton: invisible only when EVERY copy is collapsed', () => {
 test('probeLoginButton: no-button when there are no matches at all', () => {
   const r = probeLoginButton(makeDoc({ buttons: [] }), LOGIN_BUTTON_SEL);
   assert.deepEqual(r, { state: 'no-button' });
+});
+
+// ── auto-pause after a repeated account-level failure ───────────────────────
+test('foldAutoPauseStreak: three consecutive no_pass days build a streak of 3', () => {
+  let st = null;
+  for (const d of ['2026-10-13', '2026-10-14', '2026-10-15']) {
+    st = lib.foldAutoPauseStreak(st, { category: 'no_pass', ymd: d });
+  }
+  assert.equal(st.days, 3);
+  assert.equal(st.category, 'no_pass');
+  assert.equal(st.firstYmd, '2026-10-13');
+  assert.equal(lib.decideAutoPause(st, false).action, 'pause');
+});
+
+test('foldAutoPauseStreak: infra NEVER counts (the 2026-10-15 browser outage)', () => {
+  // That outage hit all 8 users in one run. If infra counted, three such
+  // mornings would auto-pause the entire roster for a ten-minute bug.
+  let st = null;
+  for (const d of ['2026-10-13', '2026-10-14', '2026-10-15']) {
+    st = lib.foldAutoPauseStreak(st, { category: 'infra', ymd: d });
+  }
+  assert.equal(st, null);
+  assert.equal(lib.decideAutoPause(st, false).action, 'none');
+});
+
+test('foldAutoPauseStreak: a full class never counts toward a pause', () => {
+  let st = null;
+  for (const d of ['2026-10-13', '2026-10-14', '2026-10-15']) {
+    st = lib.foldAutoPauseStreak(st, { category: 'full', ymd: d });
+  }
+  assert.equal(st, null);
+});
+
+test('foldAutoPauseStreak: a success clears the streak', () => {
+  let st = lib.foldAutoPauseStreak(null, { category: 'no_pass', ymd: '2026-10-13' });
+  st = lib.foldAutoPauseStreak(st, { category: 'no_pass', ymd: '2026-10-14' });
+  assert.equal(st.days, 2);
+  st = lib.foldAutoPauseStreak(st, { category: 'ok', ymd: '2026-10-15' });
+  assert.equal(st, null, 'one good day resets the count');
+});
+
+test('foldAutoPauseStreak: a DIFFERENT category restarts rather than tops up', () => {
+  let st = lib.foldAutoPauseStreak(null, { category: 'no_pass', ymd: '2026-10-13' });
+  st = lib.foldAutoPauseStreak(st, { category: 'no_pass', ymd: '2026-10-14' });
+  st = lib.foldAutoPauseStreak(st, { category: 'auth', ymd: '2026-10-15' });
+  assert.equal(st.days, 1, 'three unrelated failures must not add up to a pause');
+  assert.equal(st.category, 'auth');
+  assert.equal(lib.decideAutoPause(st, false).action, 'none');
+});
+
+test('foldAutoPauseStreak: re-running the same day is idempotent', () => {
+  // book-all runs twice some mornings (08:40 primary + 08:54 backstop).
+  let st = lib.foldAutoPauseStreak(null, { category: 'no_pass', ymd: '2026-10-15' });
+  st = lib.foldAutoPauseStreak(st, { category: 'no_pass', ymd: '2026-10-15' });
+  st = lib.foldAutoPauseStreak(st, { category: 'no_pass', ymd: '2026-10-15' });
+  assert.equal(st.days, 1, 'same-day re-runs must not inflate the streak');
+});
+
+test('decideAutoPause: two days is not enough, and an already-paused user is left alone', () => {
+  const two = { category: 'no_pass', days: 2, firstYmd: '2026-10-14', lastYmd: '2026-10-15' };
+  assert.equal(lib.decideAutoPause(two, false).action, 'none');
+  const three = { category: 'no_pass', days: 3, firstYmd: '2026-10-13', lastYmd: '2026-10-15' };
+  assert.equal(lib.decideAutoPause(three, true).action, 'none', 'no double-pausing');
+  assert.equal(lib.decideAutoPause(three, false).until, '2099-12-31');
 });

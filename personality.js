@@ -16,7 +16,7 @@
 // has a plain-text fallback; this is just a belt-and-braces.
 
 const VIBES_BY_ID = {};
-const DEFAULT_VIBE = 'gymbro';
+const DEFAULT_VIBE = 'flirty';
 
 function vibeFor(user) {
   if (!user) return DEFAULT_VIBE;
@@ -325,6 +325,22 @@ const OUTCOME = {
       ({ planLine, dayLabel, first }) => `❌ *Cooked, ${first}.* ${planLine} on ${dayLabel} FULL. Manual recon required.`,
     ],
   },
+  // Gym-side account suspension: membership on hold/freeze, or billing in
+  // arrears. Mindbody returns "Client is suspended from booking" on every
+  // class. Not a bot failure and not a race, so say so plainly and point the
+  // user at the gym, because nothing on our side can fix it.
+  suspended: {
+    chaotic: [
+      ({ planLine, dayLabel }) => `\u26d4 *Blocked at the door.* ${planLine} on ${dayLabel} never had a chance, the gym has your account suspended from booking (membership on hold, or billing). Not a Lawrence problem for once. Ping RAGTAG and I'll resume the second it's lifted.`,
+    ],
+    wholesome: [
+      ({ planLine, dayLabel, first }) => `\u26d4 ${first}, I couldn't book ${planLine} on ${dayLabel}, the gym has your account suspended from booking (usually a membership hold or a billing hiccup). Nothing wrong on my end! Have a word with RAGTAG and I'll pick straight back up 💛`,
+    ],
+    gymbro: [
+      ({ planLine, dayLabel, first }) => `\u26d4 *Turned away at reception, ${first}.* ${planLine} on ${dayLabel} was never bookable, the gym has your account suspended from booking, i.e. membership on hold or billing outstanding. Nothing I can lift from here, old sport. Sort it with RAGTAG and I'll be back on the bar the same morning.`,
+      ({ planLine, dayLabel }) => `\u26d4 *Account on ice.* Mindbody won't let me near ${planLine} on ${dayLabel}, your booking privileges are suspended (membership hold or billing). Not a lost race, a locked door. A word with RAGTAG sorts it and I resume immediately.`,
+    ],
+  },
   // Ambiguous, BUY didn't settle cleanly AND verify isn't BOOKED.
   unverified: {
     chaotic: [
@@ -365,6 +381,84 @@ const OUTCOME = {
   },
 };
 
+STARTED.flirty = [
+  ({ planLine, dayLabel, first }) => `🚀 *Morning, gorgeous.* Grabbing you ${planLine} on ${dayLabel}. Anything for you, ${first}.`,
+  ({ planLine, dayLabel, secs }) => `🚀 *Warming up for you.* ${planLine} on ${dayLabel}, T-${secs}s. Not the only thing getting warm 😏`,
+  ({ planLine, dayLabel }) => `🚀 *On it, beautiful.* ${planLine} on ${dayLabel}. A spot this good deserves someone this fit.`,
+  ({ planLine, dayLabel, first }) => `🚀 *Up early just for you, ${first}.* ${planLine} on ${dayLabel}. Don't tell the others.`,
+  ({ planLine, dayLabel }) => `🚀 *Your favourite spotter's here.* Locking ${planLine} on ${dayLabel}. You'll thank me later 😉`,
+];
+LOGGED_IN.flirty = [
+  () => `🔐 *In.* Mindbody let me through. Must be the smile.`,
+  () => `🔐 *Logged in.* I'd remember your password anywhere, darling.`,
+  () => `🔐 *Session live.* The door's open, just like my heart.`,
+  () => `🔐 *Authenticated.* Easier to get into Mindbody than to stop thinking about you.`,
+];
+STANDBY_UI.flirty = [
+  ({ planLine, secs }) => `⏸️ *Waiting for you like always.* ${planLine}, ${secs}s to go.`,
+  ({ planLine, secs }) => `⏸️ *Bar's loaded, babe.* ${planLine}. ${secs}s. Hold that thought 😏`,
+  ({ planLine, secs }) => `⏸️ *Counting down the seconds till I see you.* ${planLine} in ${secs}s.`,
+];
+STANDBY_API.flirty = [
+  ({ planLine, secs }) => `⏸️ *Fast lane primed.* ${planLine} in ${secs}s. I'm quick when it's for you.`,
+  ({ planLine, secs }) => `⏸️ *Token in pocket, eyes on you.* ${planLine}. ${secs}s 😉`,
+  ({ planLine, secs }) => `⏸️ *All warmed up.* ${planLine}, ${secs}s out. Ready when you are, gorgeous.`,
+];
+Object.assign(OUTCOME.bookedFast, { flirty: [
+  ({ planLine, dayLabel, ms, first }) => `🔒 *Got you, ${first}.* ${planLine} on ${dayLabel} in ${ms}ms. I'd move that fast for you any day 😏`,
+  ({ planLine, dayLabel, ms }) => `💘 *Booked, beautiful.* ${planLine} on ${dayLabel}. ${ms}ms. Can't keep you waiting.`,
+  ({ planLine, dayLabel, ms }) => `🔥 *Locked in.* ${planLine} on ${dayLabel} in ${ms}ms. Now go look that good on the floor.`,
+  ({ planLine, dayLabel, ms, first }) => `💪 *${ms}ms, ${first}.* ${planLine} on ${dayLabel}. Save me a spot next to you 😉`,
+  ({ planLine, dayLabel, ms }) => `🥇 *Yours.* ${planLine} on ${dayLabel}, ${ms}ms flat. Only the best for my favourite lifter.`,
+] });
+Object.assign(OUTCOME.bookedSlow, { flirty: [
+  ({ planLine, dayLabel, first }) => `✅ *Done, ${first}.* ${planLine} on ${dayLabel}. Took the long way, but you're worth it.`,
+  ({ planLine, dayLabel }) => `💘 *Booked.* ${planLine} on ${dayLabel}. Slow and steady, just how you like it 😏`,
+  ({ planLine, dayLabel }) => `✅ *Got it, gorgeous.* ${planLine} on ${dayLabel}. See you there looking unreal.`,
+] });
+Object.assign(OUTCOME.alreadyBooked, { flirty: [
+  ({ planLine, dayLabel, first }) => `✅ *Beat me to it, ${first}.* ${planLine} on ${dayLabel} already yours. Keen. I like that.`,
+  ({ planLine, dayLabel }) => `😏 *Already booked.* ${planLine} on ${dayLabel}. Can't wait to see you, can you?`,
+] });
+Object.assign(OUTCOME.dryRun, { flirty: [
+  ({ planLine, dayLabel }) => `🧪 *Just practising for you.* Would've booked ${planLine} on ${dayLabel}.`,
+] });
+Object.assign(OUTCOME.optOut, { flirty: [
+  ({ dayLabel, first }) => `🛌 *No class on ${dayLabel}, ${first}.* Rest up. I'll miss you.`,
+  ({ dayLabel }) => `💤 *${dayLabel} off.* Recovery looks good on you.`,
+  ({ dayLabel }) => `🥗 *Rest day, gorgeous.* ${dayLabel}. Hydrate, stretch, think of me.`,
+] });
+Object.assign(OUTCOME.paused, { flirty: [
+  ({ dayLabel, detail }) => `⏸️ *Paused.* No booking for ${dayLabel} (${detail || 'pause active'}). Come back to me soon 💔`,
+  ({ dayLabel }) => `🛑 *Standing down for ${dayLabel}.* You're on a break. I'll be waiting, DM me when you're back 😉`,
+] });
+Object.assign(OUTCOME.holiday, { flirty: [
+  ({ planLine, dayLabel }) => `🎈 *Public holiday, darling.* ${dayLabel} has no ${planLine}. Day off, you've earned it.`,
+  ({ planLine, dayLabel }) => `🎈 *No ${planLine} on ${dayLabel}, it's a public holiday.* Even I can't book you in, and I'd try anything.`,
+] });
+Object.assign(OUTCOME.dateSkip, { flirty: [
+  ({ dayLabel }) => `⏭️ *Skipped ${dayLabel} like you asked.* Playing hard to get, I see.`,
+  ({ dayLabel }) => `❎ *${dayLabel} cancelled, your call.* I'll survive. Barely.`,
+] });
+Object.assign(OUTCOME.full, { flirty: [
+  ({ planLine, dayLabel, first }) => `💔 *Sorry ${first}.* ${planLine} on ${dayLabel} went FULL before I could grab it. Try the waitlist? I owe you one.`,
+  ({ planLine, dayLabel }) => `❌ *FULL.* ${planLine} on ${dayLabel} sold out. Everyone wants to train where you train, can't blame them.`,
+  ({ planLine, dayLabel }) => `🥲 *Missed it, babe.* ${planLine} on ${dayLabel} is FULL. Waitlist's your best bet, I'll make it up to you.`,
+] });
+Object.assign(OUTCOME.suspended, { flirty: [
+  ({ planLine, dayLabel, first }) => `⛔ *Couldn't get you in, ${first}.* ${planLine} on ${dayLabel} isn't bookable, the gym has your account suspended from booking (membership on hold or billing). Not me this time. Sort it with RAGTAG and I'm right back on it for you.`,
+] });
+Object.assign(OUTCOME.unverified, { flirty: [
+  ({ planLine, dayLabel, detail }) => `⚠️ *Not sure it landed.* ${planLine} on ${dayLabel}, BUY didn't settle and the schedule's not confirming. Check Mindbody for me, gorgeous? (${detail})`,
+] });
+Object.assign(OUTCOME.notBooked, { flirty: [
+  ({ planLine, dayLabel, detail }) => `❌ *Didn't go through.* ${planLine} on ${dayLabel}, BUY went out but it's still BOOK NOW. Try manually? Sorry, babe. (${detail})`,
+] });
+Object.assign(OUTCOME.exception, { flirty: [
+  ({ detail, first }) => `💥 *Something broke, ${first}.* ${detail}. Yash is on it. You distracted me 😏`,
+  ({ detail }) => `💥 *Tripped over myself.* ${detail}. Manual override needed, sorry gorgeous.`,
+] });
+
 // Map status.reason → personality bucket. Defensive defaults so an unknown
 // reason still produces a message instead of crashing.
 function _bucket(status) {
@@ -374,6 +468,9 @@ function _bucket(status) {
   if (r === 'holiday_no_class') return 'holiday';
   if (!status.ok) {
     if (r === 'opt_out_day') return 'optOut';
+    // Must precede the /exception/ and /full/ tests: a suspension surfaces as a
+    // plain failure reason but needs its own "this is the gym, not the bot" DM.
+    if (r === 'client-suspended') return 'suspended';
     if (/exception/.test(r)) return 'exception';
     if (/unverified/.test(r)) return 'unverified';
     if (/full|not booked/.test(r)) return 'full';
